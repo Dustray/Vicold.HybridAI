@@ -8,6 +8,8 @@ target_sources(hybridai
         core/device_manager.cc
         core/tensor.h
         core/tensor.cc
+        core/platform.h
+        core/platform.cc
         backends/interface/backend.h
         backends/backend_registry.h
         backends/backend_registry.cc

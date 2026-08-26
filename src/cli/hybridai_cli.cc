@@ -1,3 +1,4 @@
+#include "backends/backend_registry.h"
 #include "core/device.h"
 #include "core/device_manager.h"
 
@@ -25,6 +26,7 @@ int cmd_devices() {
 }
 
 int main(int argc, char* argv[]) {
+    hybridai::InitializeBuiltinBackends();
     spdlog::set_level(spdlog::level::info);
 
     if (argc < 2) {

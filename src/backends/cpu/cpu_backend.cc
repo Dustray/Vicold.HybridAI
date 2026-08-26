@@ -123,6 +123,25 @@ std::unique_ptr<Event> CpuBackend::create_event() {
     return std::make_unique<HostEvent>();
 }
 
+std::shared_ptr<Buffer> CpuBackend::create_buffer(size_t size,
+                                                  MemoryType type) {
+    auto allocator = create_allocator(type);
+    void* ptr = nullptr;
+    Status status = allocator->allocate(size, &ptr);
+    if (!status.ok()) {
+        return nullptr;
+    }
+    auto deleter = [allocator = std::move(allocator)](void* p) mutable {
+        allocator->deallocate(p);
+    };
+    return std::shared_ptr<Buffer>(
+        new HostBuffer(ptr, size, device()),
+        [deleter = std::move(deleter)](Buffer* b) mutable {
+            deleter(b->data());
+            delete b;
+        });
+}
+
 Status CpuBackend::memcpy_h2d(Buffer* dst, const void* src, size_t size,
                                 Stream* stream) {
     (void)stream;
@@ -139,6 +158,13 @@ Status CpuBackend::memcpy_d2h(void* dst, const Buffer* src, size_t size,
 
 Status CpuBackend::memcpy_d2d(Buffer* dst, const Buffer* src, size_t size,
                               Stream* stream) {
+    (void)stream;
+    std::memcpy(dst->data(), src->data(), size);
+    return Status::OK();
+}
+
+Status CpuBackend::copy(Buffer* dst, const Buffer* src, size_t size,
+                        Stream* stream) {
     (void)stream;
     std::memcpy(dst->data(), src->data(), size);
     return Status::OK();

@@ -25,6 +25,12 @@ private:
     std::unordered_map<std::string, BackendFactory> factories_;
 };
 
+// Explicitly initialize all built-in backends. Call this in executables
+// (CLI, tests, benchmarks) to ensure backend factories are registered even when
+// linking HybridAI as a static library. Static-library global constructors may
+// be elided by the linker on some platforms/toolchains.
+void InitializeBuiltinBackends();
+
 class BackendRegistrar {
 public:
     explicit BackendRegistrar(std::string_view name, BackendFactory factory) {

@@ -21,6 +21,13 @@ public:
         compute_strides();
     }
 
+    Tensor(const Shape& shape, DType dtype, Device device,
+           std::shared_ptr<Buffer> buffer, const std::vector<int64_t>& strides)
+        : shape_(shape), dtype_(dtype), device_(device),
+          buffer_(std::move(buffer)), strides_(strides) {
+        check_contiguous();
+    }
+
     int64_t numel() const { return shape_.numel(); }
     size_t nbytes() const {
         return static_cast<size_t>(numel()) * SizeOfDType(dtype_);
@@ -51,6 +58,7 @@ public:
 
 private:
     void compute_strides();
+    void check_contiguous();
 
     Shape shape_;
     DType dtype_;

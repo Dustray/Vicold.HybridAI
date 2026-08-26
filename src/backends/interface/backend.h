@@ -74,13 +74,22 @@ public:
     virtual std::unique_ptr<Stream> create_stream() = 0;
     virtual std::unique_ptr<Event> create_event() = 0;
 
-    // Memory copy operations
+    // Convenience buffer creation using the backend's preferred allocator.
+    // Caller can wrap the raw Buffer* into std::shared_ptr<Buffer>.
+    virtual std::shared_ptr<Buffer> create_buffer(size_t size,
+                                                  MemoryType type) = 0;
+
+    // Memory copy operations.
+    // For cross-backend copies (e.g. CPU -> GPU), the dst backend is used as
+    // the execution backend and receives the source data pointer/buffer.
     virtual Status memcpy_h2d(Buffer* dst, const void* src, size_t size,
-                            Stream* stream = nullptr) = 0;
+                               Stream* stream = nullptr) = 0;
     virtual Status memcpy_d2h(void* dst, const Buffer* src, size_t size,
                               Stream* stream = nullptr) = 0;
     virtual Status memcpy_d2d(Buffer* dst, const Buffer* src, size_t size,
                               Stream* stream = nullptr) = 0;
+    virtual Status copy(Buffer* dst, const Buffer* src, size_t size,
+                        Stream* stream = nullptr) = 0;
     virtual Status memset(Buffer* dst, int value, size_t size,
                           Stream* stream = nullptr) = 0;
 

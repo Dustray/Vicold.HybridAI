@@ -54,5 +54,25 @@ TEST(SafeTensorLoaderTest, OpensDownloadedQwen38ShardedModelWhenAvailable) {
     EXPECT_EQ(last_weight->shape, Shape({17408, 5120}));
 }
 
+TEST(SafeTensorLoaderTest, ValidatesDownloadedQwen38ScaleShapesWhenAvailable) {
+    const std::filesystem::path path = "E:/models/Qwen3.8-27B-FP8";
+    if (!std::filesystem::exists(path / "model.safetensors.index.json")) {
+        GTEST_SKIP() << "Downloaded sharded Qwen3.8 model is not available";
+    }
+
+    SafeTensorLoader loader;
+    ASSERT_TRUE(loader.open_model(path.string()).ok());
+    const auto* weight = loader.tensor_info(
+        "model.language_model.layers.0.mlp.gate_proj.weight");
+    const auto* scale = loader.tensor_info(
+        "model.language_model.layers.0.mlp.gate_proj.weight_scale_inv");
+    ASSERT_NE(weight, nullptr);
+    ASSERT_NE(scale, nullptr);
+    ASSERT_EQ(weight->dtype, DType::FP8_E4M3);
+    ASSERT_EQ(scale->dtype, DType::BF16);
+    EXPECT_EQ(scale->shape,
+              Shape({(17408 + 127) / 128, (5120 + 127) / 128}));
+}
+
 } // namespace
 } // namespace hybridai::io

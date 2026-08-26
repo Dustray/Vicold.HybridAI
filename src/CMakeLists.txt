@@ -8,6 +8,8 @@ target_sources(hybridai
         core/device_manager.cc
         core/tensor.h
         core/tensor.cc
+        ops/quantized_weight.h
+        ops/quantized_weight.cc
         core/platform.h
         core/platform.cc
         io/safetensor_loader.h
@@ -18,6 +20,8 @@ target_sources(hybridai
         models/weight_sharding.cc
         models/model_weight_schema.h
         models/model_weight_schema.cc
+        models/qwen3_weights.h
+        models/qwen3_weights.cc
         backends/interface/backend.h
         backends/backend_registry.h
         backends/backend_registry.cc

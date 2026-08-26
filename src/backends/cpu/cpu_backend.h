@@ -11,6 +11,7 @@ public:
 
     const char* name() const noexcept override;
     Device device() const noexcept override;
+    bool is_available() const noexcept override;
 
     std::unique_ptr<Allocator> create_allocator(MemoryType type) override;
     std::unique_ptr<Stream> create_stream() override;

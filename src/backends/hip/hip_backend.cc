@@ -23,6 +23,13 @@ Status hip_error_to_status(hipError_t err) {
     return Status(StatusCode::BackendError, hipGetErrorString(err));
 }
 
+Status rocblas_error_to_status(rocblas_status status) {
+    if (status == rocblas_status_success) return Status::OK();
+    const char* message = rocblas_status_to_string(status);
+    return Status(StatusCode::BackendError,
+                  message == nullptr ? "Unknown rocBLAS error" : message);
+}
+
 class HipAllocator final : public Allocator {
 public:
     HipAllocator(MemoryType type) : type_(type) {}
@@ -206,13 +213,44 @@ hipMemcpyKind copy_direction(MemoryType dst, MemoryType src) {
 
 } // namespace
 
-HipBackend::HipBackend(const Device& device) : device_(device) {}
+struct HipBackend::Impl {
+#ifdef HYBRIDAI_HAS_HIP
+    rocblas_handle rocblas = nullptr;
+#endif
+};
 
-HipBackend::~HipBackend() = default;
+HipBackend::HipBackend(const Device& device)
+    : device_(device), impl_(std::make_unique<Impl>()) {
+#ifdef HYBRIDAI_HAS_HIP
+    if (hipSetDevice(device_.id()) == hipSuccess) {
+        if (rocblas_create_handle(&impl_->rocblas) != rocblas_status_success) {
+            impl_->rocblas = nullptr;
+        }
+    }
+#endif
+}
+
+HipBackend::~HipBackend() {
+#ifdef HYBRIDAI_HAS_HIP
+    if (impl_ != nullptr && impl_->rocblas != nullptr) {
+        rocblas_destroy_handle(impl_->rocblas);
+    }
+#endif
+}
 
 const char* HipBackend::name() const noexcept { return "hip"; }
 
 Device HipBackend::device() const noexcept { return device_; }
+
+bool HipBackend::is_available() const noexcept {
+#ifdef HYBRIDAI_HAS_HIP
+    int count = 0;
+    return hipGetDeviceCount(&count) == hipSuccess && device_.id() >= 0 &&
+           device_.id() < count;
+#else
+    return false;
+#endif
+}
 
 std::unique_ptr<Allocator> HipBackend::create_allocator(MemoryType type) {
     return std::make_unique<HipAllocator>(type);
@@ -364,6 +402,48 @@ Status HipBackend::synchronize() {
 Status HipBackend::gemm(Buffer* c, const Buffer* a, const Buffer* b,
                         bool trans_a, bool trans_b, int64_t m, int64_t n,
                         int64_t k, float alpha, float beta, Stream* stream) {
+#ifdef HYBRIDAI_HAS_HIP
+    if (c == nullptr || a == nullptr || b == nullptr || c->data() == nullptr ||
+        a->data() == nullptr || b->data() == nullptr || m <= 0 || n <= 0 ||
+        k <= 0) {
+        return Status(StatusCode::InvalidArgument,
+                      "HipBackend::gemm received invalid arguments");
+    }
+    if (impl_ == nullptr || impl_->rocblas == nullptr) {
+        return Status(StatusCode::BackendError,
+                      "HipBackend rocBLAS handle is unavailable");
+    }
+
+    auto* hip_stream = dynamic_cast<HipStream*>(stream);
+    if (stream != nullptr && hip_stream == nullptr) {
+        return Status(StatusCode::InvalidArgument,
+                      "HipBackend::gemm requires a HIP stream");
+    }
+    Status status = rocblas_error_to_status(rocblas_set_stream(
+        impl_->rocblas, hip_stream == nullptr ? nullptr : hip_stream->handle()));
+    if (!status.ok()) return status;
+
+    // The public Backend contract uses row-major matrices. rocBLAS is
+    // column-major, so compute C^T = op(B)^T * op(A)^T by swapping A/B and
+    // M/N. A row-major transpose flag maps directly to the corresponding
+    // column-major operation after this swap.
+    const rocblas_operation op_b =
+        trans_b ? rocblas_operation_transpose : rocblas_operation_none;
+    const rocblas_operation op_a =
+        trans_a ? rocblas_operation_transpose : rocblas_operation_none;
+    const rocblas_int lda = static_cast<rocblas_int>(
+        trans_b ? k : n);
+    const rocblas_int ldb = static_cast<rocblas_int>(
+        trans_a ? m : k);
+    const rocblas_int ldc = static_cast<rocblas_int>(n);
+
+    return rocblas_error_to_status(rocblas_sgemm(
+        impl_->rocblas, op_b, op_a, static_cast<rocblas_int>(n),
+        static_cast<rocblas_int>(m), static_cast<rocblas_int>(k), &alpha,
+        static_cast<const float*>(b->data()), lda,
+        static_cast<const float*>(a->data()), ldb, &beta,
+        static_cast<float*>(c->data()), ldc));
+#else
     (void)c;
     (void)a;
     (void)b;
@@ -375,10 +455,9 @@ Status HipBackend::gemm(Buffer* c, const Buffer* a, const Buffer* b,
     (void)alpha;
     (void)beta;
     (void)stream;
-    // TODO: integrate rocBLAS. For now return NotImplemented so tests can detect
-    // the missing path without crashing.
-    return Status(StatusCode::NotImplemented,
-                    "HipBackend::gemm not yet implemented");
+    return Status(StatusCode::BackendError,
+                  "HIP backend compiled without HIP support");
+#endif
 }
 
 void HipBackend::register_kernels() {

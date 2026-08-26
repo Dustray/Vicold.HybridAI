@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -37,7 +38,14 @@ TEST(CoreTest, DeviceCpu) {
 
 TEST(CoreTest, DeviceManagerInit) {
     DeviceManager::instance().initialize();
-    EXPECT_GE(DeviceManager::instance().devices().size(), 1);
+    const auto& devices = DeviceManager::instance().devices();
+    ASSERT_GE(devices.size(), 1);
+
+    const bool has_gpu = std::any_of(devices.begin(), devices.end(),
+                                     [](const Device& device) {
+                                         return device.is_gpu();
+                                     });
+    EXPECT_EQ(DeviceManager::instance().default_device().is_gpu(), has_gpu);
 }
 
 TEST(CoreTest, TensorEmpty) {

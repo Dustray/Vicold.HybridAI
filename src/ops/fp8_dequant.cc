@@ -86,4 +86,63 @@ Status FP8Dequantizer::dequantize(const Tensor& input, Tensor* output,
     return Status::OK();
 }
 
+Status FP8Dequantizer::dequantize_2d(const Tensor& input,
+                                     const Tensor& scales, Tensor* output,
+                                     int64_t block_rows,
+                                     int64_t block_columns) {
+    if (output == nullptr) {
+        return Status(StatusCode::InvalidArgument,
+                      "FP8Dequantizer output must not be null");
+    }
+    if (input.dtype() != DType::FP8_E4M3 || scales.dtype() != DType::FP32) {
+        return Status(StatusCode::UnsupportedDType,
+                      "2D FP8 dequantization expects FP8 and FP32 scales");
+    }
+    if (input.shape().ndim() != 2 || scales.shape().ndim() != 2 ||
+        input.data() == nullptr || scales.data() == nullptr ||
+        block_rows <= 0 || block_columns <= 0) {
+        return Status(StatusCode::InvalidArgument,
+                      "Invalid 2D FP8 dequantization arguments");
+    }
+    const int64_t rows = input.shape().dim(0);
+    const int64_t columns = input.shape().dim(1);
+    const int64_t scale_rows = (rows + block_rows - 1) / block_rows;
+    const int64_t scale_columns = (columns + block_columns - 1) /
+                                  block_columns;
+    if (scales.shape() != Shape({scale_rows, scale_columns})) {
+        return Status(StatusCode::InvalidArgument,
+                      "2D FP8 scale shape does not match input blocks");
+    }
+
+    auto backend = BackendRegistry::instance().create_backend(input.device());
+    if (backend == nullptr) {
+        return Status(StatusCode::InvalidDevice,
+                      "No backend available for FP8 dequantization");
+    }
+    auto buffer = backend->create_buffer(input.numel() * sizeof(float),
+                                         input.buffer()->memory_type());
+    if (buffer == nullptr) {
+        return Status(StatusCode::OutOfMemory,
+                      "Failed to allocate FP8 dequantization output");
+    }
+
+    const auto* encoded = static_cast<const uint8_t*>(input.data());
+    const auto* scale_data = static_cast<const float*>(scales.data());
+    auto* decoded = static_cast<float*>(buffer->data());
+    for (int64_t row = 0; row < rows; ++row) {
+        for (int64_t column = 0; column < columns; ++column) {
+            const int64_t scale_row = row / block_rows;
+            const int64_t scale_column = column / block_columns;
+            const int64_t scale_index = scale_row * scale_columns +
+                                        scale_column;
+            const int64_t index = row * columns + column;
+            decoded[index] = decode_e4m3(encoded[index]) *
+                             scale_data[scale_index];
+        }
+    }
+    *output = Tensor(input.shape(), DType::FP32, input.device(),
+                     std::move(buffer));
+    return Status::OK();
+}
+
 } // namespace hybridai::ops

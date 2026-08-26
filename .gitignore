@@ -1,6 +1,17 @@
 ## custom gitignore
 third_party/deps_local/*
-build
+
+# CMake build directories and generated build trees
+/build/
+/build-*/
+/out/
+/cmake-build-*/
+
+# CMake-generated Visual Studio projects and solutions
+*.vcxproj
+*.vcxproj.filters
+*.sln
+*.slnx
 
 
 ## CMAKE gitignore

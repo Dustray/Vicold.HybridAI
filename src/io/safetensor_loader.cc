@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <fstream>
 #include <filesystem>
 #include <nlohmann/json.hpp>
@@ -332,6 +333,54 @@ Status SafeTensorLoader::load(const std::string& name, Device device,
     if (!copy_status.ok()) return copy_status;
 
     *output = Tensor(info->shape, info->dtype, device, std::move(buffer));
+    return Status::OK();
+}
+
+Status SafeTensorLoader::load_as_fp32(const std::string& name, Device device,
+                                      Tensor* output,
+                                      MemoryType memory_type) const {
+    if (output == nullptr) {
+        return Status(StatusCode::InvalidArgument,
+                      "SafeTensorLoader output must not be null");
+    }
+    const SafeTensorInfo* info = tensor_info(name);
+    if (info == nullptr) {
+        return Status(StatusCode::InvalidArgument,
+                      "Tensor not found in safetensors model: " + name);
+    }
+    if (info->dtype != DType::BF16 && info->dtype != DType::FP32) {
+        return Status(StatusCode::UnsupportedDType,
+                      "Only BF16 and FP32 can be loaded as FP32");
+    }
+
+    Tensor source;
+    Status status = load(name, device, &source, memory_type);
+    if (!status.ok()) return status;
+    if (info->dtype == DType::FP32) {
+        *output = std::move(source);
+        return Status::OK();
+    }
+
+    auto backend = BackendRegistry::instance().create_backend(device);
+    if (backend == nullptr) {
+        return Status(StatusCode::InvalidDevice,
+                      "No backend available for FP32 conversion");
+    }
+    auto buffer = backend->create_buffer(source.numel() * sizeof(float),
+                                         memory_type);
+    if (buffer == nullptr) {
+        return Status(StatusCode::OutOfMemory,
+                      "Failed to allocate FP32 scale tensor");
+    }
+    const auto* input = static_cast<const uint16_t*>(source.data());
+    auto* values = static_cast<float*>(buffer->data());
+    for (int64_t i = 0; i < source.numel(); ++i) {
+        const uint32_t bits = static_cast<uint32_t>(input[i]) << 16u;
+        float value;
+        std::memcpy(&value, &bits, sizeof(value));
+        values[i] = value;
+    }
+    *output = Tensor(source.shape(), DType::FP32, device, std::move(buffer));
     return Status::OK();
 }
 

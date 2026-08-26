@@ -2,6 +2,8 @@
 
 #include "backends/interface/backend.h"
 
+#include <memory>
+
 namespace hybridai {
 
 // HIP/ROCm backend. All native HIP API calls are confined to this file and its
@@ -13,6 +15,7 @@ public:
 
     const char* name() const noexcept override;
     Device device() const noexcept override;
+    bool is_available() const noexcept override;
 
     std::unique_ptr<Allocator> create_allocator(MemoryType type) override;
     std::shared_ptr<Buffer> create_buffer(size_t size,
@@ -40,7 +43,10 @@ public:
     void register_kernels() override;
 
 private:
+    struct Impl;
+
     Device device_;
+    std::unique_ptr<Impl> impl_;
     bool kernels_registered_ = false;
 };
 

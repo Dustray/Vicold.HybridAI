@@ -36,6 +36,10 @@ public:
     Status load(const std::string& name, Device device, Tensor* output,
                 MemoryType memory_type = MemoryType::Host) const;
 
+    Status load_as_fp32(const std::string& name, Device device,
+                        Tensor* output,
+                        MemoryType memory_type = MemoryType::Host) const;
+
 private:
     struct Shard {
         std::string path;

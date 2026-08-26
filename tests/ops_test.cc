@@ -13,6 +13,9 @@ namespace {
 
 TEST(OpsRegistryTest, CountKernelsAfterInit) {
     InitializeBuiltinBackends();
+    auto backend = BackendRegistry::instance().create_backend(Device::Cpu());
+    ASSERT_NE(backend, nullptr);
+    backend->register_kernels();
     EXPECT_GT(ops::KernelRegistry::instance().kernel_count(), 0u);
 }
 

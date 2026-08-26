@@ -108,6 +108,8 @@ const char* CpuBackend::name() const noexcept { return "cpu"; }
 
 Device CpuBackend::device() const noexcept { return device_; }
 
+bool CpuBackend::is_available() const noexcept { return true; }
+
 std::unique_ptr<Allocator> CpuBackend::create_allocator(MemoryType type) {
     if (type == MemoryType::Host || type == MemoryType::HostPinned ||
         type == MemoryType::Unified) {

@@ -10,6 +10,8 @@
 - **内存策略**：运行时启发式选择——dGPU 优先使用 `hipMalloc` 设备内存；iGPU 优先使用 `hipMallocManaged` 统一内存；模型大小超过显存时自动 fallback 到 CPU/分层加载。
 - **平台边界**：gfx1010 仅作为 HIP 编译目标或 CPU fallback，不承诺运行成功（ROCm 官方不支持 gfx1010）。
 - **首个里程碑**：先建立 Tensor、DeviceManager、Allocator、Linear Op、safetensor Loader、CLI 的最小闭环。
+- **视觉策略**：提供 `enable_vision` 加载选项，默认 `false`。第一阶段仅实现文本推理，不构建视觉网络，也不读取 `model.visual.*` 权重 payload；显式开启视觉时返回未实现状态，待视觉后端完成后再启用。
+- **推理目标**：正式推理路径以 GPU 为主，首要后端为 ROCm/HIP。CPU 算子只用于单元测试、数值对齐和 GPU 不可用时的诊断性 fallback，不把完整 CPU 推理作为阶段性交付目标。
 - **开发规范**：
   - 所有 CUDA/HIP 原生 API（如 `hipMalloc`、`cudaMalloc`、`hipStreamSynchronize`、`rocblas_xxx`、`cublas_xxx` 等）必须封装在 `src/backends/` 对应后端实现内部。
   - 业务代码（`core/`、`memory/`、`ops/`、`runtime/`、`models/`、`io/`、`cli/`）**严禁直接包含 `<cuda_runtime.h>`、`<hip/hip_runtime.h>`、`<rocblas.h>`、`<cublas_v2.h>` 等原生头文件**，只能通过 `src/backends/interface/` 中定义的抽象接口与后端交互。
@@ -104,6 +106,114 @@ Vicold.HybridAI/
 
 ## 阶段化实施
 
+## 当前实施状态（2026-08-26）
+
+已完成：
+
+- Phase 0：CMake/C++20 工程脚手架与基础依赖。
+- Phase 1：Device、DType、Shape、Tensor、Backend 等核心抽象。
+- Phase 2：MemoryPool、MemoryPlanner 与 CPU/HIP stub 后端。
+- Phase 3：Backend/KernelRegistry 抽象及 CUDA/HIP API 封装边界。
+- Phase 4：Linear、Elementwise、RMSNorm、RoPE、Softmax 等基础算子。
+- Phase 5：Gated GQA Attention 与 Gated DeltaNet reference 实现，用于验证后续 GPU kernel。
+- Phase 6 初版：SafeTensor 单文件读取、FP8 E4M3 基础反量化、Qwen3 配置解析。
+- 真实模型 metadata 校验：已验证 `E:/models/Qwen3.8-27B-FP8` 的配置、64 个 layer 分片及关键 tensor header。
+- 分片基础支持：已支持 `model.safetensors.index.json`、跨分片 tensor 查询和按需读取。
+- 扩展性基础：已加入通用 `ModelWeightSchema`、Qwen 专用 schema 和 `WeightPlacementPlanner`。
+- 视觉开关：已实现 `enable_vision=false` 默认策略；文本模式不会加载视觉权重 payload。
+- HIP 后端基础实现：已完成 HIP allocator、buffer、stream、event、H2D/D2H/D2D copy、设备可用性检查和 rocBLAS FP32 GEMM 封装。
+- HIP/rocBLAS CMake 探测：已验证 Windows ROCm SDK 的 `hip` 与 `rocblas` config package 可以被识别。
+- Windows 构建隔离：由于当前 Visual Studio generator 不支持原生 HIP language，已改为由 `hipcc` custom command 编译 HIP 对象，再链接到 C++ 主库。
+- 自动化测试：普通 CPU/stub 构建的 GTest 全部通过，共 62 项测试。
+
+进行中：
+
+- Windows 下 HIP custom command 的可重复构建：hipcc 手动编译已成功，但 MSBuild 执行时仍存在 MSVC `<cmath>` 与 HIP math forward declaration 冲突。
+- HIP 对象与 Visual Studio Debug 目标的 ABI/CRT 对齐，已确认需要使用 `_ITERATOR_DEBUG_LEVEL=2`、`-D_DEBUG` 和 `-fms-runtime-lib=dll_dbg`。
+- 真实 GPU GEMM smoke test 的运行环境整理，包括 ROCm DLL、rocBLAS Tensile 数据文件和设备选择。
+- 二维 FP8 block scale 反量化与通用量化权重表示。
+
+尚未完成：
+
+- Qwen3.8 权重对象和完整 64 层前向。
+- 可配置的完整多设备流水线与 CPU offload。
+- Linux ROCm 构建验证和 CUDA 后端实现。
+- 真实 HIP GPU kernel、性能测试和 CLI 端到端推理。
+
+### 最新构建与 GPU 验证结论
+
+- `build/`：CPU/stub 配置稳定构建通过，62 项测试通过。
+- `build-hip/`：HIP/rocBLAS 配置成功；手动调用 Windows ROCm SDK 的 `hipcc` 可以编译 `hip_backend.cc`，并且使用 Debug DLL CRT 参数后可以与 Debug 主库链接。
+- MSBuild custom command：仍会在 HIP 编译阶段触发 `<cmath>` 与 `__clang_cuda_math_forward_declares.h` 的 `isgreater` 等重载冲突，因此当前不能宣称 HIP CMake 构建已经完全打通。
+- HIP 测试程序：在补充 ROCm DLL 路径后能够启动，但当前默认选择的 device 0（`gfx1010`）缺少 rocBLAS 所需的 `TensileLibrary.dat`，测试异常退出。需要先实现真实设备探测/选择，并确认 `gfx1150` 的 rocBLAS 数据文件与运行支持。
+- 结论：GPU-first 路线已经完成后端代码和链接层的基础打通，但真实设备上的 rocBLAS GEMM 尚未验证成功；后续不能将 CPU/stub 测试结果当作 GPU 推理完成。
+
+### Windows/Linux 构建策略
+
+- `.vcxproj`、`.sln` 和其他 Visual Studio 工程文件均为 CMake 生成物，不纳入 Git；构建目录使用 `build/`、`build-hip/` 或 `build-linux/` 分离。
+- Windows：继续使用 Visual Studio generator；HIP 源文件通过独立 `hipcc` custom command 编译，避免向 MSVC 目标传播 `hip::device` 的 `-x hip` 参数。
+- Linux：优先使用 Ninja 或 Unix Makefiles，并使用 CMake 原生 HIP language/`hipcc` 集成；不复用 Windows 的 `.vcxproj` 和 custom object 方案。
+- 两个平台共享 `Backend`、Tensor、模型和 IO 抽象，平台差异限制在后端实现及 CMake 条件分支中。
+
+## 架构扩展原则
+
+本项目不能假设所有模型或所有设备都采用相同的权重布局。后续实现必须遵守以下边界：
+
+1. **模型无关的文件层**：`SafeTensorLoader` 只负责单文件/目录/index、header 解析和按需字节读取，不包含 Qwen 网络结构判断。
+2. **模型专用的 schema 层**：Qwen 的 tensor 命名、层结构、权重别名和 scale 配对放在 `Qwen3WeightSchema`/`Qwen3WeightLoader` 中。未来通过新增 `LlamaWeightSchema`、`DeepSeekWeightSchema` 等支持其他模型，不修改通用加载器。
+3. **模型无关的量化层**：FP8、INT8、INT4 等采用统一量化权重描述，scale 形式通过 metadata 描述，不能把二维 block scale 写死到 Qwen 前向代码。
+4. **模型无关的放置层**：权重放置由 `WeightPlacementPlanner` 决定，模型代码只提供 tensor 名称、层编号、大小和生命周期信息。
+5. **单文件与分片并存**：同一模型可以是一个 `model.safetensors`，也可以由 index 指向多个分片；业务层不能依赖具体文件名或分片数量。
+6. **切片策略可配置**：默认支持不切片/单设备加载；资源不足时才启用按层切片、CPU offload 或多设备放置。切片不是模型格式的强制要求。
+7. **设备策略可扩展**：设备列表、容量、统一内存能力、带宽和优先级通过运行时配置提供，不能在 Qwen 类中写死 iGPU/dGPU 数量。
+8. **后端隔离**：模型、算子编排和 IO 层不得包含 CUDA/HIP/rocBLAS/cuBLAS 原生头文件或调用，只能访问 `Backend` 抽象。
+9. **多模态按需加载**：视觉等可选模态必须由模型加载选项显式开启。默认文本模式不得加载视觉 tensor payload，避免无效内存和磁盘带宽占用。
+
+## 可配置权重放置方案
+
+统一使用 `WeightShardingConfig` 描述部署策略：
+
+| 模式 | 行为 | 适用场景 |
+|------|------|----------|
+| `Replicated` | 权重复制到配置的设备 | 单设备、统一内存或显存足够 |
+| `Layer` | 按层分配到设备 | 多设备协同、显存不足 |
+| `ManualRanges` | 用户指定层范围与目标设备 | 固定部署拓扑 |
+| `MemoryBalanced` | 根据设备可用容量自动平衡 | 异构 iGPU/dGPU/CPU |
+| `CPUOffload` | 权重常驻 CPU，当前层按需搬运 | 单卡显存严重不足 |
+
+配置至少应包含：
+
+- 设备列表及设备类型；
+- 每个设备的可用内存预算；
+- 是否允许统一内存；
+- 是否允许复制公共权重；
+- 层切分范围或自动平衡策略；
+- 当前层预取数量；
+- 内存不足时的 fallback 顺序。
+
+示例部署语义：
+
+```text
+单设备模式：        全部权重 -> CPU 或一个 GPU
+按层模式：          layer[0..N] -> iGPU，layer[N+1..63] -> dGPU
+CPU offload 模式：   CPU 保存全部权重，GPU 只保留当前计算层
+混合模式：          embedding/final norm -> CPU，其余层按容量分配
+```
+
+## 模型插件边界
+
+每个模型适配器应至少提供以下组件：
+
+```text
+ModelConfig              # 配置解析
+ModelWeightSchema         # tensor name -> canonical key/layer/scale
+ModelWeightLoader         # 组装模型权重对象
+ModelArchitecture         # 层结构和前向编排
+ModelTokenizerAdapter     # tokenizer 与 chat template
+```
+
+Qwen3.8 只是第一个适配器，不应成为核心运行时的硬编码分支。
+
 ### Phase 0: 脚手架与构建系统
 1. 创建根 `CMakeLists.txt`，C++20 标准，CMake 3.20+。
 2. 在 `cmake/Options.cmake` 中定义构建选项：
@@ -144,6 +254,8 @@ Vicold.HybridAI/
 4. 设计 `KernelRegistry`：允许手写 kernel 按（op, device, dtype）三元组注册，运行时可替换默认 BLAS 实现。
 5. **验证**：Backend 工厂按设备类型创建正确后端；手写空 kernel 注册/反注册测试；`grep -R "hipMalloc\|cudaMalloc" src/core src/ops src/runtime src/models src/io src/cli` 无结果。
 
+当前状态：CPU/stub 路径已完成；Windows HIP/rocBLAS 代码和主库链接已完成初步验证，但 custom hipcc 的 MSBuild 可重复构建及真实设备运行仍未闭环。
+
 ### Phase 4: 基础算子与注册表
 1. 实现 `OpRegistry` 与 `KernelSelector`：根据 Tensor 设备、DType、全局策略选择 kernel。
 2. 实现 `Linear` 算子：调用后端 `gemm()`，优先 rocBLAS/cuBLAS，预留手写 tile kernel 注册入口。
@@ -165,28 +277,39 @@ Vicold.HybridAI/
 
 ### Phase 6: safetensor 加载与 FP8 反量化
 1. 实现 `SafeTensorLoader`：读取 `.safetensors` header JSON，解析 tensor metadata，按名字映射加载到 `Tensor`。
-2. 实现 `FP8Dequantizer`：将 FP8 E4M3 块量化权重按 128 块大小反量化为 BF16/FP16。
-3. 实现 `Qwen3Config`：解析 `config.json` 中的模型超参数。
-4. **验证**：加载 Qwen3.8-27B-FP8 的 safetensors，检查所有权重名、形状、dtype；对单个 Linear 权重反量化后与 BF16 基模型对比误差。
+2. 实现目录/index-aware SafeTensor loader：同时支持单文件、未切片目录和多个分片；读取 index 后按 tensor 按需打开 shard。
+3. 实现通用 `QuantizedWeight` 与 scale metadata：支持 per-tensor、per-row、per-column 和二维 block scale。
+4. 实现 `FP8Dequantizer`：将 FP8 E4M3 块量化权重按 128 block 反量化为 BF16/FP16，保留 FP8 GEMM 的后端扩展入口。
+5. 实现通用 `ModelWeightSchema`，再实现 Qwen3 专用 schema 和 scale 配对规则。
+6. 实现 `Qwen3Config`：解析 `config.json` 中的模型超参数。
+7. **验证**：只读 header 扫描全部真实分片，检查权重名、形状、dtype、offset；对单个 Linear 权重反量化后与 BF16 基模型对比误差。
+
+当前状态：SafeTensor 单文件/分片读取、真实模型 metadata 检查、FP8 E4M3 基础表示和 Qwen schema 已完成；GPU-safe 转换仍待实现。
 
 ### Phase 7: Qwen3.8 模型构建与前向
-1. 实现 `Qwen3ModelBuilder`：根据 `config.json` 与 safetensor 权重名构建完整的 64 层网络。
-2. 实现 `Qwen3Model::Forward(input_ids)`：
+1. 实现通用 `ModelBuilder` 生命周期和设备放置接口。
+2. 实现 `Qwen3ModelBuilder`：根据 `config.json`、Qwen schema 与 safetensor 权重名构建完整的 64 层网络。
+3. 实现按层懒加载/释放，避免一次性将约 30.89GB 权重反量化到单一设备。
+4. 实现 `Qwen3Model::Forward(input_ids)`：
    - Embedding lookup
    - 64 层循环（DeltaNet × 3 + GQA Attention × 1 为一组，共 16 组）
    - RMSNorm + LM Head
    - Sampling（greedy / top-k / top-p）
-3. 支持短上下文（4k / 8k）先跑通。
-4. **验证**：与 Transformers 在短 prompt 上输出一致。
+5. 支持短上下文（4k / 8k）先跑通。
+6. **验证**：GPU 输出与 reference/Transformers 对齐；同一权重在单设备和切分设备模式下输出一致。
+
+当前状态：尚未进入完整模型 GPU 前向；下一阶段先实现 GPU 单算子和最小单层路径，不回退为完整 CPU 推理交付。
 
 ### Phase 8: 多设备切分与流水线
-1. 实现 `PipelineStage`：持有子图、目标设备、输入输出 buffer。
+1. 将 `WeightPlacementPlanner` 扩展为 `Replicated`、`Layer`、`ManualRanges`、`MemoryBalanced` 和 `CPUOffload`。
+2. 实现 `PipelineStage`：持有子图、目标设备、输入输出 buffer。
 2. 实现 `StageConnector`：管理相邻 stage 之间的 `d2d` 或 `d2h/h2d` 传输。
 3. 实现 `PipelineExecutor`：按拓扑顺序执行 stages，使用 Event 同步。
 4. 实现切分策略：
    - 按层数切分到 iGPU/dGPU
    - 由于模型 27.8GB 远大于单卡显存，必要时引入 CPU offload
-5. **验证**：在两设备上运行部分层，中间传输正确，输出与单设备一致。
+5. 允许同一模型在单设备不切片模式下运行，不强制创建多设备 stage。
+6. **验证**：在单设备、CPU offload 和两设备切分模式运行部分层，中间传输正确，输出与单设备一致。
 
 ### Phase 9: CLI 与可观测性
 1. 实现 `hybridai_cli`：
@@ -239,5 +362,12 @@ Vicold.HybridAI/
 5. CLI `hybridai_cli run` 在短 prompt 上完成一次 Qwen3.8-27B-FP8 前向推理。
 6. 两设备切分运行输出与单设备运行输出在 FP32 绝对误差 < 1e-4 内一致。
 
-## 下一步建议
-确认是否按此计划开始实施 **Phase 0 脚手架与构建系统**。由于目标模型规模较大，建议先从 CPU-only 最小闭环开始，再逐步加入 HIP 后端与 FP8 处理。
+## 当前下一步执行顺序
+
+1. 完成二维 FP8 block scale 反量化和 `QuantizedWeight` 通用表示。
+2. 对真实 Qwen3.8-27B-FP8 全部分片执行 metadata 扫描和 scale 配对校验。
+3. 实现 `Qwen3LayerWeights`、`Qwen3ModelWeights` 和按层懒加载。
+4. 实现单层 Qwen3.8 GPU 前向；CPU reference 仅用于数值对照，再扩展到 64 层和短 prompt 推理。
+5. 将模型权重放置接入通用 planner，验证不切片、按层切分和 CPU offload 三种模式。
+6. 在不泄漏 HIP/CUDA API 的前提下实现 GPU backend 的 GEMM、基础算子和异步传输。
+7. 最后实现多设备流水线、CLI 推理、性能统计和 CUDA backend。

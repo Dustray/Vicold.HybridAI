@@ -68,6 +68,7 @@ public:
 
     virtual const char* name() const noexcept = 0;
     virtual Device device() const noexcept = 0;
+    virtual bool is_available() const noexcept = 0;
 
     // Memory management
     virtual std::unique_ptr<Allocator> create_allocator(MemoryType type) = 0;

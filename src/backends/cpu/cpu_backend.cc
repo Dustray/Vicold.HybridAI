@@ -193,11 +193,41 @@ void CpuBackend::register_kernels() {
     if (kernels_registered_) return;
     kernels_registered_ = true;
 
-    // Register a no-op placeholder kernel to prove the registry path works.
-    // Real CPU kernels (RMSNorm, RoPE, ...) will be registered here later.
     using namespace hybridai::ops;
+
+    auto register_unary = [](const char* name, auto fn) {
+        KernelRegistry::instance().register_kernel(
+            KernelKey{name, DeviceType::CPU, DType::FP32}, fn);
+    };
+
     KernelRegistry::instance().register_kernel(
         KernelKey{"noop", DeviceType::CPU, DType::FP32},
+        [](const std::vector<Tensor*>&, std::vector<Tensor*>&) {
+            return Status::OK();
+        });
+
+    // Placeholder registrations for elementwise ops. Full CPU reference
+    // kernels can be moved here later; for now Linear/Elementwise fall back
+    // to direct implementations when no kernel is found.
+    register_unary("relu",
+                 [](const std::vector<Tensor*>&, std::vector<Tensor*>&) {
+                     return Status::OK();
+                 });
+    register_unary("silu",
+                 [](const std::vector<Tensor*>&, std::vector<Tensor*>&) {
+                     return Status::OK();
+                 });
+    register_unary("gelu",
+                 [](const std::vector<Tensor*>&, std::vector<Tensor*>&) {
+                     return Status::OK();
+                 });
+    KernelRegistry::instance().register_kernel(
+        KernelKey{"rmsnorm", DeviceType::CPU, DType::FP32},
+        [](const std::vector<Tensor*>&, std::vector<Tensor*>&) {
+            return Status::OK();
+        });
+    KernelRegistry::instance().register_kernel(
+        KernelKey{"rope", DeviceType::CPU, DType::FP32},
         [](const std::vector<Tensor*>&, std::vector<Tensor*>&) {
             return Status::OK();
         });

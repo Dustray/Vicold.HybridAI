@@ -155,4 +155,15 @@ Tensor Tensor::contiguous() const {
     return result;
 }
 
+Tensor Tensor::reshape(const Shape& new_shape) const {
+    if (new_shape.numel() != shape_.numel()) {
+        return Tensor();
+    }
+    if (buffer_ == nullptr) {
+        return Tensor();
+    }
+    Tensor result(new_shape, dtype_, device_, buffer_);
+    return result;
+}
+
 } // namespace hybridai

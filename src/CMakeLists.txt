@@ -10,6 +10,10 @@ target_sources(hybridai
         core/tensor.cc
         core/platform.h
         core/platform.cc
+        io/safetensor_loader.h
+        io/safetensor_loader.cc
+        models/qwen3_config.h
+        models/qwen3_config.cc
         backends/interface/backend.h
         backends/backend_registry.h
         backends/backend_registry.cc

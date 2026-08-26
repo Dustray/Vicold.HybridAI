@@ -4,4 +4,18 @@ target_sources(hybridai
         registry.cc
         linear.h
         linear.cc
+        elementwise.h
+        elementwise.cc
+        rmsnorm.h
+        rmsnorm.cc
+        rope.h
+        rope.cc
+        softmax.h
+        softmax.cc
+        fp8_dequant.h
+        fp8_dequant.cc
+        attention.h
+        attention.cc
+        delta_net.h
+        delta_net.cc
 )

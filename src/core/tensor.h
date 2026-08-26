@@ -51,6 +51,12 @@ public:
     // Make contiguous copy if strides are not standard
     Tensor contiguous() const;
 
+    // Return a new tensor view with the given shape and the same buffer.
+    // The total number of elements must match. Strides are recomputed as
+    // contiguous; this is a convenience for operators that need to reshape
+    // between [seq_len, num_heads * head_dim] and [seq_len, num_heads, head_dim].
+    Tensor reshape(const Shape& new_shape) const;
+
     bool operator==(const Tensor& other) const noexcept {
         return shape_ == other.shape_ && dtype_ == other.dtype_ &&
                device_ == other.device_ && buffer_ == other.buffer_;

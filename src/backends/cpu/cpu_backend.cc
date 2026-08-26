@@ -1,5 +1,7 @@
 #include "backends/cpu/cpu_backend.h"
 
+#include "ops/registry.h"
+
 #include <algorithm>
 #include <cstring>
 
@@ -185,6 +187,20 @@ Status CpuBackend::gemm(Buffer* c, const Buffer* a, const Buffer* b,
     // TODO: add BLAS integration (OpenBLAS/MKL); for now naive reference
     return naive_gemm_f32(c->data(), a->data(), b->data(), trans_a, trans_b,
                             m, n, k, alpha, beta);
+}
+
+void CpuBackend::register_kernels() {
+    if (kernels_registered_) return;
+    kernels_registered_ = true;
+
+    // Register a no-op placeholder kernel to prove the registry path works.
+    // Real CPU kernels (RMSNorm, RoPE, ...) will be registered here later.
+    using namespace hybridai::ops;
+    KernelRegistry::instance().register_kernel(
+        KernelKey{"noop", DeviceType::CPU, DType::FP32},
+        [](const std::vector<Tensor*>&, std::vector<Tensor*>&) {
+            return Status::OK();
+        });
 }
 
 } // namespace hybridai

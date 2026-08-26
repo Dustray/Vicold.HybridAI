@@ -26,14 +26,15 @@ target_link_libraries(hybridai
 )
 
 add_subdirectory(memory)
+add_subdirectory(ops)
 
 if(HYBRIDAI_ENABLE_CPU)
     add_subdirectory(backends/cpu)
 endif()
 
-if(HYBRIDAI_ENABLE_HIP)
-    add_subdirectory(backends/hip)
-endif()
+# The HIP backend is always compiled (as a stub when HIP is unavailable) so that
+# code targeting the HIP abstraction can be built and tested on Windows.
+add_subdirectory(backends/hip)
 
 if(HYBRIDAI_ENABLE_CUDA)
     add_subdirectory(backends/cuda)

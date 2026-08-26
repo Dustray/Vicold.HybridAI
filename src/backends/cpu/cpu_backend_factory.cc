@@ -13,10 +13,18 @@ HYBRIDAI_REGISTER_BACKEND(cpu, create_cpu_backend);
 
 } // namespace
 
+void InitializeHipBackend();
+void InitializeCpuBackend();
+
 void InitializeBuiltinBackends() {
-    // The static registrar above performs the actual registration.
-    // Calling this function forces the translation unit to be linked,
-    // ensuring the registrar runs before main().
+    // Calling the per-backend helpers forces each translation unit containing
+    // the static BackendRegistrar to be linked, which performs the actual
+    // registration before main().
+    InitializeCpuBackend();
+    InitializeHipBackend();
+}
+
+void InitializeCpuBackend() {
     (void)BackendRegistry::instance().has_backend("cpu");
 }
 

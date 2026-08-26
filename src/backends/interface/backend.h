@@ -101,6 +101,12 @@ public:
                       bool trans_a, bool trans_b, int64_t m, int64_t n,
                       int64_t k, float alpha, float beta,
                       Stream* stream = nullptr) = 0;
+
+    // Kernel registration hook. Backends may pre-register custom kernels (e.g.
+    // hand-written tile kernels) into the global KernelRegistry during
+    // construction. This keeps kernel selection in ops/ independent of the
+    // concrete backend implementation.
+    virtual void register_kernels() {}
 };
 
 // Factory function signature for backend registration

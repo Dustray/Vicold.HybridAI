@@ -25,6 +25,8 @@ target_link_libraries(hybridai
         nlohmann_json::nlohmann_json
 )
 
+add_subdirectory(memory)
+
 if(HYBRIDAI_ENABLE_CPU)
     add_subdirectory(backends/cpu)
 endif()

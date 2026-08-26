@@ -1,0 +1,39 @@
+#pragma once
+
+#include "backends/interface/backend.h"
+
+#include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+namespace hybridai {
+
+class BackendRegistry {
+public:
+    static BackendRegistry& instance();
+
+    void register_backend(std::string_view name, BackendFactory factory);
+    std::unique_ptr<Backend> create_backend(const Device& device);
+
+    bool has_backend(std::string_view name) const;
+
+private:
+    BackendRegistry() = default;
+
+    mutable std::mutex mutex_;
+    std::unordered_map<std::string, BackendFactory> factories_;
+};
+
+class BackendRegistrar {
+public:
+    explicit BackendRegistrar(std::string_view name, BackendFactory factory) {
+        BackendRegistry::instance().register_backend(name, std::move(factory));
+    }
+};
+
+#define HYBRIDAI_REGISTER_BACKEND(name, factory) \
+    static ::hybridai::BackendRegistrar g_hybridai_backend_##name( \
+        #name, factory)
+
+} // namespace hybridai

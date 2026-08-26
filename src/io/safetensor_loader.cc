@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <filesystem>
 #include <nlohmann/json.hpp>
 
 namespace hybridai::io {
@@ -50,6 +51,31 @@ Status SafeTensorLoader::open(const std::string& path) {
     path_.clear();
     data_section_offset_ = 0;
     tensors_.clear();
+    tensor_shards_.clear();
+    shards_.clear();
+
+    if (!platform::file_exists(path)) {
+        return Status(StatusCode::FileNotFound,
+                      "Safetensors file does not exist: " + path);
+    }
+
+    Shard shard;
+    Status status = parse_shard(path, &shard);
+    if (!status.ok()) return status;
+
+    path_ = path;
+    data_section_offset_ = shard.data_section_offset;
+    tensors_ = std::move(shard.tensors);
+    return Status::OK();
+}
+
+Status SafeTensorLoader::parse_shard(const std::string& path, Shard* shard) {
+    if (shard == nullptr) {
+        return Status(StatusCode::InvalidArgument, "Shard must not be null");
+    }
+    shard->path.clear();
+    shard->data_section_offset = 0;
+    shard->tensors.clear();
 
     if (!platform::file_exists(path)) {
         return Status(StatusCode::FileNotFound,
@@ -137,11 +163,84 @@ Status SafeTensorLoader::open(const std::string& path) {
                           "Tensor byte size does not match shape for: " + name);
         }
 
-        tensors_.emplace(name, std::move(info));
+            shard->tensors.emplace(name, std::move(info));
+    }
+
+        shard->path = path;
+        shard->data_section_offset = 8 + header_size;
+    return Status::OK();
+}
+
+Status SafeTensorLoader::open_model(const std::string& path) {
+    if (!std::filesystem::is_directory(path)) {
+        return open(path);
+    }
+
+    const auto index_path = std::filesystem::path(path) /
+                            "model.safetensors.index.json";
+    if (!platform::file_exists(index_path.string())) {
+        const auto single_file = std::filesystem::path(path) /
+                                 "model.safetensors";
+        if (platform::file_exists(single_file.string())) {
+            return open(single_file.string());
+        }
+        return Status(StatusCode::FileNotFound,
+                      "Neither safetensors index nor model.safetensors exists: " +
+                          path);
+    }
+
+    std::ifstream index_file(index_path);
+    if (!index_file) {
+        return Status(StatusCode::FileNotFound,
+                      "Failed to open safetensors index: " +
+                          index_path.string());
+    }
+
+    nlohmann::json index;
+    try {
+        index_file >> index;
+    } catch (const nlohmann::json::exception& error) {
+        return Status(StatusCode::InvalidModel,
+                      std::string("Invalid safetensors index JSON: ") +
+                          error.what());
+    }
+    if (!index.contains("weight_map") || !index["weight_map"].is_object()) {
+        return Status(StatusCode::InvalidModel,
+                      "Safetensors index has no valid weight_map");
+    }
+
+    path_.clear();
+    data_section_offset_ = 0;
+    tensors_.clear();
+    tensor_shards_.clear();
+    shards_.clear();
+
+    for (const auto& [name, shard_name_json] : index["weight_map"].items()) {
+        if (!shard_name_json.is_string()) {
+            return Status(StatusCode::InvalidModel,
+                          "Invalid shard name for tensor: " + name);
+        }
+        const std::string shard_name = shard_name_json.get<std::string>();
+        const std::string shard_path =
+            (std::filesystem::path(path) / shard_name).string();
+        if (shards_.find(shard_name) == shards_.end()) {
+            Shard shard;
+            Status status = parse_shard(shard_path, &shard);
+            if (!status.ok()) return status;
+            shards_.emplace(shard_name, std::move(shard));
+        }
+        const auto& shard = shards_.at(shard_name);
+        const auto tensor_it = shard.tensors.find(name);
+        if (tensor_it == shard.tensors.end()) {
+            return Status(StatusCode::InvalidModel,
+                          "Tensor listed in index is missing from shard: " +
+                              name);
+        }
+        tensors_.emplace(name, tensor_it->second);
+        tensor_shards_.emplace(name, shard_name);
     }
 
     path_ = path;
-    data_section_offset_ = 8 + header_size;
     return Status::OK();
 }
 
@@ -188,12 +287,30 @@ Status SafeTensorLoader::load(const std::string& name, Device device,
                       "Failed to allocate tensor buffer");
     }
 
-    std::ifstream file(path_, std::ios::binary);
+    std::string source_path = path_;
+    uint64_t source_data_offset = data_section_offset_;
+    if (!tensor_shards_.empty()) {
+        const auto shard_name_it = tensor_shards_.find(name);
+        if (shard_name_it == tensor_shards_.end()) {
+            return Status(StatusCode::InvalidModel,
+                          "No shard mapping for tensor: " + name);
+        }
+        const auto shard_it = shards_.find(shard_name_it->second);
+        if (shard_it == shards_.end()) {
+            return Status(StatusCode::InvalidModel,
+                          "Mapped shard is not loaded: " +
+                              shard_name_it->second);
+        }
+        source_path = shard_it->second.path;
+        source_data_offset = shard_it->second.data_section_offset;
+    }
+
+    std::ifstream file(source_path, std::ios::binary);
     if (!file) {
         return Status(StatusCode::FileNotFound,
-                      "Failed to reopen safetensors file: " + path_);
+                      "Failed to reopen safetensors file: " + source_path);
     }
-    file.seekg(static_cast<std::streamoff>(data_section_offset_ +
+    file.seekg(static_cast<std::streamoff>(source_data_offset +
                                            info->data_begin));
     if (!file) {
         return Status(StatusCode::InvalidModel,

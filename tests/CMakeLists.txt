@@ -14,6 +14,7 @@ add_executable(hybridai_test
     ops_fp8_dequant_test.cc
     models_qwen3_config_test.cc
     io_real_model_test.cc
+    models_weight_sharding_test.cc
 )
 
 target_link_libraries(hybridai_test

@@ -14,6 +14,10 @@ target_sources(hybridai
         io/safetensor_loader.cc
         models/qwen3_config.h
         models/qwen3_config.cc
+        models/weight_sharding.h
+        models/weight_sharding.cc
+        models/model_weight_schema.h
+        models/model_weight_schema.cc
         backends/interface/backend.h
         backends/backend_registry.h
         backends/backend_registry.cc

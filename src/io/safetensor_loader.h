@@ -23,6 +23,9 @@ struct SafeTensorInfo {
 class SafeTensorLoader {
 public:
     Status open(const std::string& path);
+    // Opens either a single safetensors file or a model directory containing
+    // model.safetensors.index.json and multiple shard files.
+    Status open_model(const std::string& path);
 
     bool is_open() const noexcept { return !path_.empty(); }
     const std::string& path() const noexcept { return path_; }
@@ -34,9 +37,19 @@ public:
                 MemoryType memory_type = MemoryType::Host) const;
 
 private:
+    struct Shard {
+        std::string path;
+        uint64_t data_section_offset = 0;
+        std::unordered_map<std::string, SafeTensorInfo> tensors;
+    };
+
+    Status parse_shard(const std::string& path, Shard* shard);
+
     std::string path_;
     uint64_t data_section_offset_ = 0;
     std::unordered_map<std::string, SafeTensorInfo> tensors_;
+    std::unordered_map<std::string, std::string> tensor_shards_;
+    std::unordered_map<std::string, Shard> shards_;
 };
 
 } // namespace hybridai::io

@@ -1,15 +1,14 @@
+#ifdef HYBRIDAI_HAS_HIP
+#include <hip/hip_runtime.h>
+#include <rocblas/rocblas.h>
+#endif
+
 #include "backends/hip/hip_backend.h"
 
 #include "ops/registry.h"
 
 #include <cstring>
 #include <stdexcept>
-
-// Note: native HIP headers are only included here, in the backend implementation.
-#ifdef HYBRIDAI_HAS_HIP
-#include <hip/hip_runtime.h>
-#include <rocblas/rocblas.h>
-#endif
 
 namespace hybridai {
 
@@ -100,7 +99,7 @@ public:
     explicit HipStream(hipStream_t stream) : stream_(stream) {}
     ~HipStream() override {
         if (stream_ != nullptr) {
-            hipStreamDestroy(stream_);
+            (void)hipStreamDestroy(stream_);
         }
     }
 
@@ -119,7 +118,7 @@ public:
     explicit HipEvent(hipEvent_t event) : event_(event) {}
     ~HipEvent() override {
         if (event_ != nullptr) {
-            hipEventDestroy(event_);
+            (void)hipEventDestroy(event_);
         }
     }
 
@@ -219,13 +218,61 @@ struct HipBackend::Impl {
 #endif
 };
 
+namespace {
+#ifdef HYBRIDAI_HAS_HIP
+// Try a tiny rocBLAS GEMM to verify the runtime can load kernels for the
+// detected GPU architecture. Windows ROCm packages may report a device but
+// ship Tensile kernels only for a different arch (e.g. gfx1010 vs gfx1150).
+bool rocblas_can_execute(rocblas_handle handle) {
+    float one = 1.0f;
+    float zero = 0.0f;
+    float host_a = 2.0f;
+    float host_b = 3.0f;
+    float host_c = 0.0f;
+    float* dev_a = nullptr;
+    float* dev_b = nullptr;
+    float* dev_c = nullptr;
+    if (hipMalloc(&dev_a, sizeof(float)) != hipSuccess ||
+        hipMalloc(&dev_b, sizeof(float)) != hipSuccess ||
+        hipMalloc(&dev_c, sizeof(float)) != hipSuccess) {
+        hipFree(dev_a);
+        hipFree(dev_b);
+        hipFree(dev_c);
+        return false;
+    }
+    hipMemcpy(dev_a, &host_a, sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(dev_b, &host_b, sizeof(float), hipMemcpyHostToDevice);
+    hipMemcpy(dev_c, &host_c, sizeof(float), hipMemcpyHostToDevice);
+    rocblas_status status = rocblas_sgemm(
+        handle, rocblas_operation_none, rocblas_operation_none, 1, 1, 1, &one,
+        dev_b, 1, dev_a, 1, &zero, dev_c, 1);
+    if (status == rocblas_status_success) {
+        status = rocblas_sgemm(handle, rocblas_operation_none,
+                               rocblas_operation_none, 1, 1, 1, &one, dev_b, 1,
+                               dev_a, 1, &zero, dev_c, 1);
+    }
+    hipFree(dev_a);
+    hipFree(dev_b);
+    hipFree(dev_c);
+    return status == rocblas_status_success;
+}
+#endif
+} // namespace
+
 HipBackend::HipBackend(const Device& device)
     : device_(device), impl_(std::make_unique<Impl>()) {
 #ifdef HYBRIDAI_HAS_HIP
-    if (hipSetDevice(device_.id()) == hipSuccess) {
-        if (rocblas_create_handle(&impl_->rocblas) != rocblas_status_success) {
-            impl_->rocblas = nullptr;
-        }
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        impl_->rocblas = nullptr;
+        return;
+    }
+    if (rocblas_create_handle(&impl_->rocblas) != rocblas_status_success) {
+        impl_->rocblas = nullptr;
+        return;
+    }
+    if (!rocblas_can_execute(impl_->rocblas)) {
+        rocblas_destroy_handle(impl_->rocblas);
+        impl_->rocblas = nullptr;
     }
 #endif
 }
@@ -245,8 +292,16 @@ Device HipBackend::device() const noexcept { return device_; }
 bool HipBackend::is_available() const noexcept {
 #ifdef HYBRIDAI_HAS_HIP
     int count = 0;
-    return hipGetDeviceCount(&count) == hipSuccess && device_.id() >= 0 &&
-           device_.id() < count;
+    if (hipGetDeviceCount(&count) != hipSuccess || device_.id() < 0 ||
+        device_.id() >= count) {
+        return false;
+    }
+    // A HIP device is only "available" for compute if rocBLAS can create a
+    // working handle on it. Some Windows ROCm installations expose a device
+    // but ship no kernel metadata for the detected architecture (e.g. gfx1010
+    // without Tensile kernels); requiring a valid rocBLAS handle avoids
+    // failing later during the first GEMM call.
+    return impl_ != nullptr && impl_->rocblas != nullptr;
 #else
     return false;
 #endif

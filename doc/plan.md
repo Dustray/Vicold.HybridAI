@@ -106,7 +106,7 @@ Vicold.HybridAI/
 
 ## 阶段化实施
 
-## 当前实施状态（2026-08-26）
+## 当前实施状态（2026-08-27）
 
 已完成：
 
@@ -123,14 +123,12 @@ Vicold.HybridAI/
 - 视觉开关：已实现 `enable_vision=false` 默认策略；文本模式不会加载视觉权重 payload。
 - HIP 后端基础实现：已完成 HIP allocator、buffer、stream、event、H2D/D2H/D2D copy、设备可用性检查和 rocBLAS FP32 GEMM 封装。
 - HIP/rocBLAS CMake 探测：已验证 Windows ROCm SDK 的 `hip` 与 `rocblas` config package 可以被识别。
-- Windows 构建隔离：由于当前 Visual Studio generator 不支持原生 HIP language，已改为由 `hipcc` custom command 编译 HIP 对象，再链接到 C++ 主库。
-- 自动化测试：普通 CPU/stub 构建的 GTest 全部通过，共 62 项测试。
+- **Windows HIP/ROCm 构建链路打通**：将 `src/backends/hip/hip_backend.cc` 改为由 MSVC 直接编译（ROCm headers 在该文件上是 host-only），彻底消除了 ROCm Clang 与 MSVC Debug CRT 的 runtime library mismatch（LNK2038）。`hybridai_test.exe` Debug 配置完整链接成功。
+- 自动化测试：普通 CPU/stub 构建的 GTest 全部通过，共 62 项测试；HIP 后端注册/创建/空 kernel 注册测试通过。
 
 进行中：
 
-- Windows 下 HIP custom command 的可重复构建：hipcc 手动编译已成功，但 MSBuild 执行时仍存在 MSVC `<cmath>` 与 HIP math forward declaration 冲突。
-- HIP 对象与 Visual Studio Debug 目标的 ABI/CRT 对齐，已确认需要使用 `_ITERATOR_DEBUG_LEVEL=2`、`-D_DEBUG` 和 `-fms-runtime-lib=dll_dbg`。
-- 真实 GPU GEMM smoke test 的运行环境整理，包括 ROCm DLL、rocBLAS Tensile 数据文件和设备选择。
+- 真实 GPU GEMM smoke test 的运行环境整理：Windows ROCm 运行时当前把 device 0 识别为 `gfx1010`，但 SDK 仅提供 `gfx1150` 的 Tensile kernel 数据，导致 rocBLAS 加载 kernel 失败。已在 `HipBackend` 构造时增加一次最小 sgemm 探测，无法执行 kernel 时标记为不可用，GEMM 测试自动跳过，避免异常退出。
 - 二维 FP8 block scale 反量化与通用量化权重表示。
 
 尚未完成：
@@ -143,17 +141,29 @@ Vicold.HybridAI/
 ### 最新构建与 GPU 验证结论
 
 - `build/`：CPU/stub 配置稳定构建通过，62 项测试通过。
-- `build-hip/`：HIP/rocBLAS 配置成功；手动调用 Windows ROCm SDK 的 `hipcc` 可以编译 `hip_backend.cc`，并且使用 Debug DLL CRT 参数后可以与 Debug 主库链接。
-- MSBuild custom command：仍会在 HIP 编译阶段触发 `<cmath>` 与 `__clang_cuda_math_forward_declares.h` 的 `isgreater` 等重载冲突，因此当前不能宣称 HIP CMake 构建已经完全打通。
-- HIP 测试程序：在补充 ROCm DLL 路径后能够启动，但当前默认选择的 device 0（`gfx1010`）缺少 rocBLAS 所需的 `TensileLibrary.dat`，测试异常退出。需要先实现真实设备探测/选择，并确认 `gfx1150` 的 rocBLAS 数据文件与运行支持。
-- 结论：GPU-first 路线已经完成后端代码和链接层的基础打通，但真实设备上的 rocBLAS GEMM 尚未验证成功；后续不能将 CPU/stub 测试结果当作 GPU 推理完成。
+- `build-debug/`（`-D HYBRIDAI_ENABLE_HIP=ON`）：完整 Debug 构建通过，`hybridai.lib` 与 `hybridai_test.exe` 链接成功，无 LNK2038 runtime mismatch。
+- Windows HIP 编译方案：放弃 ROCm Clang custom command，改用 MSVC 直接编译 `hip_backend.cc`。ROCm include 路径与 `__HIP_PLATFORM_AMD__` 宏通过 CMake `set_source_files_properties` 仅作用于该源文件，主库仍正常链接 `hip::host` 与 `roc::rocblas` 导入库。
+- HIP 测试程序：在配置 `ROCBLAS_TENSILE_LIBPATH` 指向 `.../rocblas/library/gfx1150` 后能正常初始化 rocBLAS；但当前机器 ROCm 运行时把设备识别为 `gfx1010`，找不到对应 kernel（SDK 只有 gfx1150 kernel），GEMM 实测失败。`HipBackend::is_available()` 现已通过一次最小 sgemm 探测把此类设备标记为不可用，测试自动跳过而不是崩溃。
+- 结论：Windows 下 HIP/ROCm 从 CMake 配置、编译、链接到程序启动的完整链路已打通；真实设备上的 rocBLAS GEMM 仍受限于当前硬件/驱动环境（gfx1010 vs gfx1150 不匹配），需要到有真实 AMD GPU 或正确 ROCm 环境的目标机器上再验证实际计算。
 
 ### Windows/Linux 构建策略
 
-- `.vcxproj`、`.sln` 和其他 Visual Studio 工程文件均为 CMake 生成物，不纳入 Git；构建目录使用 `build/`、`build-hip/` 或 `build-linux/` 分离。
-- Windows：继续使用 Visual Studio generator；HIP 源文件通过独立 `hipcc` custom command 编译，避免向 MSVC 目标传播 `hip::device` 的 `-x hip` 参数。
-- Linux：优先使用 Ninja 或 Unix Makefiles，并使用 CMake 原生 HIP language/`hipcc` 集成；不复用 Windows 的 `.vcxproj` 和 custom object 方案。
+- `.vcxproj`、`.sln` 和其他 Visual Studio 工程文件均为 CMake 生成物，不纳入 Git；构建目录使用 `build/`、`build-debug/`、`build-hip/` 或 `build-linux/` 分离。
+- Windows：继续使用 Visual Studio generator；`hip_backend.cc` 仅使用 HIP host API，因此由 MSVC 直接编译，无需 `hipcc` custom command。CMake 通过 `set_source_files_properties` 只为该文件添加 ROCm include 路径与 `__HIP_PLATFORM_AMD__` 宏。
+- Linux：优先使用 Ninja 或 Unix Makefiles，并使用 CMake 原生 HIP language/`hipcc` 集成；Windows 的 MSVC 直接编译方案不适用于 Linux。
 - 两个平台共享 `Backend`、Tensor、模型和 IO 抽象，平台差异限制在后端实现及 CMake 条件分支中。
+
+### Windows ROCm 运行环境配置
+
+在 Windows 上运行 HIP/rocBLAS 测试或可执行文件时，可能需要设置以下环境变量：
+
+- `ROCBLAS_TENSILE_LIBPATH`：指向 ROCm SDK 中 rocBLAS Tensile kernel 数据目录，例如：
+  ```powershell
+  $env:ROCBLAS_TENSILE_LIBPATH = 'C:\Users\yinxi\.venv\Lib\site-packages\_rocm_sdk_devel\bin\rocblas\library\gfx1150'
+  ```
+  该目录下需要存在 `TensileLibrary.dat` 主文件（当前 SDK 提供的是 `TensileLibrary_lazy_gfx1150.dat`，可复制一份重命名为 `TensileLibrary.dat`）。
+- `PATH`：确保 `amdhip64.dll`、`rocblas.dll` 等 ROCm 运行时 DLL 可被加载。通常 Python ROCm 包安装目录下的 `bin` 已加入 PATH，否则需手动添加。
+- 当前 ROCm Windows 运行时可能把设备识别为 `gfx1010`，而 SDK kernel 数据只有 `gfx1150`。若出现 `No paths matched ...*gfx1010*co`，说明运行环境与 SDK 架构不匹配，需要换到真实目标 GPU 环境验证，或检查驱动/HSA 配置。
 
 ## 架构扩展原则
 
@@ -254,7 +264,7 @@ Qwen3.8 只是第一个适配器，不应成为核心运行时的硬编码分支
 4. 设计 `KernelRegistry`：允许手写 kernel 按（op, device, dtype）三元组注册，运行时可替换默认 BLAS 实现。
 5. **验证**：Backend 工厂按设备类型创建正确后端；手写空 kernel 注册/反注册测试；`grep -R "hipMalloc\|cudaMalloc" src/core src/ops src/runtime src/models src/io src/cli` 无结果。
 
-当前状态：CPU/stub 路径已完成；Windows HIP/rocBLAS 代码和主库链接已完成初步验证，但 custom hipcc 的 MSBuild 可重复构建及真实设备运行仍未闭环。
+当前状态：CPU/stub 路径已完成；Windows 下 HIP/rocBLAS 代码已由 MSVC 直接编译、主库与测试可执行文件完整链接成功。真实 GPU 上的 rocBLAS GEMM 受当前测试机 ROCm 运行时识别架构（gfx1010）与 SDK kernel 数据（gfx1150）不匹配影响，已自动跳过相关测试。
 
 ### Phase 4: 基础算子与注册表
 1. 实现 `OpRegistry` 与 `KernelSelector`：根据 Tensor 设备、DType、全局策略选择 kernel。
@@ -351,7 +361,7 @@ Qwen3.8 只是第一个适配器，不应成为核心运行时的硬编码分支
 - **iGPU 统一内存性能**：gfx1150 为集成显卡，统一内存虽可零拷贝，但带宽与延迟需实测，必要时回退到显式拷贝。
 - **多设备协同复杂度**：初期仅实现 layer-level 切分，不实现 expert-level 或 pipeline-parallel 高级调度。
 - **视觉编码器暂时跳过**：先聚焦语言模型推理，视觉编码器后续作为扩展。
-- **跨平台构建复杂度**：Windows 上 ROCm/HIP 与 CMake/MSVC 的兼容性较弱，初期以 Linux 为主要开发平台，Windows 通过 CPU-only 模式先验证；CUDA 后端在 Windows 上更易验证。
+- 跨平台构建复杂度：Windows 上 ROCm/HIP 与 CMake/MSVC 的兼容性较弱，但当前已通过 MSVC 直接编译 HIP host API 的方式打通；CUDA 后端在 Windows 上更易验证。
 - **封装泄漏风险**：需通过代码审查与自动化 grep 脚本确保业务代码不直接包含 CUDA/HIP 头文件。
 
 ## 验证清单
@@ -364,10 +374,10 @@ Qwen3.8 只是第一个适配器，不应成为核心运行时的硬编码分支
 
 ## 当前下一步执行顺序
 
-1. 完成二维 FP8 block scale 反量化和 `QuantizedWeight` 通用表示。
-2. 对真实 Qwen3.8-27B-FP8 全部分片执行 metadata 扫描和 scale 配对校验。
-3. 实现 `Qwen3LayerWeights`、`Qwen3ModelWeights` 和按层懒加载。
-4. 实现单层 Qwen3.8 GPU 前向；CPU reference 仅用于数值对照，再扩展到 64 层和短 prompt 推理。
-5. 将模型权重放置接入通用 planner，验证不切片、按层切分和 CPU offload 三种模式。
-6. 在不泄漏 HIP/CUDA API 的前提下实现 GPU backend 的 GEMM、基础算子和异步传输。
-7. 最后实现多设备流水线、CLI 推理、性能统计和 CUDA backend。
+1. 在真实 AMD GPU / 匹配 ROCm 环境的机器上验证 HIP/rocBLAS FP32 GEMM 实际计算成功。
+2. 完成二维 FP8 block scale 反量化和 `QuantizedWeight` 通用表示。
+3. 对真实 Qwen3.8-27B-FP8 全部分片执行 metadata 扫描和 scale 配对校验。
+4. 实现 `Qwen3LayerWeights`、`Qwen3ModelWeights` 和按层懒加载。
+5. 实现单层 Qwen3.8 GPU 前向；CPU reference 仅用于数值对照，再扩展到 64 层和短 prompt 推理。
+6. 将模型权重放置接入通用 planner，验证不切片、按层切分和 CPU offload 三种模式。
+7. 实现多设备流水线、CLI 推理、性能统计和 CUDA backend。

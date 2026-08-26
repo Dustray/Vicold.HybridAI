@@ -12,6 +12,14 @@ target_sources(hybridai
 if(HYBRIDAI_ENABLE_HIP)
     # Prefer ROCm config packages. The SDK's legacy FindHIP module can report
     # HIP correctly but still leave the rocBLAS config package undiscovered.
+    if(WIN32 AND DEFINED HYBRIDAI_ROCM_ROOT)
+        if(NOT hip_DIR)
+            set(hip_DIR "${HYBRIDAI_ROCM_ROOT}/lib/cmake/hip")
+        endif()
+        if(NOT rocblas_DIR)
+            set(rocblas_DIR "${HYBRIDAI_ROCM_ROOT}/lib/cmake/rocblas")
+        endif()
+    endif()
     find_package(hip CONFIG QUIET)
     find_package(rocblas CONFIG QUIET)
     if(hip_FOUND AND rocblas_FOUND AND TARGET hip::device AND
@@ -19,46 +27,29 @@ if(HYBRIDAI_ENABLE_HIP)
         target_compile_definitions(hybridai PRIVATE HYBRIDAI_HAS_HIP)
         if(WIN32)
             # The Visual Studio generator does not support HIP as a native
-            # language. Compile the implementation explicitly with hipcc and
-            # add the resulting COFF object to the normal MSVC target.
+            # language. The HIP runtime API headers on Windows are host-only
+            # enough to be compiled directly with MSVC, so we add the ROCm
+            # include path and platform macro only for the HIP source file.
             set(HYBRIDAI_HIPCC "${hip_HIPCC_EXECUTABLE}")
             if(NOT HYBRIDAI_HIPCC)
                 message(FATAL_ERROR "HIP was found but hipcc.exe is unavailable")
             endif()
 
-            set(HYBRIDAI_HIP_OBJECT
-                "${CMAKE_CURRENT_BINARY_DIR}/hip_backend_hip.obj")
-            add_custom_command(
-                OUTPUT "${HYBRIDAI_HIP_OBJECT}"
-                COMMAND "${HYBRIDAI_HIPCC}"
-                    -nogpulib
-                    --offload-arch=gfx1150
-                    -O2
-                    -std=c++20
-                    $<$<CONFIG:Debug>:-O0>
-                    $<$<CONFIG:Debug>:-g>
-                    $<$<CONFIG:Debug>:-D_DEBUG>
-                    $<$<CONFIG:Debug>:-D_ITERATOR_DEBUG_LEVEL=2>
-                    $<$<CONFIG:Debug>:-fms-runtime-lib=dll_dbg>
-                    -I"${CMAKE_SOURCE_DIR}/include"
-                    -I"${CMAKE_SOURCE_DIR}/src"
-                    -I"${hip_INCLUDE_DIR}"
-                    -DHYBRIDAI_HAS_HIP=1
-                    -D__HIP_NO_CUDA_MATH__=1
-                    -c "${CMAKE_CURRENT_SOURCE_DIR}/hip_backend.cc"
-                    -o "${HYBRIDAI_HIP_OBJECT}"
-                DEPENDS
-                    "${CMAKE_CURRENT_SOURCE_DIR}/hip_backend.cc"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/hip_backend.h"
-                COMMENT "Compiling HIP backend with hipcc"
-                VERBATIM
-            )
-            add_custom_target(hybridai_hip_backend_compile
-                DEPENDS "${HYBRIDAI_HIP_OBJECT}")
-            add_dependencies(hybridai hybridai_hip_backend_compile)
+            get_filename_component(HYBRIDAI_ROCM_ROOT "${HYBRIDAI_HIPCC}" DIRECTORY)
+            get_filename_component(HYBRIDAI_ROCM_ROOT "${HYBRIDAI_ROCM_ROOT}" DIRECTORY)
+            set(HYBRIDAI_ROCM_INCLUDE "${HYBRIDAI_ROCM_ROOT}/include")
+            if(NOT EXISTS "${HYBRIDAI_ROCM_INCLUDE}/hip/hip_runtime.h")
+                message(FATAL_ERROR
+                    "ROCm include directory not found at ${HYBRIDAI_ROCM_INCLUDE}")
+            endif()
+
+            target_sources(hybridai PRIVATE hip_backend.cc)
             set_source_files_properties(
-                "${HYBRIDAI_HIP_OBJECT}" PROPERTIES GENERATED TRUE)
-            target_sources(hybridai PRIVATE "${HYBRIDAI_HIP_OBJECT}")
+                hip_backend.cc
+                PROPERTIES
+                    INCLUDE_DIRECTORIES "${HYBRIDAI_ROCM_INCLUDE}"
+                    COMPILE_DEFINITIONS "__HIP_PLATFORM_AMD__=1;__HIP_NO_CUDA_MATH__=1"
+            )
         else()
             target_sources(hybridai PRIVATE hip_backend.cc)
         endif()
@@ -73,5 +64,9 @@ if(HYBRIDAI_ENABLE_HIP)
             "HYBRIDAI_ENABLE_HIP=ON but usable hip/rocBLAS config packages "
             "were not found. "
             "Compiling HIP backend as stubs.")
+        if(WIN32 AND HYBRIDAI_ENABLE_HIP)
+            message(STATUS "  hip_DIR=${hip_DIR}")
+            message(STATUS "  rocblas_DIR=${rocblas_DIR}")
+        endif()
     endif()
 endif()

@@ -17,6 +17,8 @@
 // $env:PATH = "C:\Users\yinxi\.venv\Lib\site-packages\_rocm_sdk_devel\bin;" + $env:PATH
 // run: .\build-debug\bin\Debug\qwen_infer.exe 'E:\models\Qwen3.8-27B-FP8' cpu
 
+//C:\Users\yinxi\.venv\Scripts\Activate.ps1; $env:HIP_VISIBLE_DEVICES="1"; $env:PATH="C:\Users\yinxi\.venv\Lib\site-packages\_rocm_sdk_devel\bin;" + $env:PATH; d:\Vicold\Vicold.HybridAI\build-debug\bin\Debug\qwen_infer.exe E:/models/Qwen3.8-27B-FP8 gpu 1
+
 #include "backends/backend_registry.h"
 #include "core/device.h"
 #include "core/device_manager.h"
@@ -68,8 +70,58 @@ std::string load_prompt_text(const std::string& path_or_text) {
                          std::istreambuf_iterator<char>());
 }
 
+#ifdef HYBRIDAI_HAS_HIP
+#include <hip/hip_runtime.h>
+#include <rocblas/rocblas.h>
+#endif
+
 // Tokenizer 实例，由 main 初始化后传入。
 const hybridai::tokenizer::QwenTokenizer* g_tokenizer = nullptr;
+
+namespace {
+
+// 临时探测 HIP 设备与 rocBLAS 状态，帮助排查为什么 gpu 参数 fallback 到 cpu。
+void probe_hip_devices() {
+#ifdef HYBRIDAI_HAS_HIP
+    int count = 0;
+    hipError_t herr = hipGetDeviceCount(&count);
+    std::cout << "[HIP probe] hipGetDeviceCount -> " << herr
+              << " (" << hipGetErrorString(herr) << "), count=" << count
+              << std::endl;
+    for (int id = 0; id < count; ++id) {
+        hipDeviceProp_t props = {};
+        herr = hipGetDeviceProperties(&props, id);
+        std::cout << "  device " << id << ": " << props.name
+                  << ", arch=" << props.gcnArchName
+                  << ", integrated=" << props.integrated
+                  << ", hipGetDeviceProperties=" << herr << std::endl;
+
+        herr = hipSetDevice(id);
+        if (herr != hipSuccess) {
+            std::cout << "    hipSetDevice failed: " << hipGetErrorString(herr)
+                      << std::endl;
+            continue;
+        }
+        rocblas_handle handle = nullptr;
+        rocblas_status rstatus = rocblas_create_handle(&handle);
+        std::cout << "    rocblas_create_handle -> " << rstatus;
+        if (rstatus == rocblas_status_success && handle != nullptr) {
+            std::cout << " (ok)";
+            rocblas_destroy_handle(handle);
+        } else {
+            const char* msg = rocblas_status_to_string(rstatus);
+            std::cout << " (" << (msg ? msg : "unknown") << ")";
+        }
+        std::cout << std::endl;
+    }
+#else
+    std::cout << "[HIP probe] HYBRIDAI_HAS_HIP not defined (HIP backend not "
+                 "compiled in)"
+              << std::endl;
+#endif
+}
+
+} // namespace
 
 std::vector<int64_t> tokenize(const std::string& text) {
     if (g_tokenizer != nullptr && g_tokenizer->is_loaded()) {
@@ -93,15 +145,26 @@ std::string decode_ids(const std::vector<int64_t>& ids) {
 }
 
 // 选择可用设备
+// "gpu" 是通用别名，映射到已注册的 GPU 后端（当前为 hip）。
 Device select_device(const std::string& backend_name) {
     DeviceManager::instance().initialize();
     Device chosen = Device::Cpu();
-    for (const Device& d : DeviceManager::instance().devices()) {
-        if (d.backend() == backend_name && d.is_gpu()) {
-            return d;
-        }
-        if (d.backend() == backend_name) {
-            chosen = d;
+
+    std::vector<std::string> candidates;
+    if (backend_name == "gpu") {
+        candidates = {"hip", "cuda"};
+    } else {
+        candidates.push_back(backend_name);
+    }
+
+    for (const std::string& name : candidates) {
+        for (const Device& d : DeviceManager::instance().devices()) {
+            if (d.backend() == name && d.is_gpu()) {
+                return d;
+            }
+            if (d.backend() == name) {
+                chosen = d;
+            }
         }
     }
     return chosen;
@@ -160,6 +223,8 @@ int main(int argc, char* argv[]) {
     std::cout << "[qwen_infer] backends initialized" << std::endl;
     std::cout.flush();
 
+    probe_hip_devices();
+
     fs::path model_dir = argv[1];
     std::string backend_name = (argc > 2) ? argv[2] : "cpu";
     int max_new_tokens = (argc > 3) ? std::atoi(argv[3]) : 20;
@@ -204,17 +269,7 @@ int main(int argc, char* argv[]) {
               << std::endl;
     std::cout << "  rope_theta: " << config.rope_theta << std::endl;
 
-    // 3. 打开权重加载器，扫描模型文件
-    Qwen3WeightLoader loader;
-    status = loader.open(model_dir.string(), config);
-    if (!status.ok()) {
-        std::cerr << "[ERROR] Failed to open model weights: "
-                  << status.message() << std::endl;
-        return 1;
-    }
-    std::cout << "\n[Weight Loader] Opened successfully." << std::endl;
-
-    // 4. 选择设备并创建 backend
+    // 3. 选择设备并创建 backend（先于权重加载，确保 GPU 识别正确）
     Device device = select_device(backend_name);
     std::cout << "\n[Device] backend=" << device.backend()
               << ", id=" << device.id()
@@ -228,6 +283,16 @@ int main(int argc, char* argv[]) {
                   << " is not available." << std::endl;
         return 1;
     }
+
+    // 4. 打开权重加载器，扫描模型文件
+    Qwen3WeightLoader loader;
+    status = loader.open(model_dir.string(), config);
+    if (!status.ok()) {
+        std::cerr << "[ERROR] Failed to open model weights: "
+                  << status.message() << std::endl;
+        return 1;
+    }
+    std::cout << "\n[Weight Loader] Opened successfully." << std::endl;
 
     // 5. 加载共享权重（embedding / final norm / lm_head）并做最小检查
     Qwen3SharedWeights shared;
@@ -249,23 +314,30 @@ int main(int argc, char* argv[]) {
               << (shared.lm_head.buffer() != nullptr ? "loaded" : "missing")
               << std::endl;
 
-    // 6. 加载第一层做结构探查
-    Qwen3LayerWeights layer0;
-    status = loader.load_layer(0, device, &layer0);
-    if (!status.ok()) {
-        std::cerr << "[ERROR] Failed to load layer 0: " << status.message()
-                  << std::endl;
-        return 1;
+    // 6. 加载前 4 层做结构探查（临时加速测试，避免加载全部 64 层）
+    constexpr int64_t k_probe_layers = 4;
+    std::vector<Qwen3LayerWeights> probe_layers;
+    for (int64_t li = 0; li < k_probe_layers; ++li) {
+        Qwen3LayerWeights layer;
+        status = loader.load_layer(li, device, &layer);
+        if (!status.ok()) {
+            std::cerr << "[ERROR] Failed to load layer " << li << ": "
+                      << status.message() << std::endl;
+            return 1;
+        }
+        std::cout << "\n[Layer " << li << "] attention="
+                  << layer.is_attention_layer << std::endl;
+        inspect_quantized_weight("q_proj", layer.q_proj);
+        inspect_quantized_weight("k_proj", layer.k_proj);
+        inspect_quantized_weight("v_proj", layer.v_proj);
+        inspect_quantized_weight("o_proj", layer.o_proj);
+        inspect_quantized_weight("mlp_gate_proj", layer.mlp_gate_proj);
+        inspect_quantized_weight("mlp_up_proj", layer.mlp_up_proj);
+        inspect_quantized_weight("mlp_down_proj", layer.mlp_down_proj);
+        probe_layers.push_back(std::move(layer));
     }
-    std::cout << "\n[Layer 0] attention=" << layer0.is_attention_layer
+    std::cout << "\n[Probe layers loaded: " << probe_layers.size() << "]"
               << std::endl;
-    inspect_quantized_weight("q_proj", layer0.q_proj);
-    inspect_quantized_weight("k_proj", layer0.k_proj);
-    inspect_quantized_weight("v_proj", layer0.v_proj);
-    inspect_quantized_weight("o_proj", layer0.o_proj);
-    inspect_quantized_weight("mlp_gate_proj", layer0.mlp_gate_proj);
-    inspect_quantized_weight("mlp_up_proj", layer0.mlp_up_proj);
-    inspect_quantized_weight("mlp_down_proj", layer0.mlp_down_proj);
 
     // 0. 加载 tokenizer（如果有 tokenizer.json）
     hybridai::tokenizer::QwenTokenizer tokenizer;

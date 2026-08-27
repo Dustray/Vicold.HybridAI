@@ -24,12 +24,15 @@ if(HYBRIDAI_ENABLE_HIP)
     find_package(rocblas CONFIG QUIET)
     if(hip_FOUND AND rocblas_FOUND AND TARGET hip::device AND
        TARGET roc::rocblas)
-        target_compile_definitions(hybridai PRIVATE HYBRIDAI_HAS_HIP)
+        # Make the HIP macro visible to all consumers of the hybridai target
+        # (demos, tests, CLI) so they can conditionally include HIP headers.
+        target_compile_definitions(hybridai PUBLIC HYBRIDAI_HAS_HIP)
         if(WIN32)
             # The Visual Studio generator does not support HIP as a native
             # language. The HIP runtime API headers on Windows are host-only
             # enough to be compiled directly with MSVC, so we add the ROCm
-            # include path and platform macro only for the HIP source file.
+            # include path and platform macro for the HIP source file and any
+            # consumer that needs to probe the device.
             set(HYBRIDAI_HIPCC "${hip_HIPCC_EXECUTABLE}")
             if(NOT HYBRIDAI_HIPCC)
                 message(FATAL_ERROR "HIP was found but hipcc.exe is unavailable")
@@ -50,6 +53,8 @@ if(HYBRIDAI_ENABLE_HIP)
                     INCLUDE_DIRECTORIES "${HYBRIDAI_ROCM_INCLUDE}"
                     COMPILE_DEFINITIONS "__HIP_PLATFORM_AMD__=1;__HIP_NO_CUDA_MATH__=1"
             )
+            # Expose ROCm headers to consumers as well.
+            target_include_directories(hybridai PUBLIC "${HYBRIDAI_ROCM_INCLUDE}")
         else()
             target_sources(hybridai PRIVATE hip_backend.cc)
         endif()

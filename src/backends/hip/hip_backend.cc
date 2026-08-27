@@ -46,6 +46,7 @@ public:
             case MemoryType::Unified:
                 err = hipMallocManaged(ptr, size, hipMemAttachGlobal);
                 break;
+            case MemoryType::Host:
             case MemoryType::HostPinned:
                 err = hipHostMalloc(ptr, size);
                 break;

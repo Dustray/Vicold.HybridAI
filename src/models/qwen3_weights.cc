@@ -79,13 +79,19 @@ Status Qwen3WeightLoader::open(const std::string& model_path,
     return Status::OK();
 }
 
+namespace {
+MemoryType MemoryTypeForDevice(Device device) {
+    return device.is_cpu() ? MemoryType::Host : MemoryType::Device;
+}
+} // namespace
+
 Status Qwen3WeightLoader::load_tensor(const std::string& name, Device device,
                                       Tensor* output) const {
     if (!loader_) {
         return Status(StatusCode::InvalidArgument, "Qwen loader is not open");
     }
     if (!Has(*loader_, name)) return Missing(name);
-    return loader_->load(name, device, output);
+    return loader_->load(name, device, output, MemoryTypeForDevice(device));
 }
 
 Status Qwen3WeightLoader::load_quantized(
@@ -114,10 +120,14 @@ Status Qwen3WeightLoader::load_quantized(
     }
 
     Tensor values;
-    Status status = loader_->load(base_name, device, &values);
+    Status status = loader_->load(base_name, device, &values,
+                                  MemoryTypeForDevice(device));
     if (!status.ok()) return status;
     Tensor scales;
-    status = loader_->load_as_fp32(scale_name, device, &scales);
+    // Scales are small and currently consumed on the host (until a HIP
+    // dequant kernel is wired up), so keep them in host memory.
+    status = loader_->load_as_fp32(scale_name, device, &scales,
+                                    MemoryType::Host);
     if (!status.ok()) return status;
 
     output->values = std::move(values);

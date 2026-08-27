@@ -19,25 +19,28 @@ void DeviceManager::initialize() {
     // Always register CPU device
     devices_.emplace_back(Device::Cpu());
 
-    if (BackendRegistry::instance().has_backend("hip")) {
-        // TODO: move native property discovery behind a backend enumeration API.
-        // Until then, only publish configured devices that the backend confirms
-        // are present. The type/unified-memory hints match the target platform.
-        const Device hip_devices[] = {
-            Device(0, DeviceType::DiscreteGPU, "hip", false),
-            Device(1, DeviceType::IntegratedGPU, "hip", true),
-        };
-        for (const Device& device : hip_devices) {
+    // Enumerate devices for every registered backend. Each backend reports its
+    // own native ids (which may already be filtered by environment variables such
+    // as HIP_VISIBLE_DEVICES), type, and unified-memory capability.
+    for (const std::string& backend_name :
+         BackendRegistry::instance().backend_names()) {
+        // CPU backend is added explicitly above.
+        if (backend_name == "cpu") {
+            continue;
+        }
+
+        Device probe_device(-1, DeviceType::CPU, backend_name, false);
+        auto probe = BackendRegistry::instance().create_backend(probe_device);
+        if (probe == nullptr) {
+            continue;
+        }
+
+        for (const Device& device : probe->enumerate_devices()) {
             auto backend = BackendRegistry::instance().create_backend(device);
             if (backend != nullptr && backend->is_available()) {
                 devices_.push_back(device);
             }
         }
-    }
-
-    if (BackendRegistry::instance().has_backend("cuda")) {
-        // TODO: query CUDA device count and properties
-        devices_.emplace_back(0, DeviceType::DiscreteGPU, "cuda", false);
     }
 
     initialized_ = true;

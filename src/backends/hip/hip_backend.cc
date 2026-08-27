@@ -289,6 +289,31 @@ const char* HipBackend::name() const noexcept { return "hip"; }
 
 Device HipBackend::device() const noexcept { return device_; }
 
+std::vector<Device> HipBackend::enumerate_devices() const {
+#ifdef HYBRIDAI_HAS_HIP
+    int count = 0;
+    if (hipGetDeviceCount(&count) != hipSuccess || count <= 0) {
+        return {};
+    }
+    std::vector<Device> devices;
+    devices.reserve(static_cast<size_t>(count));
+    for (int id = 0; id < count; ++id) {
+        hipDeviceProp_t props = {};
+        if (hipGetDeviceProperties(&props, id) != hipSuccess) {
+            continue;
+        }
+        // Treat APUs / integrated GPUs as unified-memory capable.
+        const bool unified = (props.integrated != 0);
+        const DeviceType type = unified ? DeviceType::IntegratedGPU
+                                          : DeviceType::DiscreteGPU;
+        devices.emplace_back(id, type, "hip", unified);
+    }
+    return devices;
+#else
+    return {};
+#endif
+}
+
 bool HipBackend::is_available() const noexcept {
 #ifdef HYBRIDAI_HAS_HIP
     int count = 0;

@@ -34,4 +34,14 @@ bool BackendRegistry::has_backend(std::string_view name) const {
     return factories_.find(std::string(name)) != factories_.end();
 }
 
+std::vector<std::string> BackendRegistry::backend_names() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<std::string> names;
+    names.reserve(factories_.size());
+    for (const auto& [name, _factory] : factories_) {
+        names.push_back(name);
+    }
+    return names;
+}
+
 } // namespace hybridai

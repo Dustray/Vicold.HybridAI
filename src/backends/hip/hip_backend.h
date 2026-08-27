@@ -17,6 +17,8 @@ public:
     Device device() const noexcept override;
     bool is_available() const noexcept override;
 
+    std::vector<Device> enumerate_devices() const override;
+
     std::unique_ptr<Allocator> create_allocator(MemoryType type) override;
     std::shared_ptr<Buffer> create_buffer(size_t size,
                                           MemoryType type) override;

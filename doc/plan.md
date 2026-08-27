@@ -111,6 +111,7 @@ Vicold.HybridAI/
 已完成：
 
 - Phase 0：CMake/C++20 工程脚手架与基础依赖。
+- Windows HIP/ROCm 端到端验证：Debug 构建链接成功、HIP 设备动态枚举、`hybridai_cli devices` 列出可用 GPU、`BackendComputeTest.HipFp32GemmMatchesReference` 在 `HIP_VISIBLE_DEVICES=1` 与 `ROCBLAS_TENSILE_LIBPATH` 配置下通过。
 - Phase 1：Device、DType、Shape、Tensor、Backend 等核心抽象。
 - Phase 2：MemoryPool、MemoryPlanner 与 CPU/HIP stub 后端。
 - Phase 3：Backend/KernelRegistry 抽象及 CUDA/HIP API 封装边界。
@@ -128,7 +129,7 @@ Vicold.HybridAI/
 
 进行中：
 
-- 真实 GPU GEMM smoke test 的运行环境整理：Windows ROCm 运行时当前把 device 0 识别为 `gfx1010`，但 SDK 仅提供 `gfx1150` 的 Tensile kernel 数据，导致 rocBLAS 加载 kernel 失败。已在 `HipBackend` 构造时增加一次最小 sgemm 探测，无法执行 kernel 时标记为不可用，GEMM 测试自动跳过，避免异常退出。
+- 真实 GPU GEMM smoke test：当前机器有两块 AMD GPU；ROCm 运行时把 device 0 识别为 `gfx1010`，device 1 识别为 `gfx1150`。SDK 仅提供 `gfx1150` 的 Tensile kernel 数据，因此需要设置 `HIP_VISIBLE_DEVICES=1` 让程序只看到可用 GPU。已增加 `Backend::enumerate_devices()` 接口并由 `HipBackend` 实现，DeviceManager 不再硬编码 HIP 设备 ID，而是根据当前可见设备和 rocBLAS 可用性动态枚举。`HipBackend` 构造时的最小 sgemm 探测仍保留，作为最终兜底。
 - 二维 FP8 block scale 反量化与通用量化权重表示。
 
 尚未完成：
@@ -143,8 +144,8 @@ Vicold.HybridAI/
 - `build/`：CPU/stub 配置稳定构建通过，62 项测试通过。
 - `build-debug/`（`-D HYBRIDAI_ENABLE_HIP=ON`）：完整 Debug 构建通过，`hybridai.lib` 与 `hybridai_test.exe` 链接成功，无 LNK2038 runtime mismatch。
 - Windows HIP 编译方案：放弃 ROCm Clang custom command，改用 MSVC 直接编译 `hip_backend.cc`。ROCm include 路径与 `__HIP_PLATFORM_AMD__` 宏通过 CMake `set_source_files_properties` 仅作用于该源文件，主库仍正常链接 `hip::host` 与 `roc::rocblas` 导入库。
-- HIP 测试程序：在配置 `ROCBLAS_TENSILE_LIBPATH` 指向 `.../rocblas/library/gfx1150` 后能正常初始化 rocBLAS；但当前机器 ROCm 运行时把设备识别为 `gfx1010`，找不到对应 kernel（SDK 只有 gfx1150 kernel），GEMM 实测失败。`HipBackend::is_available()` 现已通过一次最小 sgemm 探测把此类设备标记为不可用，测试自动跳过而不是崩溃。
-- 结论：Windows 下 HIP/ROCm 从 CMake 配置、编译、链接到程序启动的完整链路已打通；真实设备上的 rocBLAS GEMM 仍受限于当前硬件/驱动环境（gfx1010 vs gfx1150 不匹配），需要到有真实 AMD GPU 或正确 ROCm 环境的目标机器上再验证实际计算。
+- HIP 测试程序：在配置 `ROCBLAS_TENSILE_LIBPATH` 指向 `.../rocblas/library/gfx1150` 并设置 `HIP_VISIBLE_DEVICES=1` 后，`BackendComputeTest.HipFp32GemmMatchesReference` 实测通过（约 330 ms）。`hybridai_cli devices` 正确列出可见的 HIP 设备。
+- 结论：Windows 下 HIP/ROCm 从 CMake 配置、编译、链接到程序启动，再到真实 GPU GEMM 执行的完整链路已打通。当前环境需通过 `HIP_VISIBLE_DEVICES=1` 过滤掉不支持的 `gfx1010` 设备。
 
 ### Windows/Linux 构建策略
 
@@ -162,8 +163,11 @@ Vicold.HybridAI/
   $env:ROCBLAS_TENSILE_LIBPATH = 'C:\Users\yinxi\.venv\Lib\site-packages\_rocm_sdk_devel\bin\rocblas\library\gfx1150'
   ```
   该目录下需要存在 `TensileLibrary.dat` 主文件（当前 SDK 提供的是 `TensileLibrary_lazy_gfx1150.dat`，可复制一份重命名为 `TensileLibrary.dat`）。
+- `HIP_VISIBLE_DEVICES`：当机器存在多个 AMD GPU 且只有部分受 ROCm 支持时，用该变量过滤可见设备。例如当前机器 device 0 为 `gfx1010`、device 1 为 `gfx1150`，只有后者能运行 SDK 中的 rocBLAS kernel，因此需要：
+  ```powershell
+  $env:HIP_VISIBLE_DEVICES = '1'
+  ```
 - `PATH`：确保 `amdhip64.dll`、`rocblas.dll` 等 ROCm 运行时 DLL 可被加载。通常 Python ROCm 包安装目录下的 `bin` 已加入 PATH，否则需手动添加。
-- 当前 ROCm Windows 运行时可能把设备识别为 `gfx1010`，而 SDK kernel 数据只有 `gfx1150`。若出现 `No paths matched ...*gfx1010*co`，说明运行环境与 SDK 架构不匹配，需要换到真实目标 GPU 环境验证，或检查驱动/HSA 配置。
 
 ## 架构扩展原则
 
@@ -264,7 +268,7 @@ Qwen3.8 只是第一个适配器，不应成为核心运行时的硬编码分支
 4. 设计 `KernelRegistry`：允许手写 kernel 按（op, device, dtype）三元组注册，运行时可替换默认 BLAS 实现。
 5. **验证**：Backend 工厂按设备类型创建正确后端；手写空 kernel 注册/反注册测试；`grep -R "hipMalloc\|cudaMalloc" src/core src/ops src/runtime src/models src/io src/cli` 无结果。
 
-当前状态：CPU/stub 路径已完成；Windows 下 HIP/rocBLAS 代码已由 MSVC 直接编译、主库与测试可执行文件完整链接成功。真实 GPU 上的 rocBLAS GEMM 受当前测试机 ROCm 运行时识别架构（gfx1010）与 SDK kernel 数据（gfx1150）不匹配影响，已自动跳过相关测试。
+当前状态：CPU/stub 路径已完成；Windows 下 HIP/rocBLAS 代码已由 MSVC 直接编译、主库与测试可执行文件完整链接成功。设置 `HIP_VISIBLE_DEVICES=1` 后，真实 GPU（gfx1150）上的 rocBLAS FP32 GEMM 测试通过。
 
 ### Phase 4: 基础算子与注册表
 1. 实现 `OpRegistry` 与 `KernelSelector`：根据 Tensor 设备、DType、全局策略选择 kernel。
@@ -367,14 +371,14 @@ Qwen3.8 只是第一个适配器，不应成为核心运行时的硬编码分支
 ## 验证清单
 1. `cmake --build build` 在 `-D HYBRIDAI_ENABLE_HIP=ON` 下通过。
 2. GTest 全部通过：Tensor、Allocator、Backend、Linear、FP8Dequantizer、SafeTensorLoader。
-3. CLI `hybridai_cli devices` 正确列出 device#0 (gfx1010) 与 device#1 (gfx1150)。
+3. CLI `hybridai_cli devices` 正确列出当前可见设备；在多 GPU 环境中配合 `HIP_VISIBLE_DEVICES` 过滤后只列出可用设备。
 4. 单层 GQA Attention 与 Transformers 输出误差 < 1e-3。
 5. CLI `hybridai_cli run` 在短 prompt 上完成一次 Qwen3.8-27B-FP8 前向推理。
 6. 两设备切分运行输出与单设备运行输出在 FP32 绝对误差 < 1e-4 内一致。
 
 ## 当前下一步执行顺序
 
-1. 在真实 AMD GPU / 匹配 ROCm 环境的机器上验证 HIP/rocBLAS FP32 GEMM 实际计算成功。
+1. ✅ 已在当前 AMD GPU（gfx1150，通过 `HIP_VISIBLE_DEVICES=1` 过滤）上验证 HIP/rocBLAS FP32 GEMM 实际计算成功。下一步：把环境变量配置固化为开发脚本或 CMake/CTest 环境，避免每次手动设置。
 2. 完成二维 FP8 block scale 反量化和 `QuantizedWeight` 通用表示。
 3. 对真实 Qwen3.8-27B-FP8 全部分片执行 metadata 扫描和 scale 配对校验。
 4. 实现 `Qwen3LayerWeights`、`Qwen3ModelWeights` 和按层懒加载。

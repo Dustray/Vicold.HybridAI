@@ -18,6 +18,10 @@ public:
 
     bool has_backend(std::string_view name) const;
 
+    // Return the names of all currently registered backends. Order matches
+    // registration order so callers can prioritise preferred backends.
+    std::vector<std::string> backend_names() const;
+
 private:
     BackendRegistry() = default;
 

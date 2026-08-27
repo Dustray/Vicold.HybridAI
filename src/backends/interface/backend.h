@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace hybridai {
 
@@ -69,6 +70,12 @@ public:
     virtual const char* name() const noexcept = 0;
     virtual Device device() const noexcept = 0;
     virtual bool is_available() const noexcept = 0;
+
+    // Enumerate devices that this backend implementation can manage.
+    // Default implementation returns an empty list; backends that can discover
+    // native devices (HIP/CUDA) should override this. The returned devices use
+    // backend-local ids that match the native runtime's enumeration order.
+    virtual std::vector<Device> enumerate_devices() const { return {}; }
 
     // Memory management
     virtual std::unique_ptr<Allocator> create_allocator(MemoryType type) = 0;

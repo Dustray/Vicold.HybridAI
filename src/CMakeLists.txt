@@ -39,6 +39,7 @@ target_link_libraries(hybridai
 
 add_subdirectory(memory)
 add_subdirectory(ops)
+add_subdirectory(tokenizer)
 
 if(HYBRIDAI_ENABLE_CPU)
     add_subdirectory(backends/cpu)

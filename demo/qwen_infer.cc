@@ -28,6 +28,7 @@
 #include "models/qwen3_config.h"
 #include "models/qwen3_weights.h"
 #include "ops/fp8_dequant.h"
+#include "tokenizer/qwen_tokenizer.h"
 #include "ops/linear.h"
 #include "ops/rmsnorm.h"
 #include "ops/softmax.h"
@@ -67,26 +68,27 @@ std::string load_prompt_text(const std::string& path_or_text) {
                          std::istreambuf_iterator<char>());
 }
 
-// 占位 tokenizer：当前项目没有 tokenizer 实现。
-// 真实实现需要加载 tokenizer.json / merges.txt / vocab.json 并把文本映射
-// 到 ids。这里直接返回一个固定的 id 序列，并打印明确提示。
-std::vector<int64_t> placeholder_tokenize(const std::string& text) {
-    (void)text;
-    std::cerr << "[WARN] No tokenizer is implemented yet. "
-              << "Using placeholder token ids [151644, 872, 198, 151645]."
-              << std::endl;
-    // 151644/151645 大致对应 <|im_start|>/<|im_end|>，872 是 "hello" 类 token
+// Tokenizer 实例，由 main 初始化后传入。
+const hybridai::tokenizer::QwenTokenizer* g_tokenizer = nullptr;
+
+std::vector<int64_t> tokenize(const std::string& text) {
+    if (g_tokenizer != nullptr && g_tokenizer->is_loaded()) {
+        return g_tokenizer->encode(text, true);
+    }
+    std::cerr << "[WARN] Tokenizer not loaded. "
+              << "Using placeholder token ids." << std::endl;
     return {151644, 872, 198, 151645};
 }
 
-std::string placeholder_decode(const std::vector<int64_t>& ids) {
+std::string decode_ids(const std::vector<int64_t>& ids) {
+    if (g_tokenizer != nullptr && g_tokenizer->is_loaded()) {
+        return g_tokenizer->decode(ids, false);
+    }
     std::string out = "<decoded> ";
     for (int64_t id : ids) {
         out += std::to_string(id) + " ";
     }
     out += "</decoded>";
-    std::cerr << "[WARN] No tokenizer decoder implemented yet. "
-              << "Returning raw ids." << std::endl;
     return out;
 }
 
@@ -265,9 +267,20 @@ int main(int argc, char* argv[]) {
     inspect_quantized_weight("mlp_up_proj", layer0.mlp_up_proj);
     inspect_quantized_weight("mlp_down_proj", layer0.mlp_down_proj);
 
-    // 7. 文本 -> ids（当前为占位）
+    // 0. 加载 tokenizer（如果有 tokenizer.json）
+    hybridai::tokenizer::QwenTokenizer tokenizer;
+    Status tok_status = tokenizer.load(model_dir.string());
+    if (tok_status.ok()) {
+        g_tokenizer = &tokenizer;
+        std::cout << "\n[Tokenizer] Loaded successfully." << std::endl;
+    } else {
+        std::cout << "\n[Tokenizer] Not loaded: " << tok_status.message()
+                  << std::endl;
+    }
+
+    // 7. 文本 -> ids
     std::string prompt = "Hello, how are you?";
-    std::vector<int64_t> input_ids = placeholder_tokenize(prompt);
+    std::vector<int64_t> input_ids = tokenize(prompt);
     std::cout << "\n[Prompt -> Token IDs]" << std::endl;
     std::cout << "  prompt: " << prompt << std::endl;
     std::cout << "  ids:    [";
@@ -337,7 +350,7 @@ int main(int argc, char* argv[]) {
     // 10. ids -> 文本（当前为占位）
     std::vector<int64_t> output_ids(input_ids);
     output_ids.push_back(next_id);
-    std::string output_text = placeholder_decode(output_ids);
+    std::string output_text = decode_ids(output_ids);
     std::cout << "\n[Generated text]\n" << output_text << std::endl;
 
     // 11. 同步并总结缺失项

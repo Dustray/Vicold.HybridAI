@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../../Github/llama.cpp"
+		}
+	],
+	"settings": {}
+}

@@ -12,6 +12,10 @@
 //   qwen_infer.exe <model_dir> [backend=cpu|hip] [max_new_tokens=20]
 //
 // 它会验证模型目录、加载 config、打印权重/层信息，并提示还缺什么组件。
+// compile: Set-Location d:\Vicold\Vicold.HybridAI; cmake --build build-debug --target qwen_infer --config Debug
+// $env:HIP_VISIBLE_DEVICES="1"
+// $env:PATH = "C:\Users\yinxi\.venv\Lib\site-packages\_rocm_sdk_devel\bin;" + $env:PATH
+// run: .\build-debug\bin\Debug\qwen_infer.exe 'E:\models\Qwen3.8-27B-FP8' cpu
 
 #include "backends/backend_registry.h"
 #include "core/device.h"
@@ -139,12 +143,20 @@ void inspect_quantized_weight(const std::string& name,
 } // namespace
 
 int main(int argc, char* argv[]) {
+    // 尽早刷新，确保即使后续崩溃也能看到启动痕迹
+    std::cout << "[qwen_infer] enter main, argc=" << argc << std::endl;
+    std::cout.flush();
+
     if (argc < 2) {
         print_usage(argv[0]);
         return 1;
     }
 
+    std::cout << "[qwen_infer] initializing backends..." << std::endl;
+    std::cout.flush();
     InitializeBuiltinBackends();
+    std::cout << "[qwen_infer] backends initialized" << std::endl;
+    std::cout.flush();
 
     fs::path model_dir = argv[1];
     std::string backend_name = (argc > 2) ? argv[2] : "cpu";

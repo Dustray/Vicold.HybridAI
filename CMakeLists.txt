@@ -12,12 +12,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # Build options
-option(HYBRIDAI_ENABLE_HIP "Enable HIP/ROCm backend" OFF)
+option(HYBRIDAI_ENABLE_HIP "Enable HIP/ROCm backend" ON)
 option(HYBRIDAI_ENABLE_CUDA "Enable CUDA backend" OFF)
-option(HYBRIDAI_ENABLE_CPU "Enable CPU backend" ON)
-option(HYBRIDAI_BUILD_TESTS "Build unit tests" ON)
-option(HYBRIDAI_BUILD_CLI "Build command line interface" ON)
+option(HYBRIDAI_ENABLE_CPU "Enable CPU backend" OFF)
+option(BUILD_SHARED_LIBS "Build HybridAI as a shared library" ON)
+option(HYBRIDAI_BUILD_TESTS "Build unit tests" OFF)
+option(HYBRIDAI_BUILD_CLI "Build command line interface" OFF)
 option(HYBRIDAI_BUILD_BENCHMARKS "Build benchmarks" OFF)
+option(HYBRIDAI_BUILD_DEMOS "Build demo executables" OFF)
 
 if(NOT HYBRIDAI_ENABLE_HIP AND NOT HYBRIDAI_ENABLE_CUDA AND NOT HYBRIDAI_ENABLE_CPU)
     message(FATAL_ERROR "At least one backend must be enabled (CPU/CUDA/HIP).")
@@ -27,8 +29,8 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(Options)
 include(CPMPackages)
 
-# Main library
-add_library(hybridai STATIC)
+# Main library. CMake selects SHARED or STATIC according to BUILD_SHARED_LIBS.
+add_library(hybridai)
 add_subdirectory(src)
 
 # Public headers
@@ -56,7 +58,6 @@ if(HYBRIDAI_BUILD_BENCHMARKS)
 endif()
 
 # Demo executables (simple inference examples without test framework)
-option(HYBRIDAI_BUILD_DEMOS "Build demo executables" ON)
 if(HYBRIDAI_BUILD_DEMOS)
     add_subdirectory(demo)
 endif()

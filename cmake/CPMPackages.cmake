@@ -54,25 +54,25 @@ if(HYBRIDAI_BUILD_CLI)
     endif()
 endif()
 
-find_package(nlohmann_json CONFIG QUIET)
-if(NOT TARGET nlohmann_json::nlohmann_json AND
-   HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR)
-    if(NOT EXISTS
-       "${HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR}/nlohmann/json.hpp")
-        message(FATAL_ERROR
-            "HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR does not contain "
-            "nlohmann/json.hpp")
-    endif()
-    add_library(hybridai_nlohmann_json INTERFACE)
-    add_library(nlohmann_json::nlohmann_json ALIAS hybridai_nlohmann_json)
-    target_include_directories(hybridai_nlohmann_json INTERFACE
-        "${HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR}")
+# nlohmann_json is vendored in the repository. Do not search the host system
+# and do not fall back to a network download: reproducible/offline builds must
+# always use this exact source tree.
+set(HYBRIDAI_NLOHMANN_JSON_SOURCE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann_json")
+if(NOT EXISTS
+   "${HYBRIDAI_NLOHMANN_JSON_SOURCE_DIR}/include/nlohmann/json.hpp")
+    message(FATAL_ERROR
+        "Vendored nlohmann_json was not found at "
+        "${HYBRIDAI_NLOHMANN_JSON_SOURCE_DIR}/include/nlohmann/json.hpp")
+endif()
+
+if(NOT TARGET nlohmann_json::nlohmann_json)
     message(STATUS
-        "Using external nlohmann-json headers from "
-        "${HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR}")
-elseif(NOT TARGET nlohmann_json::nlohmann_json)
-    hybridai_add_local_or_github(
-        nlohmann_json 3.11.3 nlohmann/json v3.11.3 "json-3.11.3"
+        "CPM: Using vendored nlohmann_json from "
+        "${HYBRIDAI_NLOHMANN_JSON_SOURCE_DIR}")
+    CPMAddPackage(
+        NAME nlohmann_json
+        SOURCE_DIR "${HYBRIDAI_NLOHMANN_JSON_SOURCE_DIR}"
     )
 endif()
 

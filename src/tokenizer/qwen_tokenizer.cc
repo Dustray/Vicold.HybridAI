@@ -431,13 +431,22 @@ std::string QwenTokenizer::decode(const std::vector<int64_t>& ids,
 
 std::string QwenTokenizer::build_chat_prompt(
     const std::vector<std::pair<std::string, std::string>>& messages,
-    bool add_generation_prompt) const {
+    bool add_generation_prompt, bool enable_thinking) const {
     std::string prompt;
     for (const auto& [role, content] : messages) {
-        prompt += "<|im_start|>" + role + "\n" + content + "\n";
+        prompt += "<|im_start|>" + role + "\n" + content +
+                  "<|im_end|>\n";
     }
     if (add_generation_prompt) {
         prompt += "<|im_start|>assistant\n";
+        if (enable_thinking) {
+            // Qwen3.5's default generation template starts an open thinking
+            // block. The model emits the reasoning and closes it itself.
+            prompt += "<think>\n";
+        } else {
+            // Match tokenizer_config.json when enable_thinking=false.
+            prompt += "<think>\n\n</think>\n\n";
+        }
     }
     return prompt;
 }

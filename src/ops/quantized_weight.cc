@@ -3,16 +3,25 @@
 namespace hybridai::ops {
 
 Status QuantizedWeight::validate() const {
-    if (values.buffer() == nullptr || values.dtype() != DType::FP8_E4M3) {
+    if (values.buffer() == nullptr) {
         return Status(StatusCode::InvalidArgument,
-                      "QuantizedWeight values must be FP8_E4M3");
+                      "Weight values are not loaded");
     }
     if (quantization.scale_layout == ScaleLayout::None) {
         if (scales.buffer() != nullptr) {
             return Status(StatusCode::InvalidArgument,
                           "Scales are present but scale layout is None");
         }
+        if (values.dtype() != DType::FP32 && values.dtype() != DType::FP16 &&
+            values.dtype() != DType::BF16) {
+            return Status(StatusCode::InvalidArgument,
+                          "Dense weight must be FP32, FP16, or BF16");
+        }
         return Status::OK();
+    }
+    if (values.dtype() != DType::FP8_E4M3) {
+        return Status(StatusCode::InvalidArgument,
+                      "Scaled weight values must be FP8_E4M3");
     }
     if (scales.buffer() == nullptr || scales.dtype() != DType::FP32) {
         return Status(StatusCode::InvalidArgument,

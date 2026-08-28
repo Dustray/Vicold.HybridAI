@@ -8,19 +8,6 @@
 
 namespace hybridai {
 
-namespace {
-
-// Generic element copy for contiguous -> contiguous between same dtype.
-Status copy_buffer(Buffer* dst, const Buffer* src, size_t size) {
-    if (dst == nullptr || src == nullptr) {
-        return Status(StatusCode::InvalidArgument, "Null buffer in copy");
-    }
-    std::memcpy(dst->data(), src->data(), size);
-    return Status::OK();
-}
-
-} // namespace
-
 void Tensor::compute_strides() {
     strides_.resize(shape_.ndim());
     if (shape_.ndim() == 0) {
@@ -75,6 +62,13 @@ Tensor Tensor::to(Device target) const {
 
     Status status = backend->copy(dst_buffer.get(), buffer_.get(), nbytes());
     if (!status.ok()) {
+        return Tensor();
+    }
+    // Backend copies may be asynchronous. Tensor::to() returns an owning
+    // tensor while the source tensor can be destroyed immediately afterwards
+    // (this is common at layer partition boundaries), so make the transfer
+    // complete before exposing the destination buffer.
+    if (!backend->synchronize().ok()) {
         return Tensor();
     }
 

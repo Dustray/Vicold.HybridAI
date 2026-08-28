@@ -318,18 +318,37 @@ Status SafeTensorLoader::load(const std::string& name, Device device,
                       "Failed to seek to tensor data: " + name);
     }
 
-    std::vector<uint8_t> host_data(bytes);
+    // Use pinned host staging for HIP asynchronously and ordinary host memory
+    // for CPU.  The staging buffer is released immediately after synchronize,
+    // keeping peak RSS lower while loading a large sharded model.
+    std::unique_ptr<Allocator> staging_allocator =
+        backend->create_allocator(device.is_cpu() ? MemoryType::Host
+                                                  : MemoryType::HostPinned);
+    void* staging = nullptr;
+    Status staging_status = staging_allocator->allocate(bytes, &staging);
+    if (!staging_status.ok()) {
+        return Status(StatusCode::OutOfMemory,
+                      "Failed to allocate safetensors staging buffer: " + name);
+    }
     if (bytes > 0) {
-        file.read(reinterpret_cast<char*>(host_data.data()),
+        file.read(static_cast<char*>(staging),
                   static_cast<std::streamsize>(bytes));
     }
     if (!file && bytes > 0) {
+        staging_allocator->deallocate(staging);
         return Status(StatusCode::InvalidModel,
                       "Failed to read tensor data: " + name);
     }
 
-    Status copy_status = backend->memcpy_h2d(buffer.get(), host_data.data(),
-                                             bytes);
+    Status copy_status = backend->memcpy_h2d(buffer.get(), staging, bytes);
+    if (!copy_status.ok()) {
+        staging_allocator->deallocate(staging);
+        return copy_status;
+    }
+    // The temporary host buffer must remain alive until an asynchronous HIP
+    // copy has completed. This is also a no-op-style synchronization for CPU.
+    copy_status = backend->synchronize();
+    staging_allocator->deallocate(staging);
     if (!copy_status.ok()) return copy_status;
 
     *output = Tensor(info->shape, info->dtype, device, std::move(buffer));

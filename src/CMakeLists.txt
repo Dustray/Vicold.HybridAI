@@ -32,8 +32,6 @@ target_sources(hybridai
 
 target_link_libraries(hybridai
     PUBLIC
-        fmt::fmt
-        spdlog::spdlog
         nlohmann_json::nlohmann_json
 )
 

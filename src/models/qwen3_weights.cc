@@ -1,6 +1,8 @@
 #include "models/qwen3_weights.h"
 
+#include <algorithm>
 #include <filesystem>
+#include <limits>
 #include <sstream>
 
 namespace hybridai::models {
@@ -26,16 +28,16 @@ Status Qwen3LayerWeights::validate() const {
                       "Qwen layer norms are not loaded");
     }
     if (is_attention_layer) {
-        if (!q_proj.has_scales() || !k_proj.has_scales() ||
-            !v_proj.has_scales() || !o_proj.has_scales()) {
+        if (!q_proj.validate().ok() || !k_proj.validate().ok() ||
+            !v_proj.validate().ok() || !o_proj.validate().ok()) {
             return Status(StatusCode::InvalidModel,
                           "Qwen attention projections are not loaded");
         }
     } else {
-        if (!in_proj_qkv.has_scales() || !in_proj_z.has_scales() ||
-            !linear_out_proj.has_scales()) {
+        if (!in_proj_qkv.validate().ok() || !in_proj_z.validate().ok() ||
+            !linear_out_proj.validate().ok()) {
             return Status(StatusCode::InvalidModel,
-                          "Qwen DeltaNet quantized weights are incomplete");
+                          "Qwen DeltaNet weights are incomplete");
         }
     }
     return mlp_gate_proj.validate().ok() && mlp_up_proj.validate().ok() &&
@@ -110,13 +112,23 @@ Status Qwen3WeightLoader::load_quantized(
     const std::string scale_name =
         base_name.substr(0, base_name.size() - weight_suffix.size()) +
         ".weight_scale_inv";
-    if (!Has(*loader_, base_name) || !Has(*loader_, scale_name)) {
-        return Missing(!Has(*loader_, base_name) ? base_name : scale_name);
-    }
+    if (!Has(*loader_, base_name)) return Missing(base_name);
     const auto* weight_info = loader_->tensor_info(base_name);
-    if (weight_info->dtype != DType::FP8_E4M3) {
+    if (weight_info->dtype == DType::BF16 ||
+        weight_info->dtype == DType::FP16 ||
+        weight_info->dtype == DType::FP32) {
+        Status status = loader_->load(base_name, device, &output->values,
+                                      MemoryTypeForDevice(device));
+        if (!status.ok()) return status;
+        output->scales = Tensor();
+        output->quantization = ops::QuantizationSpec{};
+        return output->validate();
+    }
+    if (weight_info->dtype != DType::FP8_E4M3 ||
+        !Has(*loader_, scale_name)) {
         return Status(StatusCode::UnsupportedDType,
-                      "Expected FP8 Qwen weight: " + base_name);
+                      "Expected dense BF16/FP16/FP32 or scaled FP8 Qwen weight: " +
+                          base_name);
     }
 
     Tensor values;
@@ -234,6 +246,100 @@ Status Qwen3WeightLoader::load_shared(Device device,
     if (!status.ok()) return status;
     status = load_tensor("lm_head.weight", device, &result.lm_head);
     if (!status.ok()) return status;
+    *output = std::move(result);
+    return Status::OK();
+}
+
+uint64_t Qwen3WeightLoader::tensor_bytes(const std::string& name) const {
+    if (!loader_) return 0;
+    const auto* info = loader_->tensor_info(name);
+    return info == nullptr ? 0 : info->data_end - info->data_begin;
+}
+
+uint64_t Qwen3WeightLoader::layer_bytes(int64_t layer_index) const {
+    if (!loader_) return 0;
+    const std::string prefix =
+        "model.language_model.layers." + std::to_string(layer_index) + ".";
+    uint64_t bytes = 0;
+    for (const std::string& name : loader_->tensor_names()) {
+        if (name.compare(0, prefix.size(), prefix) == 0) {
+            bytes += tensor_bytes(name);
+        }
+    }
+    return bytes;
+}
+
+Status Qwen3WeightLoader::load_distributed(
+    const std::vector<Device>& devices, Qwen3DistributedWeights* output) const {
+    if (!loader_) {
+        return Status(StatusCode::InvalidArgument, "Qwen loader is not open");
+    }
+    if (output == nullptr || devices.empty()) {
+        return Status(StatusCode::InvalidArgument,
+                      "Distributed load requires output and at least one device");
+    }
+    for (const Device& device : devices) {
+        if (!device.is_gpu()) {
+            return Status(StatusCode::InvalidDevice,
+                          "Distributed Qwen load requires GPU devices");
+        }
+    }
+
+    Qwen3DistributedWeights result;
+    result.layers.resize(static_cast<size_t>(config_.num_hidden_layers));
+    result.layer_devices.resize(static_cast<size_t>(config_.num_hidden_layers));
+    result.partitions.resize(devices.size());
+    for (size_t i = 0; i < devices.size(); ++i) {
+        result.partitions[i].device = devices[i];
+    }
+
+    // Keep layer ranges contiguous so inference only transfers activations at
+    // partition boundaries. Every group of four Qwen3.5 layers has the same
+    // 3x linear-attention + 1x full-attention pattern, so an even layer split
+    // is also close to an even byte split for up to eight devices.
+    const int64_t layer_count = config_.num_hidden_layers;
+    const int64_t device_count = static_cast<int64_t>(devices.size());
+    for (int64_t device_index = 0; device_index < device_count; ++device_index) {
+        const int64_t first = layer_count * device_index / device_count;
+        const int64_t last = layer_count * (device_index + 1) / device_count - 1;
+        auto& partition = result.partitions[static_cast<size_t>(device_index)];
+        partition.first_layer = first;
+        partition.last_layer = last;
+        for (int64_t layer_index = first; layer_index <= last; ++layer_index) {
+            Status status = load_layer(
+                layer_index, devices[static_cast<size_t>(device_index)],
+                &result.layers[static_cast<size_t>(layer_index)]);
+            if (!status.ok()) return status;
+            result.layer_devices[static_cast<size_t>(layer_index)] =
+                devices[static_cast<size_t>(device_index)];
+            const uint64_t bytes = layer_bytes(layer_index);
+            partition.weight_bytes += bytes;
+            result.total_weight_bytes += bytes;
+        }
+    }
+
+    Status status = load_tensor("model.language_model.embed_tokens.weight",
+                                devices.front(), &result.shared.embed_tokens);
+    if (!status.ok()) return status;
+    const uint64_t embed_bytes =
+        tensor_bytes("model.language_model.embed_tokens.weight");
+    result.partitions.front().weight_bytes += embed_bytes;
+    result.total_weight_bytes += embed_bytes;
+
+    status = load_tensor("model.language_model.norm.weight", devices.back(),
+                         &result.shared.final_norm);
+    if (!status.ok()) return status;
+    const uint64_t norm_bytes = tensor_bytes("model.language_model.norm.weight");
+    result.partitions.back().weight_bytes += norm_bytes;
+    result.total_weight_bytes += norm_bytes;
+
+    status = load_tensor("lm_head.weight", devices.back(),
+                         &result.shared.lm_head);
+    if (!status.ok()) return status;
+    const uint64_t head_bytes = tensor_bytes("lm_head.weight");
+    result.partitions.back().weight_bytes += head_bytes;
+    result.total_weight_bytes += head_bytes;
+
     *output = std::move(result);
     return Status::OK();
 }

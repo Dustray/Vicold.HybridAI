@@ -104,11 +104,13 @@ public:
     // Synchronization
     virtual Status synchronize() = 0;
 
-    // GEMM: C = alpha * op(A) * op(B) + beta * C
+    // GEMM: C = alpha * op(A) * op(B) + beta * C. Buffer does not carry a
+    // dtype, so callers must describe storage and accumulation explicitly.
     virtual Status gemm(Buffer* c, const Buffer* a, const Buffer* b,
-                      bool trans_a, bool trans_b, int64_t m, int64_t n,
-                      int64_t k, float alpha, float beta,
-                      Stream* stream = nullptr) = 0;
+                        DType c_type, DType a_type, DType b_type,
+                        DType compute_type, bool trans_a, bool trans_b,
+                        int64_t m, int64_t n, int64_t k, float alpha,
+                        float beta, Stream* stream = nullptr) = 0;
 
     // Kernel registration hook. Backends may pre-register custom kernels (e.g.
     // hand-written tile kernels) into the global KernelRegistry during

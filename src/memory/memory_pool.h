@@ -35,7 +35,8 @@ public:
         size_t max_pooled_bytes = 256 * 1024 * 1024; // 256 MiB
     };
 
-    MemoryPool(Backend* backend, MemoryType type, const Options& options = {});
+    MemoryPool(Backend* backend, MemoryType type);
+    MemoryPool(Backend* backend, MemoryType type, const Options& options);
     ~MemoryPool() override;
 
     // Allocator interface

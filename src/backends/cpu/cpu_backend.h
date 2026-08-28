@@ -32,9 +32,10 @@ public:
 
     Status synchronize() override;
 
-    Status gemm(Buffer* c, const Buffer* a, const Buffer* b, bool trans_a,
-                bool trans_b, int64_t m, int64_t n, int64_t k, float alpha,
-                float beta, Stream* stream) override;
+    Status gemm(Buffer* c, const Buffer* a, const Buffer* b, DType c_type,
+                DType a_type, DType b_type, DType compute_type,
+                bool trans_a, bool trans_b, int64_t m, int64_t n, int64_t k,
+                float alpha, float beta, Stream* stream) override;
 
     void register_kernels() override;
 

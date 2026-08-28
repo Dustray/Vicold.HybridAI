@@ -53,6 +53,12 @@ Status Qwen3Config::load_json(const std::string& path) {
     read_i64("vocab_size", &vocab_size);
     read_i64("max_position_embeddings", &max_position_embeddings);
     read_float("rope_theta", &rope_theta);
+    read_float("rms_norm_eps", &rms_norm_eps);
+    read_i64("linear_num_key_heads", &linear_num_key_heads);
+    read_i64("linear_num_value_heads", &linear_num_value_heads);
+    read_i64("linear_key_head_dim", &linear_key_head_dim);
+    read_i64("linear_value_head_dim", &linear_value_head_dim);
+    read_i64("linear_conv_kernel_dim", &linear_conv_kernel_dim);
 
     // Some Qwen releases omit head_dim and derive it from hidden size and
     // attention heads. The actual Qwen3.8 config also stores rope_theta only
@@ -79,6 +85,10 @@ Status Qwen3Config::load_json(const std::string& path) {
         num_attention_heads <= 0 || num_key_value_heads <= 0 || head_dim <= 0 ||
         rope_head_dim <= 0 || intermediate_size <= 0 || vocab_size <= 0 ||
         max_position_embeddings <= 0 || rope_theta <= 0.0f ||
+        rms_norm_eps <= 0.0f || linear_num_key_heads <= 0 ||
+        linear_num_value_heads <= 0 || linear_key_head_dim <= 0 ||
+        linear_value_head_dim <= 0 || linear_conv_kernel_dim <= 0 ||
+        linear_num_value_heads % linear_num_key_heads != 0 ||
         num_attention_heads % num_key_value_heads != 0 ||
         rope_head_dim > head_dim || rope_head_dim % 2 != 0) {
         return Status(StatusCode::InvalidModel,

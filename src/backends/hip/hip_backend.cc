@@ -29,6 +29,28 @@ Status rocblas_error_to_status(rocblas_status status) {
                   message == nullptr ? "Unknown rocBLAS error" : message);
 }
 
+bool to_rocblas_datatype(DType type, rocblas_datatype* output) {
+    switch (type) {
+        case DType::FP32:
+            *output = rocblas_datatype_f32_r;
+            return true;
+        case DType::FP16:
+            *output = rocblas_datatype_f16_r;
+            return true;
+        case DType::BF16:
+            *output = rocblas_datatype_bf16_r;
+            return true;
+        case DType::INT8:
+            *output = rocblas_datatype_i8_r;
+            return true;
+        case DType::INT32:
+            *output = rocblas_datatype_i32_r;
+            return true;
+        default:
+            return false;
+    }
+}
+
 class HipAllocator final : public Allocator {
 public:
     HipAllocator(MemoryType type) : type_(type) {}
@@ -63,6 +85,7 @@ public:
             case MemoryType::Device:
             case MemoryType::Unified:
                 return hip_error_to_status(hipFree(ptr));
+            case MemoryType::Host:
             case MemoryType::HostPinned:
                 return hip_error_to_status(hipHostFree(ptr));
             default:
@@ -241,9 +264,17 @@ bool rocblas_can_execute(rocblas_handle handle) {
         hipFree(dev_c);
         return false;
     }
-    hipMemcpy(dev_a, &host_a, sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(dev_b, &host_b, sizeof(float), hipMemcpyHostToDevice);
-    hipMemcpy(dev_c, &host_c, sizeof(float), hipMemcpyHostToDevice);
+    if (hipMemcpy(dev_a, &host_a, sizeof(float), hipMemcpyHostToDevice) !=
+            hipSuccess ||
+        hipMemcpy(dev_b, &host_b, sizeof(float), hipMemcpyHostToDevice) !=
+            hipSuccess ||
+        hipMemcpy(dev_c, &host_c, sizeof(float), hipMemcpyHostToDevice) !=
+            hipSuccess) {
+        (void)hipFree(dev_a);
+        (void)hipFree(dev_b);
+        (void)hipFree(dev_c);
+        return false;
+    }
     rocblas_status status = rocblas_sgemm(
         handle, rocblas_operation_none, rocblas_operation_none, 1, 1, 1, &one,
         dev_b, 1, dev_a, 1, &zero, dev_c, 1);
@@ -252,9 +283,16 @@ bool rocblas_can_execute(rocblas_handle handle) {
                                rocblas_operation_none, 1, 1, 1, &one, dev_b, 1,
                                dev_a, 1, &zero, dev_c, 1);
     }
-    hipFree(dev_a);
-    hipFree(dev_b);
-    hipFree(dev_c);
+    // rocBLAS launches asynchronously on its stream.  Do not release the
+    // probe buffers until both test GEMMs have completed; otherwise the
+    // allocator may recycle them and the first real GEMM can VM-fault.
+    if (status == rocblas_status_success && hipDeviceSynchronize() !=
+                                                 hipSuccess) {
+        status = rocblas_status_internal_error;
+    }
+    (void)hipFree(dev_a);
+    (void)hipFree(dev_b);
+    (void)hipFree(dev_c);
     return status == rocblas_status_success;
 }
 #endif
@@ -340,6 +378,9 @@ std::unique_ptr<Allocator> HipBackend::create_allocator(MemoryType type) {
 std::shared_ptr<Buffer> HipBackend::create_buffer(size_t size,
                                                     MemoryType type) {
 #ifdef HYBRIDAI_HAS_HIP
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return nullptr;
+    }
     auto allocator = create_allocator(type);
     void* ptr = nullptr;
     Status status = allocator->allocate(size, &ptr);
@@ -364,6 +405,9 @@ std::shared_ptr<Buffer> HipBackend::create_buffer(size_t size,
 
 std::unique_ptr<Stream> HipBackend::create_stream() {
 #ifdef HYBRIDAI_HAS_HIP
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return nullptr;
+    }
     hipStream_t stream = nullptr;
     hipError_t err = hipStreamCreate(&stream);
     if (err != hipSuccess) {
@@ -377,6 +421,9 @@ std::unique_ptr<Stream> HipBackend::create_stream() {
 
 std::unique_ptr<Event> HipBackend::create_event() {
 #ifdef HYBRIDAI_HAS_HIP
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return nullptr;
+    }
     hipEvent_t event = nullptr;
     hipError_t err = hipEventCreate(&event);
     if (err != hipSuccess) {
@@ -392,6 +439,9 @@ Status HipBackend::memcpy_h2d(Buffer* dst, const void* src, size_t size,
                               Stream* stream) {
     (void)stream;
 #ifdef HYBRIDAI_HAS_HIP
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    }
     auto* s = static_cast<HipStream*>(stream);
     return hip_error_to_status(hipMemcpyAsync(
         dst->data(), src, size, hipMemcpyHostToDevice,
@@ -409,6 +459,9 @@ Status HipBackend::memcpy_d2h(void* dst, const Buffer* src, size_t size,
                               Stream* stream) {
     (void)stream;
 #ifdef HYBRIDAI_HAS_HIP
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    }
     auto* s = static_cast<HipStream*>(stream);
     return hip_error_to_status(hipMemcpyAsync(
         dst, src->data(), size, hipMemcpyDeviceToHost,
@@ -426,7 +479,23 @@ Status HipBackend::memcpy_d2d(Buffer* dst, const Buffer* src, size_t size,
                                 Stream* stream) {
     (void)stream;
 #ifdef HYBRIDAI_HAS_HIP
+    if (dst == nullptr || src == nullptr) {
+        return Status(StatusCode::InvalidArgument,
+                      "HIP D2D copy received a null buffer");
+    }
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    }
     auto* s = static_cast<HipStream*>(stream);
+    const int src_device = src->device().id();
+    const int dst_device = dst->device().id();
+    if (src->device().is_gpu() && dst->device().is_gpu() &&
+        src->device().backend() == "hip" &&
+        dst->device().backend() == "hip" && src_device != dst_device) {
+        return hip_error_to_status(hipMemcpyPeerAsync(
+            dst->data(), dst_device, src->data(), src_device, size,
+            s ? s->handle() : nullptr));
+    }
     return hip_error_to_status(hipMemcpyAsync(
         dst->data(), src->data(), size, hipMemcpyDeviceToDevice,
         s ? s->handle() : nullptr));
@@ -442,7 +511,24 @@ Status HipBackend::memcpy_d2d(Buffer* dst, const Buffer* src, size_t size,
 Status HipBackend::copy(Buffer* dst, const Buffer* src, size_t size,
                         Stream* stream) {
 #ifdef HYBRIDAI_HAS_HIP
+    if (dst == nullptr || src == nullptr) {
+        return Status(StatusCode::InvalidArgument,
+                      "HIP copy received a null buffer");
+    }
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    }
     auto* s = static_cast<HipStream*>(stream);
+    if (dst->memory_type() == MemoryType::Device &&
+        src->memory_type() == MemoryType::Device &&
+        dst->device().is_gpu() && src->device().is_gpu() &&
+        dst->device().backend() == "hip" &&
+        src->device().backend() == "hip" &&
+        dst->device().id() != src->device().id()) {
+        return hip_error_to_status(hipMemcpyPeerAsync(
+            dst->data(), dst->device().id(), src->data(), src->device().id(),
+            size, s ? s->handle() : nullptr));
+    }
     hipMemcpyKind kind = copy_direction(dst->memory_type(), src->memory_type());
     return hip_error_to_status(hipMemcpyAsync(
         dst->data(), src->data(), size, kind, s ? s->handle() : nullptr));
@@ -459,6 +545,9 @@ Status HipBackend::copy(Buffer* dst, const Buffer* src, size_t size,
 Status HipBackend::memset(Buffer* dst, int value, size_t size, Stream* stream) {
     (void)stream;
 #ifdef HYBRIDAI_HAS_HIP
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    }
     auto* s = static_cast<HipStream*>(stream);
     return hip_error_to_status(
         hipMemsetAsync(dst->data(), value, size, s ? s->handle() : nullptr));
@@ -473,6 +562,9 @@ Status HipBackend::memset(Buffer* dst, int value, size_t size, Stream* stream) {
 
 Status HipBackend::synchronize() {
 #ifdef HYBRIDAI_HAS_HIP
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    }
     return hip_error_to_status(hipDeviceSynchronize());
 #else
     return Status(StatusCode::BackendError,
@@ -481,9 +573,14 @@ Status HipBackend::synchronize() {
 }
 
 Status HipBackend::gemm(Buffer* c, const Buffer* a, const Buffer* b,
-                        bool trans_a, bool trans_b, int64_t m, int64_t n,
-                        int64_t k, float alpha, float beta, Stream* stream) {
+                        DType c_type, DType a_type, DType b_type,
+                        DType compute_type, bool trans_a, bool trans_b,
+                        int64_t m, int64_t n, int64_t k, float alpha,
+                        float beta, Stream* stream) {
 #ifdef HYBRIDAI_HAS_HIP
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    }
     if (c == nullptr || a == nullptr || b == nullptr || c->data() == nullptr ||
         a->data() == nullptr || b->data() == nullptr || m <= 0 || n <= 0 ||
         k <= 0) {
@@ -493,6 +590,24 @@ Status HipBackend::gemm(Buffer* c, const Buffer* a, const Buffer* b,
     if (impl_ == nullptr || impl_->rocblas == nullptr) {
         return Status(StatusCode::BackendError,
                       "HipBackend rocBLAS handle is unavailable");
+    }
+    if (a->device() != device_ || b->device() != device_ ||
+        c->device() != device_) {
+        return Status(StatusCode::InvalidArgument,
+                      "HIP GEMM buffers must belong to the backend device");
+    }
+
+    const size_t a_elements = static_cast<size_t>(trans_a ? k : m) *
+                              static_cast<size_t>(trans_a ? m : k);
+    const size_t b_elements = static_cast<size_t>(trans_b ? n : k) *
+                              static_cast<size_t>(trans_b ? k : n);
+    const size_t c_elements = static_cast<size_t>(m) *
+                              static_cast<size_t>(n);
+    if (a->size() < a_elements * SizeOfDType(a_type) ||
+        b->size() < b_elements * SizeOfDType(b_type) ||
+        c->size() < c_elements * SizeOfDType(c_type)) {
+        return Status(StatusCode::InvalidArgument,
+                      "HIP GEMM buffer is smaller than the requested matrix");
     }
 
     auto* hip_stream = dynamic_cast<HipStream*>(stream);
@@ -512,22 +627,50 @@ Status HipBackend::gemm(Buffer* c, const Buffer* a, const Buffer* b,
         trans_b ? rocblas_operation_transpose : rocblas_operation_none;
     const rocblas_operation op_a =
         trans_a ? rocblas_operation_transpose : rocblas_operation_none;
-    const rocblas_int lda = static_cast<rocblas_int>(
-        trans_b ? k : n);
-    const rocblas_int ldb = static_cast<rocblas_int>(
-        trans_a ? m : k);
+    // The first rocBLAS operand is the original B and the second is the
+    // original A.  A row-major [rows, cols] buffer is a column-major
+    // [cols, rows] buffer, so the leading dimensions must describe the
+    // physical storage before applying the operation flag.
+    const rocblas_int lda = static_cast<rocblas_int>(trans_b ? k : n);
+    const rocblas_int ldb = static_cast<rocblas_int>(trans_a ? m : k);
     const rocblas_int ldc = static_cast<rocblas_int>(n);
 
-    return rocblas_error_to_status(rocblas_sgemm(
+    if (c_type == DType::FP32 && a_type == DType::FP32 &&
+        b_type == DType::FP32 && compute_type == DType::FP32) {
+        return rocblas_error_to_status(rocblas_sgemm(
+            impl_->rocblas, op_b, op_a, static_cast<rocblas_int>(n),
+            static_cast<rocblas_int>(m), static_cast<rocblas_int>(k), &alpha,
+            static_cast<const float*>(b->data()), lda,
+            static_cast<const float*>(a->data()), ldb, &beta,
+            static_cast<float*>(c->data()), ldc));
+    }
+
+    rocblas_datatype roc_c;
+    rocblas_datatype roc_a;
+    rocblas_datatype roc_b;
+    rocblas_datatype roc_compute;
+    if (!to_rocblas_datatype(c_type, &roc_c) ||
+        !to_rocblas_datatype(a_type, &roc_a) ||
+        !to_rocblas_datatype(b_type, &roc_b) ||
+        !to_rocblas_datatype(compute_type, &roc_compute)) {
+        return Status(StatusCode::UnsupportedDType,
+                      "HipBackend::gemm received an unsupported dtype");
+    }
+
+    return rocblas_error_to_status(rocblas_gemm_ex(
         impl_->rocblas, op_b, op_a, static_cast<rocblas_int>(n),
         static_cast<rocblas_int>(m), static_cast<rocblas_int>(k), &alpha,
-        static_cast<const float*>(b->data()), lda,
-        static_cast<const float*>(a->data()), ldb, &beta,
-        static_cast<float*>(c->data()), ldc));
+        b->data(), roc_b, lda, a->data(), roc_a, ldb, &beta, c->data(), roc_c,
+        ldc, c->data(), roc_c, ldc, roc_compute, rocblas_gemm_algo_standard, 0,
+        0));
 #else
     (void)c;
     (void)a;
     (void)b;
+    (void)c_type;
+    (void)a_type;
+    (void)b_type;
+    (void)compute_type;
     (void)trans_a;
     (void)trans_b;
     (void)m;

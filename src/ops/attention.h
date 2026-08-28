@@ -33,7 +33,10 @@ public:
                           int64_t num_q_heads, int64_t num_kv_heads,
                           int64_t head_dim, int64_t rope_head_dim,
                           float rope_base = 10000.0f,
-                          Stream* stream = nullptr);
+                          Stream* stream = nullptr,
+                          const Tensor& q_norm = Tensor(),
+                          const Tensor& k_norm = Tensor(),
+                          float rms_norm_eps = 1.0e-6f);
 
     static Status validate(const Tensor& input,
                            const Tensor& wq, const Tensor& wk,

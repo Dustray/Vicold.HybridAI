@@ -1,14 +1,14 @@
 # Plan: Vicold.HybridAI 跨平台 C++ 推理引擎
 
 ## 目标
-构建一个基于 CMake 的 C++ 高速 AI 推理引擎，初始目标平台为 ROCm/HIP，支持 iGPU（gfx1150，统一内存）+ dGPU（gfx1010，独立显存）协同推理，模型输入为 Dense safetensor 格式。架构预留未来向 CUDA、手写 HIP kernel（Tile 路线）扩展的接口。
+构建一个基于 CMake 的 C++ 高速 AI 推理引擎。当前主开发平台为 Linux DTK/HIP，硬件为最多 8 张 `gfx936` 离散 GPU（每张约 64 GiB，非统一内存）。当前交付目标是在 BF16 文本权重完整常驻设备的基础上，跑通 batch=1、短上下文、greedy 解码的 Qwen3.5/Qwen3.8 27B 端到端文本生成。架构继续保留 Windows 编译兼容、CUDA 后端以及手写 HIP kernel（Tile 路线）的扩展接口。
 
 ## 关键决策
 - **产品形态**：C++ 库 + 命令行 CLI。库可独立链接，CLI 用于加载 safetensor 并执行推理。
 - **后端策略**：优先使用 rocBLAS/cuBLAS/CPU BLAS；通过 `Backend` / `KernelRegistry` 抽象层预留手写 kernel（Tile 路线）替换入口。
-- **多设备策略**：同一模型按层/阶段切分到 iGPU 与 dGPU，PCIe 传输由 `PipelineStage` 显式管理。
-- **内存策略**：运行时启发式选择——dGPU 优先使用 `hipMalloc` 设备内存；iGPU 优先使用 `hipMallocManaged` 统一内存；模型大小超过显存时自动 fallback 到 CPU/分层加载。
-- **平台边界**：gfx1010 仅作为 HIP 编译目标或 CPU fallback，不承诺运行成功（ROCm 官方不支持 gfx1010）。
+- **多设备策略**：64 层按连续区间切分到最多 8 张 GPU，当前 8 卡配置为每卡 8 层；embedding 位于首卡，final norm 和 LM head 位于末卡。只在相邻 partition 边界传输 activation。
+- **内存策略**：当前正式路径只使用离散设备内存，BF16 权重完整常驻 GPU，不使用统一内存或 CPU offload。KV cache、DeltaNet state 和 workspace 随对应层驻留其目标设备。
+- **平台边界**：Linux `gfx936` 是当前构建、kernel 和推理验证平台。Windows 保持公共接口、模型/IO/tokenizer 与 HIP host-only 路径可编译，本阶段不要求运行新增 HIP device kernel。
 - **首个里程碑**：先建立 Tensor、DeviceManager、Allocator、Linear Op、safetensor Loader、CLI 的最小闭环。
 - **视觉策略**：提供 `enable_vision` 加载选项，默认 `false`。第一阶段仅实现文本推理，不构建视觉网络，也不读取 `model.visual.*` 权重 payload；显式开启视觉时返回未实现状态，待视觉后端完成后再启用。
 - **推理目标**：正式推理路径以 GPU 为主，首要后端为 ROCm/HIP。CPU 算子只用于单元测试、数值对齐和 GPU 不可用时的诊断性 fallback，不把完整 CPU 推理作为阶段性交付目标。
@@ -18,13 +18,14 @@
   - 抽象接口需兼容 Linux 与 Windows 双平台：所有同步原语、动态库加载、文件路径、线程/进程 API 均使用跨平台封装（`std::mutex`、`std::thread`、`std::filesystem`、CMake 平台检测）。
   - 后端具体实现按平台隔离编译：Windows 上 CUDA/HIP 后端通过 CMake option 与条件编译启用；Linux 为默认目标平台。
 
-## 目标模型：Qwen3.8-27B-FP8
+## 当前目标模型：Qwen3.5/Qwen3.8 27B BF16
 
 ### 模型来源
-- 模型库：[ModelScope - Qwen/Qwen3.8-27B-FP8](https://www.modelscope.cn/models/Qwen/Qwen3.8-27B-FP8)
+- 本地目录：`/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master`
 - 协议：Apache-2.0
 - 文件格式：Hugging Face Transformers，safetensors
-- 总大小：约 30.89 GB
+- 架构：`Qwen3_5ForConditionalGeneration`，当前只加载 `qwen3_5_text`
+- 文本权重：BF16，约 50.10 GiB；视觉权重暂不加载
 
 ### 核心架构参数
 | 参数 | 值 |
@@ -39,24 +40,23 @@
 | 门控注意力（标准 MHA/GQA） | Q 头数 24，KV 头数 4，头维度 256，RoPE 维度 64 |
 | FFN 中间维度 | 17,408 |
 | 上下文长度 | 原生 262,144，可扩展至 1,000,000（YaRN） |
-| 量化 | 细粒度 FP8 E4M3，块大小 128；部分张量为 BF16 |
+| 权重精度 | BF16；FP8 schema 和量化表示仅作为后续扩展保留 |
 | MTP | 多 Token 预测 |
 
 ### 模型对引擎的特殊要求
-1. **FP8 推理支持**：权重以 FP8 E4M3 存储，需要反量化到 BF16/FP16 后再计算，或在支持的硬件上做 FP8 GEMM。
+1. **BF16 推理支持**：权重和主要 activation 使用 BF16，GEMM/reduction 关键路径使用 FP32 accumulation；SSM state 按模型配置使用 FP32。
 2. **GQA + DeltaNet 混合注意力**：每 4 层中有 3 层是 DeltaNet（线性注意力），1 层是标准 GQA 注意力，需要分别实现。
 3. **门控 FFN**：存在门控机制（类似 SwiGLU）的 FFN 结构。
 4. **RoPE 与 YaRN**：标准 RoPE 维度 64，长上下文需要支持 YaRN 缩放。
 5. **MTP**：多 token 预测可作为可选优化，第一阶段可先实现单步预测。
 6. **思考模式/指令模式切换**：模板控制，不影响引擎核心，但 tokenizer 需处理 `enable_thinking` 模板。
 
-### 显存估算（FP8 权重 + BF16 KV Cache）
-- 模型权重：约 27.78B × 1 byte ≈ **27.8 GB**（FP8），反量化后约 55.6 GB（BF16）
-- KV Cache（原生 262k 上下文、64 层、batch=1）：约 2 × 64 × 262144 × (5120 × 1/8) × 2 byte ≈ **41.9 GB**
-- 因此：
-  - 单卡 7.98 GB dGPU 或 13.11 GB iGPU 无法直接放下完整模型或长上下文 KV。
-  - 必须采用 **分层/分阶段多设备切分** + **上下文长度限制** + **量化 KV Cache**。
-  - 实用目标：先以短上下文（如 4k / 8k / 32k）运行，验证端到端推理；长上下文作为后续优化。
+### 当前显存基线
+- 设备：8 × `gfx936`，每张约 63.98 GiB，非统一内存。
+- 文本模型权重：约 **50.10 GiB**。
+- 当前切分：首末卡各约 8.04 GiB，中间卡各约 5.67 GiB。
+- 剩余显存足以容纳短上下文 KV cache、DeltaNet state、workspace 和跨卡 activation buffer。
+- 第一验收目标限制为 batch=1、128–512 prompt tokens、最多 16 个新 token；跑通后再逐步扩大到 4k。长上下文、量化 KV cache 和 YaRN 优化不属于当前阶段。
 
 ## 目录结构
 
@@ -112,6 +112,8 @@ Vicold.HybridAI/
 
 - Phase 0：CMake/C++20 工程脚手架与基础依赖。
 - Windows HIP/ROCm 端到端验证：Debug 构建链接成功、HIP 设备动态枚举、`hybridai_cli devices` 列出可用 GPU、`BackendComputeTest.HipFp32GemmMatchesReference` 在 `HIP_VISIBLE_DEVICES=1` 与 `ROCBLAS_TENSILE_LIBPATH` 配置下通过。
+- Linux DTK/HIP 端到端构建验证：GCC 11 + Ninja 下成功发现 `/opt/dtk` 的 HIP/rocBLAS CMake 包，核心库及 demo 构建通过，`simple_infer hip` 已在 `gfx936` 上实际运行成功。
+- Linux 非统一内存多卡 BF16 加载验证：已在 8 张 `gfx936`（每张约 64 GiB）上将指定 Qwen3.8/Qwen3.5 27B BF16 文本模型完整加载到设备显存。64 层按连续区间切分，每卡 8 层；embedding 位于首卡，final norm/lm_head 位于末卡。实际文本权重约 50.10 GiB，首末卡各约 8.04 GiB，其余卡各约 5.67 GiB。
 - Phase 1：Device、DType、Shape、Tensor、Backend 等核心抽象。
 - Phase 2：MemoryPool、MemoryPlanner 与 CPU/HIP stub 后端。
 - Phase 3：Backend/KernelRegistry 抽象及 CUDA/HIP API 封装边界。
@@ -129,17 +131,27 @@ Vicold.HybridAI/
 
 进行中：
 
-- 真实 GPU GEMM smoke test：当前机器有两块 AMD GPU；ROCm 运行时把 device 0 识别为 `gfx1010`，device 1 识别为 `gfx1150`。SDK 仅提供 `gfx1150` 的 Tensile kernel 数据，因此需要设置 `HIP_VISIBLE_DEVICES=1` 让程序只看到可用 GPU。已增加 `Backend::enumerate_devices()` 接口并由 `HipBackend` 实现，DeviceManager 不再硬编码 HIP 设备 ID，而是根据当前可见设备和 rocBLAS 可用性动态枚举。`HipBackend` 构造时的最小 sgemm 探测仍保留，作为最终兜底。
-- 二维 FP8 block scale 反量化与通用量化权重表示。
+- typed GEMM 与 HIP BF16 计算路径：扩展 `Backend::gemm()` 的 dtype 合约，并使用 rocBLAS BF16 输入、FP32 accumulation。
+- BF16 基础 GPU kernel：embedding、RMSNorm、residual、SwiGLU、partial RoPE、causal softmax 和 argmax。
+- Qwen3.5 Full Attention、DeltaNet state/cache 和八卡短上下文前向。
+- Hugging Face 逐层数值对齐，以及 reference 路径到 GPU kernel 的迁移。
 
 尚未完成：
 
-- Qwen3.8 权重对象和完整 64 层前向。
-- 可配置的完整多设备流水线与 CPU offload。
-- Linux ROCm 构建验证和 CUDA 后端实现。
-- 真实 HIP GPU kernel、性能测试和 CLI 端到端推理。
+- 持久化 KV cache、DeltaNet recurrent state 和增量 decode。
+- partition 边界 peer copy/pinned-host fallback 和流水线执行。
+- Linux 完整测试依赖/CTest 验证和 CUDA 后端实现。
+- 单层 Transformers 数值对齐、性能测试和最终 CLI 端到端推理验收。
 
 ### 最新构建与 GPU 验证结论
+
+- **Linux HIP 当前实测**：在 `HIP_VISIBLE_DEVICES=0` 下，`build-linux-hip/bin/qwen_infer` 已成功加载约 50.10 GiB 的 BF16 文本权重，并完成 64 层混合 Attention/DeltaNet、MLP、final norm、lm_head 和多步 full-recompute greedy decode。推理路径当前是 reference 实现，性能尚未优化。
+- **Qwen3.5 语义修复**：主 RMSNorm 使用官方的 `(1 + weight)` 参数化；DeltaNet 的 `RMSNormGated` 保持普通乘权重并在归一化后施加 `SiLU(z)`；标准 Attention 使用 q/k per-head norm、half-split RoPE、sigmoid gate，且 q/gate 按 `[head, 2*head_dim]` 交错布局拆分。
+- **Tokenizer 模板**：C++ tokenizer 已支持 `<|im_end|>`、assistant generation prompt 和 `enable_thinking=false` 的空 thinking 段。当前 demo 使用关闭 thinking 的对话模板，以便先验证正常文本输出。
+- **当前数值状态**：模型可以稳定运行，但尚未达到 Hugging Face 参考输出；后续仍需做逐层/逐 token 数值对齐，重点是 BF16 staging、DeltaNet conv/state、attention 和 MLP 的算子精度。
+- **多卡 activation 传输**：`Tensor::to()` 的 HIP GPU-to-GPU 路径已在 backend 中区分跨设备拷贝，并使用 `hipMemcpyPeerAsync`，避免把源卡指针直接交给目标卡的普通 `hipMemcpyDeviceToDevice`。backend 的内存、拷贝、同步和 GEMM 操作都会恢复所属 HIP device；`Tensor::to()` 会在异步跨卡拷贝后同步目标设备，确保源 tensor 生命周期安全。
+- **多卡稳定性验证**：已在 `HIP_VISIBLE_DEVICES=0,1` 下完成 2 卡真实 BF16 加载、64 层 full-recompute 和 8 步 greedy decode；已在 `HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7` 下完成 8 卡同样验证，进程退出码均为 0，未再出现 VMFault。此前双卡 VMFault 的直接原因是多个 HIP backend 交替使用后当前 device 上下文漂移。
+- **最新 Linux HIP 验证**：`Qwen3Config` 已动态解析 `rms_norm_eps`、DeltaNet 的 key/value head 数、head dim 和卷积核尺寸；C++ tokenizer 对 `Hello, how are you?` 生成的 ID 已与 HF 基准完全一致：`[248045, 846, 198, 9419, 11, 1204, 513, 488, 30, 248046, 198, 248045, 74455, 198, 248068, 271, 248069, 271]`。单卡 `HIP_VISIBLE_DEVICES=0` 下仍可完成 64 层 full-recompute 推理，未出现 NaN/Inf，但 greedy 输出仍主要为 `271`/`198`（空白/换行），因此模型数值尚未对齐 HF；已加入 compact layer statistics 作为后续定位基础。
 
 - `build/`：CPU/stub 配置稳定构建通过，62 项测试通过。
 - `build-debug/`（`-D HYBRIDAI_ENABLE_HIP=ON`）：完整 Debug 构建通过，`hybridai.lib` 与 `hybridai_test.exe` 链接成功，无 LNK2038 runtime mismatch。
@@ -152,6 +164,7 @@ Vicold.HybridAI/
 - `.vcxproj`、`.sln` 和其他 Visual Studio 工程文件均为 CMake 生成物，不纳入 Git；构建目录使用 `build/`、`build-debug/`、`build-hip/` 或 `build-linux/` 分离。
 - Windows：继续使用 Visual Studio generator；`hip_backend.cc` 仅使用 HIP host API，因此由 MSVC 直接编译，无需 `hipcc` custom command。CMake 通过 `set_source_files_properties` 只为该文件添加 ROCm include 路径与 `__HIP_PLATFORM_AMD__` 宏。
 - Linux：优先使用 Ninja 或 Unix Makefiles，并使用 CMake 原生 HIP language/`hipcc` 集成；Windows 的 MSVC 直接编译方案不适用于 Linux。
+- Linux 当前 host-only HIP 后端源可由 GCC/Clang 配合 `hip::host` 编译；后续加入手写 HIP kernel 时，再为 kernel 源启用 CMake HIP language/`hipcc`。DTK 这类分散安装布局通过 `HYBRIDAI_ROCM_ROOT` 统一定位。
 - 两个平台共享 `Backend`、Tensor、模型和 IO 抽象，平台差异限制在后端实现及 CMake 条件分支中。
 
 ### Windows ROCm 运行环境配置
@@ -358,11 +371,10 @@ Qwen3.8 只是第一个适配器，不应成为核心运行时的硬编码分支
    预期输出为空。
 
 ## 风险与边界
-- **gfx1010 不支持官方 ROCm**：`HipBackend` 编译目标可包含 gfx1010，但运行测试以 CPU 或 iGPU 为主；dGPU 仅做编译兼容性验证。
-- **27.8B FP8 模型远超单卡显存**：必须分层/多设备/CPU offload，初期以短上下文、部分层验证为主。
-- **FP8 计算支持有限**：ROCm/rocBLAS 对 FP8 GEMM 的支持取决于 GPU 架构（MI 系列较完整，gfx1010/gfx1150 不确定），可能需要在线反量化到 BF16/FP16 计算。
-- **DeltaNet 实现复杂**：线性注意力有多种实现形式（recurrent/parallel），先从简单 recurrent 开始，后续再优化。
-- **iGPU 统一内存性能**：gfx1150 为集成显卡，统一内存虽可零拷贝，但带宽与延迟需实测，必要时回退到显式拷贝。
+- **BF16 正确性优先**：先实现 BF16 输入、FP32 accumulation 的可靠路径，再考虑 FP8 GEMM 和 kernel 融合。
+- **DeltaNet 实现复杂**：必须以当前 Transformers 实现和导出的中间 tensor/state fixture 为事实来源，不能继续扩展现有固定 gate 占位算法。
+- **多卡传输拓扑未知**：需要运行时探测 peer access；不支持时必须提供 pinned-host staging fallback。
+- **显存预算不能只计算权重**：加载前还要为 KV cache、DeltaNet FP32 state、workspace、rocBLAS 临时空间和跨卡双缓冲预留容量。
 - **多设备协同复杂度**：初期仅实现 layer-level 切分，不实现 expert-level 或 pipeline-parallel 高级调度。
 - **视觉编码器暂时跳过**：先聚焦语言模型推理，视觉编码器后续作为扩展。
 - 跨平台构建复杂度：Windows 上 ROCm/HIP 与 CMake/MSVC 的兼容性较弱，但当前已通过 MSVC 直接编译 HIP host API 的方式打通；CUDA 后端在 Windows 上更易验证。

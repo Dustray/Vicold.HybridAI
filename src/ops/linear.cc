@@ -42,9 +42,11 @@ Status Linear::validate(const Tensor& input, const Tensor& weight,
                                            transpose_weight, &unused);
     if (!status.ok()) return status;
 
-    if (input.dtype() != weight.dtype()) {
+    const bool supported_mixed_types =
+        input.dtype() == DType::FP32 && weight.dtype() == DType::BF16;
+    if (input.dtype() != weight.dtype() && !supported_mixed_types) {
         return Status(StatusCode::InvalidArgument,
-                        "Linear input/weight dtype mismatch");
+                        "Linear input/weight dtype mismatch (only FP32 x BF16 is supported)");
     }
 
     if (input.device() != weight.device()) {
@@ -107,8 +109,9 @@ Tensor Linear::forward(const Tensor& input, const Tensor& weight,
         return Tensor();
     }
 
+    const DType output_dtype = input.dtype();
     auto output_buffer = backend->create_buffer(
-        output_shape.numel() * SizeOfDType(input.dtype()),
+        output_shape.numel() * SizeOfDType(output_dtype),
         input.buffer()->memory_type());
     if (output_buffer == nullptr) {
         return Tensor();
@@ -121,6 +124,9 @@ Tensor Linear::forward(const Tensor& input, const Tensor& weight,
     // We pass trans_a=false, trans_b=true and let the backend handle layout.
     status = backend->gemm(output_buffer.get(), input.buffer().get(),
                            weight.buffer().get(),
+                           output_dtype, input.dtype(), weight.dtype(),
+                           output_dtype == DType::BF16 ? DType::FP32
+                                                        : output_dtype,
                            /*trans_a=*/false, /*trans_b=*/transpose_weight,
                            m, n, k, 1.0f, 0.0f, stream);
     if (!status.ok()) {
@@ -129,7 +135,7 @@ Tensor Linear::forward(const Tensor& input, const Tensor& weight,
 
     // TODO: add bias after GEMM.
 
-    return Tensor(output_shape, input.dtype(), input.device(),
+    return Tensor(output_shape, output_dtype, input.device(),
                   std::move(output_buffer));
 }
 

@@ -34,7 +34,8 @@ public:
     // full jinja engine.
     std::string build_chat_prompt(
         const std::vector<std::pair<std::string, std::string>>& messages,
-        bool add_generation_prompt = true) const;
+        bool add_generation_prompt = true,
+        bool enable_thinking = true) const;
 
     int64_t eos_token_id() const noexcept { return eos_token_id_; }
 

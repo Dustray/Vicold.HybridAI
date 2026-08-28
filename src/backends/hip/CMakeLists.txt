@@ -10,9 +10,44 @@ target_sources(hybridai
 )
 
 if(HYBRIDAI_ENABLE_HIP)
-    # Prefer ROCm config packages. The SDK's legacy FindHIP module can report
-    # HIP correctly but still leave the rocBLAS config package undiscovered.
-    if(WIN32 AND DEFINED HYBRIDAI_ROCM_ROOT)
+    # Prefer ROCm config packages. ROCm-derived Linux distributions may place
+    # HIP, rocBLAS and compiler support packages under different prefixes
+    # below the SDK root (for example /opt/dtk/{hip,dcc,dcc/comgr}).
+    if(NOT HYBRIDAI_ROCM_ROOT)
+        if(DEFINED ENV{ROCM_PATH})
+            set(HYBRIDAI_ROCM_ROOT "$ENV{ROCM_PATH}")
+        elseif(DEFINED ENV{HIP_PATH})
+            get_filename_component(HYBRIDAI_ROCM_ROOT "$ENV{HIP_PATH}" DIRECTORY)
+        else()
+            find_program(HYBRIDAI_HIPCC NAMES hipcc)
+            if(HYBRIDAI_HIPCC)
+                get_filename_component(HYBRIDAI_HIP_BIN_DIR
+                                       "${HYBRIDAI_HIPCC}" DIRECTORY)
+                get_filename_component(HYBRIDAI_ROCM_ROOT
+                                       "${HYBRIDAI_HIP_BIN_DIR}" DIRECTORY)
+            endif()
+        endif()
+    endif()
+
+    if(HYBRIDAI_ROCM_ROOT)
+        get_filename_component(HYBRIDAI_ROCM_ROOT
+                               "${HYBRIDAI_ROCM_ROOT}" REALPATH)
+        list(PREPEND CMAKE_PREFIX_PATH
+            "${HYBRIDAI_ROCM_ROOT}"
+            "${HYBRIDAI_ROCM_ROOT}/hip"
+            "${HYBRIDAI_ROCM_ROOT}/rocblas"
+            "${HYBRIDAI_ROCM_ROOT}/dcc"
+            "${HYBRIDAI_ROCM_ROOT}/dcc/comgr"
+        )
+        if(NOT WIN32)
+            set(ROCM_PATH "${HYBRIDAI_ROCM_ROOT}")
+        endif()
+        message(STATUS "HybridAI ROCm root: ${HYBRIDAI_ROCM_ROOT}")
+    endif()
+
+    # The Windows Python SDK needs explicit package directories. Keep these
+    # overrides isolated from the Linux package search above.
+    if(WIN32 AND HYBRIDAI_ROCM_ROOT)
         if(NOT hip_DIR)
             set(hip_DIR "${HYBRIDAI_ROCM_ROOT}/lib/cmake/hip")
         endif()
@@ -22,8 +57,8 @@ if(HYBRIDAI_ENABLE_HIP)
     endif()
     find_package(hip CONFIG QUIET)
     find_package(rocblas CONFIG QUIET)
-    if(hip_FOUND AND rocblas_FOUND AND TARGET hip::device AND
-       TARGET roc::rocblas)
+     if(hip_FOUND AND rocblas_FOUND AND TARGET hip::host AND
+         TARGET roc::rocblas)
         # Make the HIP macro visible to all consumers of the hybridai target
         # (demos, tests, CLI) so they can conditionally include HIP headers.
         target_compile_definitions(hybridai PUBLIC HYBRIDAI_HAS_HIP)

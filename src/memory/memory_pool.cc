@@ -24,6 +24,9 @@ size_t next_power_of_two(size_t v) {
 
 } // namespace
 
+MemoryPool::MemoryPool(Backend* backend, MemoryType type)
+    : MemoryPool(backend, type, Options{}) {}
+
 MemoryPool::MemoryPool(Backend* backend, MemoryType type, const Options& options)
     : backend_(backend), type_(type), options_(options) {
     if (options_.bucket_growth < 1.01) {

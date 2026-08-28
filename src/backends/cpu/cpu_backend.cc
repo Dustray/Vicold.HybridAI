@@ -183,12 +183,19 @@ Status CpuBackend::memset(Buffer* dst, int value, size_t size, Stream* stream) {
 Status CpuBackend::synchronize() { return Status::OK(); }
 
 Status CpuBackend::gemm(Buffer* c, const Buffer* a, const Buffer* b,
-                          bool trans_a, bool trans_b, int64_t m, int64_t n,
-                          int64_t k, float alpha, float beta, Stream* stream) {
+                        DType c_type, DType a_type, DType b_type,
+                        DType compute_type, bool trans_a, bool trans_b,
+                        int64_t m, int64_t n, int64_t k, float alpha,
+                        float beta, Stream* stream) {
     (void)stream;
+    if (c_type != DType::FP32 || a_type != DType::FP32 ||
+        b_type != DType::FP32 || compute_type != DType::FP32) {
+        return Status(StatusCode::UnsupportedDType,
+                      "CpuBackend reference GEMM only supports FP32");
+    }
     // TODO: add BLAS integration (OpenBLAS/MKL); for now naive reference
     return naive_gemm_f32(c->data(), a->data(), b->data(), trans_a, trans_b,
-                            m, n, k, alpha, beta);
+                          m, n, k, alpha, beta);
 }
 
 void CpuBackend::register_kernels() {

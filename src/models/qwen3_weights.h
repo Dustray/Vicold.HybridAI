@@ -52,6 +52,24 @@ struct Qwen3SharedWeights {
     Tensor lm_head;
 };
 
+struct Qwen3DevicePartition {
+    Device device;
+    int64_t first_layer = 0;
+    int64_t last_layer = -1;
+    uint64_t weight_bytes = 0;
+};
+
+// Fully resident text-model weights. Layers are stored by model index while
+// layer_devices records the device that owns each layer. Embeddings live on
+// the first device; final norm and LM head live on the last device.
+struct Qwen3DistributedWeights {
+    Qwen3SharedWeights shared;
+    std::vector<Qwen3LayerWeights> layers;
+    std::vector<Device> layer_devices;
+    std::vector<Qwen3DevicePartition> partitions;
+    uint64_t total_weight_bytes = 0;
+};
+
 struct Qwen3LoadOptions {
     // Phase 1 is text-only. Vision is opt-in and remains disabled by default.
     bool enable_vision = false;
@@ -75,6 +93,8 @@ public:
     Status load_layer(int64_t layer_index, Device device,
                       Qwen3LayerWeights* output) const;
     Status load_shared(Device device, Qwen3SharedWeights* output) const;
+    Status load_distributed(const std::vector<Device>& devices,
+                            Qwen3DistributedWeights* output) const;
 
 private:
     Status load_tensor(const std::string& name, Device device,
@@ -84,6 +104,8 @@ private:
     Status load_layer_tensor(int64_t layer_index, const std::string& suffix,
                              Device device, Tensor* output) const;
     std::string layer_name(int64_t layer_index, const std::string& suffix) const;
+    uint64_t tensor_bytes(const std::string& name) const;
+    uint64_t layer_bytes(int64_t layer_index) const;
 
     std::shared_ptr<io::SafeTensorLoader> loader_;
     Qwen3Config config_;

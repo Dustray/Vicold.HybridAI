@@ -36,19 +36,45 @@ function(hybridai_add_local_or_github name version github_repo git_tag source_di
     endif()
 endfunction()
 
-hybridai_add_local_or_github(
-    fmt 11.0.2 fmtlib/fmt 11.0.2 "fmt-11.0.2"
-)
+if(HYBRIDAI_BUILD_CLI)
+    find_package(fmt CONFIG QUIET)
+    if(NOT TARGET fmt::fmt)
+        hybridai_add_local_or_github(
+            fmt 11.0.2 fmtlib/fmt 11.0.2 "fmt-11.0.2"
+        )
+    endif()
 
-hybridai_add_local_or_github(
-    spdlog 1.14.1 gabime/spdlog v1.14.1 "spdlog-1.14.1"
-    OPTIONS
-        "SPDLOG_FMT_EXTERNAL ON"
-)
+    find_package(spdlog CONFIG QUIET)
+    if(NOT TARGET spdlog::spdlog)
+        hybridai_add_local_or_github(
+            spdlog 1.14.1 gabime/spdlog v1.14.1 "spdlog-1.14.1"
+            OPTIONS
+                "SPDLOG_FMT_EXTERNAL ON"
+        )
+    endif()
+endif()
 
-hybridai_add_local_or_github(
-    nlohmann_json 3.11.3 nlohmann/json v3.11.3 "json-3.11.3"
-)
+find_package(nlohmann_json CONFIG QUIET)
+if(NOT TARGET nlohmann_json::nlohmann_json AND
+   HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR)
+    if(NOT EXISTS
+       "${HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR}/nlohmann/json.hpp")
+        message(FATAL_ERROR
+            "HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR does not contain "
+            "nlohmann/json.hpp")
+    endif()
+    add_library(hybridai_nlohmann_json INTERFACE)
+    add_library(nlohmann_json::nlohmann_json ALIAS hybridai_nlohmann_json)
+    target_include_directories(hybridai_nlohmann_json INTERFACE
+        "${HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR}")
+    message(STATUS
+        "Using external nlohmann-json headers from "
+        "${HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR}")
+elseif(NOT TARGET nlohmann_json::nlohmann_json)
+    hybridai_add_local_or_github(
+        nlohmann_json 3.11.3 nlohmann/json v3.11.3 "json-3.11.3"
+    )
+endif()
 
 if(HYBRIDAI_BUILD_TESTS)
     hybridai_add_local_or_github(

@@ -975,8 +975,8 @@ int main(int argc, char* argv[]) {
               << (shared.lm_head.buffer() != nullptr ? "loaded" : "missing")
               << std::endl;
 
-    // 6. 加载前 4 层做结构探查（临时加速测试，避免加载全部 64 层）
-    constexpr int64_t k_probe_layers = 4;
+    // 6. 按模型配置加载全部真实层。
+    const int64_t k_probe_layers = config.num_hidden_layers;
     std::vector<Qwen3LayerWeights> probe_layers;
     for (int64_t li = 0; li < k_probe_layers; ++li) {
         Qwen3LayerWeights layer;

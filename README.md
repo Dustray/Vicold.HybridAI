@@ -52,6 +52,155 @@ Vicold.HybridAI/
 
 ## 构建命令
 
+### 当前推荐流程：Linux + HIP
+
+当前默认配置只构建 HIP 版共享库，不构建 demo、CLI 和单元测试：
+
+```text
+HYBRIDAI_ENABLE_HIP=ON
+HYBRIDAI_ENABLE_CPU=OFF
+BUILD_SHARED_LIBS=ON
+HYBRIDAI_BUILD_TESTS=OFF
+HYBRIDAI_BUILD_CLI=OFF
+HYBRIDAI_BUILD_DEMOS=OFF
+```
+
+`nlohmann_json` 已放在 `third_party/nlohmann_json`，配置过程不需要从
+GitHub 下载该依赖。
+
+#### 1. 构建 `libhybridai.so`
+
+在项目根目录创建并进入 `build`：
+
+```bash
+mkdir -p build
+cd build
+cmake ..
+make -j$(nproc)
+```
+
+也可以使用与生成器无关的写法：
+
+```bash
+cmake -S . -B build
+cmake --build build --parallel
+```
+
+成功后生成：
+
+```text
+build/libhybridai.so
+```
+
+如需同时启用 CPU 参考后端：
+
+```bash
+cmake -S . -B build -DHYBRIDAI_ENABLE_CPU=ON
+cmake --build build --parallel
+```
+
+#### 2. 使用已编译的 `.so` 独立构建 demo
+
+`demo/CMakeLists.txt` 可以作为独立 CMake 项目使用，不会重新编译
+`hybridai`，默认链接 `build/libhybridai.so`：
+
+```bash
+cmake -S demo -B demo/build \
+  -DCMAKE_CXX_COMPILER=/opt/dtk/bin/hipcc
+
+cmake --build demo/build --target qwen_infer -j$(nproc)
+```
+
+生成文件：
+
+```text
+demo/build/bin/qwen_infer
+```
+
+如果动态库不在默认位置，通过 `HYBRIDAI_LIBRARY` 指定：
+
+```bash
+cmake -S demo -B demo/build \
+  -DCMAKE_CXX_COMPILER=/opt/dtk/bin/hipcc \
+  -DHYBRIDAI_LIBRARY=/absolute/path/to/libhybridai.so
+```
+
+如果 demo 与 HybridAI 源码不在同一个仓库目录，还需要指定源码根目录：
+
+```bash
+cmake -S demo -B demo/build \
+  -DCMAKE_CXX_COMPILER=/opt/dtk/bin/hipcc \
+  -DHYBRIDAI_ROOT=/absolute/path/to/Vicold.HybridAI \
+  -DHYBRIDAI_LIBRARY=/absolute/path/to/libhybridai.so
+```
+
+同一个独立 demo 工程也可以构建其他示例：
+
+```bash
+cmake --build demo/build --target simple_infer -j$(nproc)
+cmake --build demo/build --target test_tokenizer -j$(nproc)
+```
+
+#### 3. 检查动态链接
+
+```bash
+ldd demo/build/bin/qwen_infer | grep -E 'hybridai|rocblas|galaxyhip'
+```
+
+输出应包含 `build/libhybridai.so`、`librocblas.so` 和 HIP runtime。
+独立 demo 已设置构建 RPATH，正常情况下不需要手动设置
+`LD_LIBRARY_PATH`。
+
+#### 4. 启动检查
+
+不传模型路径时，程序应打印用法并退出：
+
+```bash
+./demo/build/bin/qwen_infer
+```
+
+预期输出开头：
+
+```text
+[qwen_infer] enter main, argc=1
+Usage: ./demo/build/bin/qwen_infer <model_dir> [backend=cpu|hip] [max_devices=8]
+```
+
+#### 5. 运行真实 Qwen 模型
+
+```bash
+./demo/build/bin/qwen_infer \
+  /public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master \
+  hip 8
+```
+
+参数含义：
+
+- 第一个参数：模型快照目录；
+- 第二个参数：后端，当前使用 `hip`；
+- 第三个参数：最多使用的设备数，当前八卡环境使用 `8`。
+
+该流程会验证 tokenizer、分片 SafeTensor 权重加载、BF16 投影、真实
+DeltaNet/reference forward、完整 64 层前向、LM head 和 greedy decode。
+
+#### 6. 可选：构建单元测试
+
+单元测试默认关闭。需要测试时重新配置独立构建目录：
+
+```bash
+cmake -S . -B build-tests \
+  -DHYBRIDAI_ENABLE_HIP=ON \
+  -DHYBRIDAI_ENABLE_CPU=ON \
+  -DHYBRIDAI_BUILD_TESTS=ON
+
+cmake --build build-tests --target hybridai_test --parallel
+ctest --test-dir build-tests --output-on-failure
+```
+
+注意：测试依赖 GoogleTest。如果系统没有可用的 GoogleTest，且仓库中
+没有准备 `third_party/deps_local/googletest-1.15.2`，CMake 会尝试从
+GitHub 获取。当前主要端到端验证方式是直接运行 `qwen_infer`。
+
 ### Windows 默认构建（CPU + 测试）
 
 ```powershell
@@ -104,15 +253,13 @@ cmake -B build \
 cmake --build build
 ```
 
-当前 DTK 环境安装在 `/opt/dtk`。当容器不能访问 GitHub、但已有
-`nlohmann/json.hpp` 时，可以先关闭依赖 fmt/spdlog/GTest 的 CLI 与测试，
-构建核心库和 demo：
+当前 DTK 环境安装在 `/opt/dtk`。`nlohmann_json` 已随仓库提供；离线环境
+可以关闭依赖 fmt/spdlog/GTest 的 CLI 与测试，构建核心库和 demo：
 
 ```bash
 cmake -S . -B build-linux-hip -G Ninja \
   -D CMAKE_BUILD_TYPE=Debug \
   -D HYBRIDAI_ROCM_ROOT=/opt/dtk \
-  -D HYBRIDAI_NLOHMANN_JSON_INCLUDE_DIR=/path/to/json/include \
   -D HYBRIDAI_ENABLE_HIP=ON \
   -D HYBRIDAI_ENABLE_CPU=ON \
   -D HYBRIDAI_BUILD_TESTS=OFF \
@@ -137,8 +284,9 @@ final norm 和 LM head 放在末卡；BF16 权重保持原始精度并使用设�
 
 在当前 8 × 64 GiB `gfx936` 环境实测加载成功：文本模型权重约
 `50.10 GiB`，首末卡各约 `8.04 GiB`，其余卡各约 `5.67 GiB`。
-该命令目前验证的是完整权重常驻；真实生成仍需接入 BF16 算子、跨设备
-activation 传输、DeltaNet state/KV cache 和采样。
+该命令可以继续执行 BF16 投影、真实 DeltaNet/reference forward、完整
+64 层前向、LM head 与 greedy decode。当前待改进项主要是 tokenizer
+字节级解码质量，以及将 host-reference DeltaNet 替换为优化 HIP kernel。
 
 `HYBRIDAI_ROCM_ROOT` 支持标准 ROCm 与 DTK 这类派生 SDK；构建逻辑会在
 SDK 根目录下查找 `hip`、`rocblas`、`dcc` 和 `dcc/comgr` 的 CMake 包。
@@ -238,8 +386,10 @@ $env:ROCBLAS_TENSILE_LIBPATH = 'C:\Users\yinxi\.venv\Lib\site-packages\_rocm_sdk
 - ✅ 真实 GPU（gfx1150）上 rocBLAS FP32 GEMM 测试通过。
 - ✅ Linux DTK/HIP 构建链路打通：GCC + Ninja 成功构建核心库和 demo，`simple_infer hip` 已在 `gfx936` 上完成 `Linear -> RMSNorm -> Softmax`。
 - ✅ 8×`gfx936` 非统一内存环境中，约 50.10 GiB BF16 文本权重已按连续层完整常驻设备。
+- ✅ 真实 BF16 投影、DeltaNet/reference forward、64 层前向、LM head 和 greedy decode 已跑通。
+- ✅ `demo/CMakeLists.txt` 可独立链接预编译的 `libhybridai.so` 构建示例。
 - ✅ 新增 `demo/simple_infer.cc`：不依赖测试框架的最小推理用例，支持 CPU/HIP 后端。
-- 🔄 进行中：typed BF16 GEMM、GPU 基础 kernel、真实 Full Attention/DeltaNet state，以及八卡短上下文 greedy 生成。
+- 🔄 进行中：tokenizer 字节级解码修正、GPU 基础 kernel 和优化版 HIP DeltaNet。
 
 ## 文档索引
 

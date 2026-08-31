@@ -16,11 +16,6 @@ namespace hybridai::tokenizer {
 
 namespace {
 
-// Convert a UTF-8 string to raw bytes (each char is one byte).
-std::vector<uint8_t> utf8_to_bytes(const std::string& s) {
-    return std::vector<uint8_t>(s.begin(), s.end());
-}
-
 // Convert raw bytes to a UTF-8 string. Bytes are emitted as-is; callers that
 // need strict UTF-8 validation should handle invalid sequences themselves.
 std::string bytes_to_utf8(const std::vector<uint8_t>& bytes) {
@@ -63,6 +58,17 @@ std::unordered_map<char32_t, uint8_t> QwenTokenizer::build_unicode_to_bytes(
 }
 
 Status QwenTokenizer::load(const std::string& model_dir) {
+    vocab_.clear();
+    id_to_token_.clear();
+    merges_.clear();
+    added_tokens_.clear();
+    id_to_added_token_.clear();
+    bytes_to_unicode_.clear();
+    unicode_to_bytes_.clear();
+    eos_token_ids_.clear();
+    pad_token_id_ = -1;
+    bos_token_id_ = -1;
+
     std::string path = platform::join_path(model_dir, "tokenizer.json");
     if (!platform::file_exists(path)) {
         return Status(StatusCode::FileNotFound,
@@ -120,8 +126,9 @@ Status QwenTokenizer::load(const std::string& model_dir) {
         merges_[{first, second}] = static_cast<int64_t>(i);
     }
 
-    // Added tokens (specials).
-    added_tokens_.clear();
+    // Added tokens may be either special or ordinary atomic tokens. Keep both
+    // content -> id and id -> metadata maps because their ids commonly live
+    // above the base BPE vocabulary.
     if (root.contains("added_tokens") && root["added_tokens"].is_array()) {
         for (const auto& tok : root["added_tokens"]) {
             std::string content = tok.value("content", "");
@@ -129,25 +136,60 @@ Status QwenTokenizer::load(const std::string& model_dir) {
             bool special = tok.value("special", false);
             if (content.empty() || id < 0) continue;
             added_tokens_[content] = id;
-            if (id >= static_cast<int64_t>(added_token_flags_.size())) {
-                added_token_flags_.resize(static_cast<size_t>(id) + 1, false);
-            }
-            added_token_flags_[static_cast<size_t>(id)] = special;
+            id_to_added_token_[id] = AddedTokenInfo{content, special};
         }
     }
 
-    eos_token_id_ = -1;
-    pad_token_id_ = -1;
-    bos_token_id_ = -1;
-    for (const auto& kv : added_tokens_) {
-        if (kv.first == "<|endoftext|>") pad_token_id_ = kv.second;
-        if (kv.first == "\n") eos_token_id_ = kv.second;
+    // Generation metadata is authoritative for stopping. Qwen releases use
+    // either a scalar or an array for eos_token_id.
+    const std::string generation_path =
+        platform::join_path(model_dir, "generation_config.json");
+    if (platform::file_exists(generation_path)) {
+        std::ifstream generation_file(generation_path);
+        nlohmann::json generation;
+        try {
+            generation_file >> generation;
+            if (generation.contains("eos_token_id")) {
+                const auto& eos = generation["eos_token_id"];
+                if (eos.is_number_integer()) {
+                    eos_token_ids_.push_back(eos.get<int64_t>());
+                } else if (eos.is_array()) {
+                    for (const auto& id : eos) {
+                        if (!id.is_number_integer()) {
+                            return Status(StatusCode::InvalidModel,
+                                          "generation_config.json contains a non-integer EOS id");
+                        }
+                        eos_token_ids_.push_back(id.get<int64_t>());
+                    }
+                } else {
+                    return Status(StatusCode::InvalidModel,
+                                  "generation_config.json has invalid eos_token_id");
+                }
+            }
+            if (generation.contains("pad_token_id") &&
+                generation["pad_token_id"].is_number_integer()) {
+                pad_token_id_ = generation["pad_token_id"].get<int64_t>();
+            }
+            if (generation.contains("bos_token_id") &&
+                generation["bos_token_id"].is_number_integer()) {
+                bos_token_id_ = generation["bos_token_id"].get<int64_t>();
+            }
+        } catch (const nlohmann::json::exception& error) {
+            return Status(StatusCode::InvalidModel,
+                          std::string("Invalid generation_config.json: ") +
+                              error.what());
+        }
     }
 
     bytes_to_unicode_ = build_bytes_to_unicode();
     unicode_to_bytes_ = build_unicode_to_bytes(bytes_to_unicode_);
 
     return Status::OK();
+}
+
+bool QwenTokenizer::is_eos_token(int64_t id) const noexcept {
+    return std::find(eos_token_ids_.begin(), eos_token_ids_.end(), id) !=
+           eos_token_ids_.end();
 }
 
 std::string QwenTokenizer::byte_encode(const std::string& text) const {
@@ -407,14 +449,22 @@ std::vector<int64_t> QwenTokenizer::encode(const std::string& text,
 
 std::string QwenTokenizer::decode(const std::vector<int64_t>& ids,
                                    bool skip_special_tokens) const {
+    std::string output;
     std::vector<uint8_t> bytes;
+    auto flush_bytes = [&]() {
+        output += bytes_to_utf8(bytes);
+        bytes.clear();
+    };
     for (int64_t id : ids) {
-        if (id < 0 || id >= static_cast<int64_t>(id_to_token_.size())) {
+        const auto added = id_to_added_token_.find(id);
+        if (added != id_to_added_token_.end()) {
+            flush_bytes();
+            if (!skip_special_tokens || !added->second.special) {
+                output += added->second.content;
+            }
             continue;
         }
-        if (skip_special_tokens &&
-            id < static_cast<int64_t>(added_token_flags_.size()) &&
-            added_token_flags_[static_cast<size_t>(id)]) {
+        if (id < 0 || id >= static_cast<int64_t>(id_to_token_.size())) {
             continue;
         }
         const std::string& token = id_to_token_[static_cast<size_t>(id)];
@@ -426,7 +476,8 @@ std::string QwenTokenizer::decode(const std::vector<int64_t>& ids,
             }
         }
     }
-    return bytes_to_utf8(bytes);
+    flush_bytes();
+    return output;
 }
 
 std::string QwenTokenizer::build_chat_prompt(

@@ -209,7 +209,7 @@ Tensor GatedDeltaNet::causal_conv(const Tensor& input, const Tensor& weight,
 }
 
 DeltaNetQKV GatedDeltaNet::grouped_causal_conv(
-    const Tensor& grouped_qkv, const Tensor& weight,
+    const Tensor& qkv, const Tensor& weight,
     int64_t num_qk_heads, int64_t num_value_heads,
     int64_t key_head_dim, int64_t value_head_dim, int64_t kernel_size,
     DeltaNetCache* cache, Stream* stream) {
@@ -217,59 +217,59 @@ DeltaNetQKV GatedDeltaNet::grouped_causal_conv(
     const int64_t key_width = num_qk_heads * key_head_dim;
     const int64_t value_width = num_value_heads * value_head_dim;
     const int64_t channels = key_width * 2 + value_width;
-    if (cache == nullptr || grouped_qkv.buffer() == nullptr ||
-        weight.buffer() == nullptr || grouped_qkv.device().type() == DeviceType::CPU ||
-        grouped_qkv.shape().ndim() != 2 ||
-        grouped_qkv.shape().dim(1) != channels ||
+    if (cache == nullptr || qkv.buffer() == nullptr ||
+        weight.buffer() == nullptr || qkv.device().type() == DeviceType::CPU ||
+        qkv.shape().ndim() != 2 ||
+        qkv.shape().dim(1) != channels ||
         weight.numel() != channels * kernel_size ||
-        grouped_qkv.dtype() != weight.dtype() || num_qk_heads <= 0 ||
+        qkv.dtype() != weight.dtype() || num_qk_heads <= 0 ||
         num_value_heads % num_qk_heads != 0 || kernel_size <= 1) return output;
     auto backend = BackendRegistry::instance().get_backend(
-        grouped_qkv.device());
+        qkv.device());
     if (backend == nullptr) return output;
-    const int64_t token_count = grouped_qkv.shape().dim(0);
+    const int64_t token_count = qkv.shape().dim(0);
     const Shape state_shape{channels, kernel_size - 1};
     if (cache->conv_state.buffer() == nullptr) {
         auto state_buffer = backend->create_buffer(
             static_cast<size_t>(state_shape.numel()) *
-                SizeOfDType(grouped_qkv.dtype()),
-            grouped_qkv.buffer()->memory_type());
+                SizeOfDType(qkv.dtype()),
+            qkv.buffer()->memory_type());
         if (state_buffer == nullptr ||
             !backend->memset(state_buffer.get(), 0, state_buffer->size()).ok())
             return output;
-        cache->conv_state = Tensor(state_shape, grouped_qkv.dtype(),
-                                   grouped_qkv.device(),
+        cache->conv_state = Tensor(state_shape, qkv.dtype(),
+                                   qkv.device(),
                                    std::move(state_buffer));
     } else if (cache->conv_state.shape() != state_shape ||
-               cache->conv_state.dtype() != grouped_qkv.dtype() ||
-               cache->conv_state.device() != grouped_qkv.device()) return output;
+               cache->conv_state.dtype() != qkv.dtype() ||
+               cache->conv_state.device() != qkv.device()) return output;
     auto q_buffer = backend->create_buffer(
         static_cast<size_t>(token_count * key_width) *
-            SizeOfDType(grouped_qkv.dtype()),
-        grouped_qkv.buffer()->memory_type());
+            SizeOfDType(qkv.dtype()),
+        qkv.buffer()->memory_type());
     auto k_buffer = backend->create_buffer(
         static_cast<size_t>(token_count * key_width) *
-            SizeOfDType(grouped_qkv.dtype()),
-        grouped_qkv.buffer()->memory_type());
+            SizeOfDType(qkv.dtype()),
+        qkv.buffer()->memory_type());
     auto v_buffer = backend->create_buffer(
         static_cast<size_t>(token_count * value_width) *
-            SizeOfDType(grouped_qkv.dtype()),
-        grouped_qkv.buffer()->memory_type());
+            SizeOfDType(qkv.dtype()),
+        qkv.buffer()->memory_type());
     if (q_buffer == nullptr || k_buffer == nullptr || v_buffer == nullptr ||
         !backend->deltanet_grouped_conv(
             q_buffer.get(), k_buffer.get(), v_buffer.get(),
-            cache->conv_state.buffer().get(), grouped_qkv.buffer().get(),
-            weight.buffer().get(), grouped_qkv.dtype(), token_count,
+            cache->conv_state.buffer().get(), qkv.buffer().get(),
+            weight.buffer().get(), qkv.dtype(), token_count,
             num_qk_heads, num_value_heads, key_head_dim, value_head_dim,
             kernel_size, stream).ok()) return output;
     output.query = Tensor(Shape{token_count, num_qk_heads, key_head_dim},
-                          grouped_qkv.dtype(), grouped_qkv.device(),
+                                                    qkv.dtype(), qkv.device(),
                           std::move(q_buffer));
     output.key = Tensor(Shape{token_count, num_qk_heads, key_head_dim},
-                        grouped_qkv.dtype(), grouped_qkv.device(),
+                                                qkv.dtype(), qkv.device(),
                         std::move(k_buffer));
     output.value = Tensor(Shape{token_count, num_value_heads, value_head_dim},
-                          grouped_qkv.dtype(), grouped_qkv.device(),
+                                                    qkv.dtype(), qkv.device(),
                           std::move(v_buffer));
     return output;
 }

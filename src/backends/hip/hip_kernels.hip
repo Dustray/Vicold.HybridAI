@@ -372,7 +372,7 @@ __global__ void causal_conv1d_silu_kernel(
 
 template <typename T>
 __global__ void deltanet_grouped_conv_kernel(
-    T* query, T* key, T* value, T* conv_state, const T* grouped_qkv,
+    T* query, T* key, T* value, T* conv_state, const T* qkv,
     const T* weight, int64_t token_count, int64_t num_qk_heads,
     int64_t num_value_heads, int64_t key_head_dim,
     int64_t value_head_dim, int64_t kernel_size) {
@@ -381,27 +381,10 @@ __global__ void deltanet_grouped_conv_kernel(
     const int64_t value_width = num_value_heads * value_head_dim;
     const int64_t qkv_width = key_width * 2 + value_width;
     if (flat_channel >= qkv_width || threadIdx.x != 0) return;
-    const int64_t heads_per_group = num_value_heads / num_qk_heads;
-    const int64_t group_value_width = heads_per_group * value_head_dim;
-    const int64_t group_width = key_head_dim * 2 + group_value_width;
-    int64_t grouped_channel = 0;
-    if (flat_channel < key_width) {
-        const int64_t head = flat_channel / key_head_dim;
-        grouped_channel = head * group_width + flat_channel % key_head_dim;
-    } else if (flat_channel < key_width * 2) {
-        const int64_t local = flat_channel - key_width;
-        const int64_t head = local / key_head_dim;
-        grouped_channel = head * group_width + key_head_dim +
-                          local % key_head_dim;
-    } else {
-        const int64_t local = flat_channel - key_width * 2;
-        const int64_t value_head = local / value_head_dim;
-        const int64_t group = value_head / heads_per_group;
-        const int64_t within_group = value_head % heads_per_group;
-        grouped_channel = group * group_width + key_head_dim * 2 +
-                          within_group * value_head_dim +
-                          local % value_head_dim;
-    }
+    // Qwen3.5 stores both in_proj_qkv output and depthwise Conv1D weights in
+    // flat [all Q][all K][all V] channel order. No per-QK-head regrouping is
+    // applied here; older Qwen3-Next checkpoints require a separate layout
+    // conversion path.
     const int64_t history = kernel_size - 1;
     T* channel_state = conv_state + flat_channel * history;
     const T* channel_weight = weight + flat_channel * kernel_size;
@@ -411,7 +394,7 @@ __global__ void deltanet_grouped_conv_kernel(
             sum += load_value(channel_state, index) *
                    load_value(channel_weight, index);
         const float current = load_value(
-            grouped_qkv, token * qkv_width + grouped_channel);
+            qkv, token * qkv_width + flat_channel);
         sum += current * load_value(channel_weight, history);
         const float activated = sum / (1.0f + expf(-sum));
         if (flat_channel < key_width)

@@ -83,6 +83,52 @@ TEST_F(HipKernelTest, CastRoundTripMatchesBf16Precision) {
     }
 }
 
+TEST_F(HipKernelTest, Bf16TransposeWeightGemmMatchesReference) {
+    constexpr int64_t m = 2;
+    constexpr int64_t n = 3;
+    constexpr int64_t k = 4;
+    // A is [M,K]. Weight is physically [N,K], matching Linear's checkpoint
+    // storage, and trans_b=true computes A * weight^T.
+    const std::vector<float> a_fp32 = {
+        1.25f, -2.0f, 0.5f, 3.0f,
+        -1.0f, 0.75f, 2.5f, -0.5f};
+    const std::vector<float> weight_fp32 = {
+        0.5f, 1.0f, -1.5f, 2.0f,
+        -2.0f, 0.25f, 1.0f, -0.75f,
+        1.5f, -0.5f, 0.75f, 1.25f};
+    std::vector<uint16_t> a(a_fp32.size());
+    std::vector<uint16_t> weight(weight_fp32.size());
+    for (size_t index = 0; index < a.size(); ++index)
+        a[index] = fp32_to_bf16(a_fp32[index]);
+    for (size_t index = 0; index < weight.size(); ++index)
+        weight[index] = fp32_to_bf16(weight_fp32[index]);
+
+    auto a_buffer = upload(a);
+    auto weight_buffer = upload(weight);
+    auto output = backend_->create_buffer(
+        static_cast<size_t>(m * n) * sizeof(uint16_t), MemoryType::Device);
+    ASSERT_NE(output, nullptr);
+    ASSERT_TRUE(backend_->gemm(
+        output.get(), a_buffer.get(), weight_buffer.get(), DType::BF16,
+        DType::BF16, DType::BF16, DType::FP32, false, true, m, n, k,
+        1.0f, 0.0f).ok());
+    const auto actual = download<uint16_t>(output, m * n);
+
+    for (int64_t row = 0; row < m; ++row) {
+        for (int64_t column = 0; column < n; ++column) {
+            float expected = 0.0f;
+            for (int64_t inner = 0; inner < k; ++inner) {
+                expected += bf16_to_fp32(a[row * k + inner]) *
+                            bf16_to_fp32(weight[column * k + inner]);
+            }
+            const float rounded_expected =
+                bf16_to_fp32(fp32_to_bf16(expected));
+            EXPECT_NEAR(bf16_to_fp32(actual[row * n + column]),
+                        rounded_expected, 1e-3f);
+        }
+    }
+}
+
 TEST_F(HipKernelTest, EmbeddingAddAndArgmaxMatchReference) {
     const std::vector<float> embedding = {
         0, 1, 2, 3,
@@ -337,6 +383,111 @@ TEST_F(HipKernelTest, KvCacheAppendAndDecodeMatchReference) {
     }
 }
 
+TEST_F(HipKernelTest, KvCacheAppendAtNonzeroOffsetPreservesRows) {
+    constexpr int64_t capacity = 4;
+    constexpr int64_t kv_heads = 2;
+    constexpr int64_t head_dim = 2;
+    constexpr int64_t row_width = kv_heads * head_dim;
+    auto key_cache = upload(std::vector<float>(capacity * row_width, -1.0f));
+    auto value_cache = upload(std::vector<float>(capacity * row_width, -2.0f));
+    const std::vector<float> key = {1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<float> value = {11, 12, 13, 14, 15, 16, 17, 18};
+    auto key_buffer = upload(key);
+    auto value_buffer = upload(value);
+    ASSERT_TRUE(backend_->append_kv_cache(
+        key_cache.get(), value_cache.get(), key_buffer.get(),
+        value_buffer.get(), DType::FP32, 2, kv_heads, head_dim, 1,
+        capacity).ok());
+
+    const auto actual_key = download<float>(key_cache, capacity * row_width);
+    const auto actual_value = download<float>(value_cache,
+                                               capacity * row_width);
+    const std::vector<float> expected_key = {
+        -1, -1, -1, -1, 1, 2, 3, 4,
+        5, 6, 7, 8, -1, -1, -1, -1};
+    const std::vector<float> expected_value = {
+        -2, -2, -2, -2, 11, 12, 13, 14,
+        15, 16, 17, 18, -2, -2, -2, -2};
+    EXPECT_EQ(actual_key, expected_key);
+    EXPECT_EQ(actual_value, expected_value);
+}
+
+TEST_F(HipKernelTest, KvCacheAppendRejectsCapacityOverflow) {
+    constexpr int64_t capacity = 3;
+    constexpr int64_t kv_heads = 1;
+    constexpr int64_t head_dim = 2;
+    auto key_cache = backend_->create_buffer(
+        capacity * kv_heads * head_dim * sizeof(float), MemoryType::Device);
+    auto value_cache = backend_->create_buffer(
+        capacity * kv_heads * head_dim * sizeof(float), MemoryType::Device);
+    auto key = upload(std::vector<float>{1, 2, 3, 4});
+    auto value = upload(std::vector<float>{5, 6, 7, 8});
+    const Status status = backend_->append_kv_cache(
+        key_cache.get(), value_cache.get(), key.get(), value.get(),
+        DType::FP32, 2, kv_heads, head_dim, 2, capacity);
+    EXPECT_EQ(status.code(), StatusCode::InvalidArgument);
+}
+
+TEST_F(HipKernelTest, Bf16CachedGqaMatchesFp32Reference) {
+    constexpr int64_t query_len = 1;
+    constexpr int64_t cache_len = 3;
+    constexpr int64_t query_heads = 2;
+    constexpr int64_t kv_heads = 1;
+    constexpr int64_t head_dim = 2;
+    const std::vector<float> query_fp32 = {1.25f, -0.5f, -0.75f, 1.5f};
+    const std::vector<float> key_fp32 = {1, 0.5f, -0.5f, 1, 0.75f, 1.25f};
+    const std::vector<float> value_fp32 = {2, -1, 0.5f, 3, -2, 1.5f};
+    std::vector<uint16_t> query(query_fp32.size());
+    std::vector<uint16_t> key(key_fp32.size());
+    std::vector<uint16_t> value(value_fp32.size());
+    for (size_t index = 0; index < query.size(); ++index)
+        query[index] = fp32_to_bf16(query_fp32[index]);
+    for (size_t index = 0; index < key.size(); ++index)
+        key[index] = fp32_to_bf16(key_fp32[index]);
+    for (size_t index = 0; index < value.size(); ++index)
+        value[index] = fp32_to_bf16(value_fp32[index]);
+    auto query_buffer = upload(query);
+    auto key_cache = upload(key);
+    auto value_cache = upload(value);
+    auto output = backend_->create_buffer(query.size() * sizeof(uint16_t),
+                                           MemoryType::Device);
+    ASSERT_TRUE(backend_->cached_gqa(
+        output.get(), query_buffer.get(), key_cache.get(), value_cache.get(),
+        nullptr, DType::BF16, query_len, cache_len, query_heads, kv_heads,
+        head_dim).ok());
+    const auto actual = download<uint16_t>(output, query.size());
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    for (int64_t head = 0; head < query_heads; ++head) {
+        float scores[cache_len];
+        float maximum = -INFINITY;
+        for (int64_t token = 0; token < cache_len; ++token) {
+            scores[token] = 0.0f;
+            for (int64_t dimension = 0; dimension < head_dim; ++dimension) {
+                scores[token] +=
+                    bf16_to_fp32(query[head * head_dim + dimension]) *
+                    bf16_to_fp32(key[token * head_dim + dimension]);
+            }
+            scores[token] *= scale;
+            maximum = std::max(maximum, scores[token]);
+        }
+        float denominator = 0.0f;
+        for (float score : scores)
+            denominator += std::exp(score - maximum);
+        for (int64_t dimension = 0; dimension < head_dim; ++dimension) {
+            float expected = 0.0f;
+            for (int64_t token = 0; token < cache_len; ++token) {
+                expected += std::exp(scores[token] - maximum) / denominator *
+                            bf16_to_fp32(value[token * head_dim + dimension]);
+            }
+            const float rounded_expected =
+                bf16_to_fp32(fp32_to_bf16(expected));
+            EXPECT_NEAR(bf16_to_fp32(actual[head * head_dim + dimension]),
+                        rounded_expected, 1e-3f);
+        }
+    }
+}
+
 TEST_F(HipKernelTest, DeltaNetCausalConvCacheMatchesFullSequence) {
     constexpr int64_t channels = 2;
     constexpr int64_t kernel_size = 3;
@@ -373,14 +524,14 @@ TEST_F(HipKernelTest, DeltaNetCausalConvCacheMatchesFullSequence) {
         EXPECT_NEAR(full[index], split[index], 1e-6f);
 }
 
-TEST_F(HipKernelTest, DeltaNetGroupedConvReordersCheckpointLayout) {
+TEST_F(HipKernelTest, DeltaNetConvSplitsFlatQKVLayout) {
     constexpr int64_t qk_heads = 2;
     constexpr int64_t value_heads = 4;
     constexpr int64_t key_dim = 1;
     constexpr int64_t value_dim = 1;
     constexpr int64_t kernel_size = 2;
-    // Per group: [q, k, v0, v1].
-    auto grouped = upload(std::vector<float>{1, 2, 3, 4, 5, 6, 7, 8});
+    // Qwen3.5 checkpoint layout: [q0, q1, k0, k1, v0, v1, v2, v3].
+    auto qkv = upload(std::vector<float>{1, 2, 3, 4, 5, 6, 7, 8});
     auto weight = upload(std::vector<float>{
         0, 1, 0, 1, 0, 1, 0, 1,
         0, 1, 0, 1, 0, 1, 0, 1});
@@ -389,7 +540,7 @@ TEST_F(HipKernelTest, DeltaNetGroupedConvReordersCheckpointLayout) {
     auto key = backend_->create_buffer(2 * sizeof(float), MemoryType::Device);
     auto value = backend_->create_buffer(4 * sizeof(float), MemoryType::Device);
     ASSERT_TRUE(backend_->deltanet_grouped_conv(
-        query.get(), key.get(), value.get(), state.get(), grouped.get(),
+        query.get(), key.get(), value.get(), state.get(), qkv.get(),
         weight.get(), DType::FP32, 1, qk_heads, value_heads, key_dim,
         value_dim, kernel_size).ok());
     const auto q = download<float>(query, 2);
@@ -397,13 +548,134 @@ TEST_F(HipKernelTest, DeltaNetGroupedConvReordersCheckpointLayout) {
     const auto v = download<float>(value, 4);
     const auto silu = [](float x) { return x / (1.0f + std::exp(-x)); };
     EXPECT_NEAR(q[0], silu(1), 1e-6f);
-    EXPECT_NEAR(q[1], silu(5), 1e-6f);
-    EXPECT_NEAR(k[0], silu(2), 1e-6f);
-    EXPECT_NEAR(k[1], silu(6), 1e-6f);
-    EXPECT_NEAR(v[0], silu(3), 1e-6f);
-    EXPECT_NEAR(v[1], silu(4), 1e-6f);
+    EXPECT_NEAR(q[1], silu(2), 1e-6f);
+    EXPECT_NEAR(k[0], silu(3), 1e-6f);
+    EXPECT_NEAR(k[1], silu(4), 1e-6f);
+    EXPECT_NEAR(v[0], silu(5), 1e-6f);
+    EXPECT_NEAR(v[1], silu(6), 1e-6f);
     EXPECT_NEAR(v[2], silu(7), 1e-6f);
     EXPECT_NEAR(v[3], silu(8), 1e-6f);
+}
+
+TEST_F(HipKernelTest, DeltaNetConvUsesFlatCheckpointWeightChannels) {
+    constexpr int64_t qk_heads = 2;
+    constexpr int64_t value_heads = 4;
+    constexpr int64_t key_dim = 1;
+    constexpr int64_t value_dim = 1;
+    constexpr int64_t kernel_size = 2;
+    // Give every flat checkpoint channel a distinct current-token coefficient.
+    const std::vector<float> qkv = {1, 2, 3, 4, 5, 6, 7, 8};
+    const std::vector<float> weight = {
+        0, 1, 0, 2, 0, 3, 0, 4,
+        0, 5, 0, 6, 0, 7, 0, 8};
+    auto qkv_buffer = upload(qkv);
+    auto weight_buffer = upload(weight);
+    auto state = upload(std::vector<float>(8, 0.0f));
+    auto query = backend_->create_buffer(2 * sizeof(float), MemoryType::Device);
+    auto key = backend_->create_buffer(2 * sizeof(float), MemoryType::Device);
+    auto value = backend_->create_buffer(4 * sizeof(float), MemoryType::Device);
+    ASSERT_TRUE(backend_->deltanet_grouped_conv(
+        query.get(), key.get(), value.get(), state.get(), qkv_buffer.get(),
+        weight_buffer.get(), DType::FP32, 1, qk_heads, value_heads, key_dim,
+        value_dim, kernel_size).ok());
+
+    const auto q = download<float>(query, 2);
+    const auto k = download<float>(key, 2);
+    const auto v = download<float>(value, 4);
+    const auto silu = [](float x) { return x / (1.0f + std::exp(-x)); };
+    EXPECT_NEAR(q[0], silu(1.0f * 1.0f), 1e-6f);
+    EXPECT_NEAR(q[1], silu(2.0f * 2.0f), 1e-6f);
+    EXPECT_NEAR(k[0], silu(3.0f * 3.0f), 1e-6f);
+    EXPECT_NEAR(k[1], silu(4.0f * 4.0f), 1e-6f);
+    EXPECT_NEAR(v[0], silu(5.0f * 5.0f), 1e-6f);
+    EXPECT_NEAR(v[1], silu(6.0f * 6.0f), 1e-6f);
+    EXPECT_NEAR(v[2], silu(7.0f * 7.0f), 1e-6f);
+    EXPECT_NEAR(v[3], silu(8.0f * 8.0f), 1e-6f);
+}
+
+TEST_F(HipKernelTest, DeltaNetFlatConvCacheMatchesFullSequence) {
+    constexpr int64_t tokens = 3;
+    constexpr int64_t qk_heads = 2;
+    constexpr int64_t value_heads = 4;
+    constexpr int64_t key_dim = 1;
+    constexpr int64_t value_dim = 1;
+    constexpr int64_t kernel_size = 3;
+    constexpr int64_t channels = 8;
+    constexpr int64_t key_width = qk_heads * key_dim;
+    constexpr int64_t value_width = value_heads * value_dim;
+    const std::vector<float> qkv = {
+        1, 2, 3, 4, 5, 6, 7, 8,
+        2, 3, 4, 5, 6, 7, 8, 9,
+        3, 4, 5, 6, 7, 8, 9, 10};
+    // Qwen3.5 flat [Q][K][V] channel order, with distinct filters.
+    const std::vector<float> weight = {
+        0.1f, 0.2f, 1.0f,  0.2f, 0.3f, 0.9f,
+        0.3f, 0.4f, 0.8f,  0.4f, 0.5f, 0.7f,
+        0.5f, 0.6f, 0.6f,  0.6f, 0.7f, 0.5f,
+        0.7f, 0.8f, 0.4f,  0.8f, 0.9f, 0.3f};
+    auto qkv_buffer = upload(qkv);
+    auto weight_buffer = upload(weight);
+    auto full_state = upload(std::vector<float>(channels * 2, 0.0f));
+    auto full_query = backend_->create_buffer(
+        tokens * key_width * sizeof(float), MemoryType::Device);
+    auto full_key = backend_->create_buffer(
+        tokens * key_width * sizeof(float), MemoryType::Device);
+    auto full_value = backend_->create_buffer(
+        tokens * value_width * sizeof(float), MemoryType::Device);
+    ASSERT_TRUE(backend_->deltanet_grouped_conv(
+        full_query.get(), full_key.get(), full_value.get(), full_state.get(),
+        qkv_buffer.get(), weight_buffer.get(), DType::FP32, tokens,
+        qk_heads, value_heads, key_dim, value_dim, kernel_size).ok());
+
+    auto split_state = upload(std::vector<float>(channels * 2, 0.0f));
+    auto prompt = upload(std::vector<float>(qkv.begin(),
+                                            qkv.begin() + 2 * channels));
+    auto decode = upload(std::vector<float>(qkv.begin() + 2 * channels,
+                                            qkv.end()));
+    auto prompt_query = backend_->create_buffer(
+        2 * key_width * sizeof(float), MemoryType::Device);
+    auto prompt_key = backend_->create_buffer(
+        2 * key_width * sizeof(float), MemoryType::Device);
+    auto prompt_value = backend_->create_buffer(
+        2 * value_width * sizeof(float), MemoryType::Device);
+    auto decode_query = backend_->create_buffer(
+        key_width * sizeof(float), MemoryType::Device);
+    auto decode_key = backend_->create_buffer(
+        key_width * sizeof(float), MemoryType::Device);
+    auto decode_value = backend_->create_buffer(
+        value_width * sizeof(float), MemoryType::Device);
+    ASSERT_TRUE(backend_->deltanet_grouped_conv(
+        prompt_query.get(), prompt_key.get(), prompt_value.get(),
+        split_state.get(), prompt.get(), weight_buffer.get(), DType::FP32, 2,
+        qk_heads, value_heads, key_dim, value_dim, kernel_size).ok());
+    ASSERT_TRUE(backend_->deltanet_grouped_conv(
+        decode_query.get(), decode_key.get(), decode_value.get(),
+        split_state.get(), decode.get(), weight_buffer.get(), DType::FP32, 1,
+        qk_heads, value_heads, key_dim, value_dim, kernel_size).ok());
+
+    const auto append_and_compare = [this](
+        const std::shared_ptr<Buffer>& full_buffer,
+        const std::shared_ptr<Buffer>& prompt_buffer,
+        const std::shared_ptr<Buffer>& decode_buffer, int64_t prompt_count,
+        int64_t decode_count) {
+        const auto full = download<float>(full_buffer,
+                                          prompt_count + decode_count);
+        auto split = download<float>(prompt_buffer, prompt_count);
+        const auto tail = download<float>(decode_buffer, decode_count);
+        split.insert(split.end(), tail.begin(), tail.end());
+        ASSERT_EQ(full.size(), split.size());
+        for (size_t index = 0; index < full.size(); ++index)
+            EXPECT_NEAR(full[index], split[index], 1e-6f);
+    };
+    append_and_compare(full_query, prompt_query, decode_query,
+                       2 * key_width, key_width);
+    append_and_compare(full_key, prompt_key, decode_key,
+                       2 * key_width, key_width);
+    append_and_compare(full_value, prompt_value, decode_value,
+                       2 * value_width, value_width);
+    const auto full_state_host = download<float>(full_state, channels * 2);
+    const auto split_state_host = download<float>(split_state, channels * 2);
+    EXPECT_EQ(full_state_host, split_state_host);
 }
 
 TEST_F(HipKernelTest, DeltaNetRecurrentCacheMatchesFullSequence) {

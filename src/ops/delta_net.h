@@ -54,14 +54,14 @@ public:
                           Stream* stream = nullptr);
 
         // Stateful GPU primitives used by Qwen DeltaNet prefill and decode.
-        // causal_conv accepts the rearranged [q, k, v] stream and preserves the
+        // causal_conv accepts the flat [q, k, v] stream and preserves the
         // last kernel_size - 1 raw inputs in cache->conv_state.
         static Tensor causal_conv(const Tensor& input, const Tensor& weight,
                                                             int64_t kernel_size, DeltaNetCache* cache,
                                                             Stream* stream = nullptr);
 
                                     static DeltaNetQKV grouped_causal_conv(
-                                        const Tensor& grouped_qkv, const Tensor& weight,
+                                        const Tensor& qkv, const Tensor& weight,
                                         int64_t num_qk_heads, int64_t num_value_heads,
                                         int64_t key_head_dim, int64_t value_head_dim,
                                         int64_t kernel_size, DeltaNetCache* cache,

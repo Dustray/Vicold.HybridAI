@@ -167,6 +167,11 @@ Status Qwen3WeightLoader::load_layer(int64_t layer_index, Device device,
         layer_index >= config_.num_hidden_layers) {
         return Status(StatusCode::InvalidArgument, "Invalid Qwen layer request");
     }
+    if (config_.layer_types.size() !=
+        static_cast<size_t>(config_.num_hidden_layers)) {
+        return Status(StatusCode::InvalidModel,
+                      "Qwen layer schedule is missing or incomplete");
+    }
     Qwen3LayerWeights result;
     result.layer_index = layer_index;
     Status status = load_layer_tensor(layer_index, "input_layernorm.weight",
@@ -176,8 +181,29 @@ Status Qwen3WeightLoader::load_layer(int64_t layer_index, Device device,
                                device, &result.post_attention_layernorm);
     if (!status.ok()) return status;
 
-    const std::string attn_prefix = layer_name(layer_index, "self_attn.q_proj.weight");
-    result.is_attention_layer = Has(*loader_, attn_prefix);
+    const bool has_attention = Has(
+        *loader_, layer_name(layer_index, "self_attn.q_proj.weight"));
+    const bool has_linear = Has(
+        *loader_, layer_name(layer_index, "linear_attn.in_proj_qkv.weight"));
+    if (has_attention == has_linear) {
+        return Status(
+            StatusCode::InvalidModel,
+            "Qwen layer " + std::to_string(layer_index) +
+                (has_attention
+                     ? " contains both full-attention and linear-attention weights"
+                     : " contains neither full-attention nor linear-attention weights"));
+    }
+    const Qwen3LayerType expected =
+        config_.layer_types[static_cast<size_t>(layer_index)];
+    result.is_attention_layer = expected == Qwen3LayerType::FullAttention;
+    if (result.is_attention_layer != has_attention) {
+        return Status(
+            StatusCode::InvalidModel,
+            "Qwen layer " + std::to_string(layer_index) +
+                (result.is_attention_layer
+                     ? " is configured as full attention but checkpoint contains linear attention"
+                     : " is configured as linear attention but checkpoint contains full attention"));
+    }
     if (result.is_attention_layer) {
         for (const char* suffix : {"self_attn.q_proj.weight", "self_attn.k_proj.weight",
                                    "self_attn.v_proj.weight", "self_attn.o_proj.weight"}) {
@@ -294,9 +320,8 @@ Status Qwen3WeightLoader::load_distributed(
     }
 
     // Keep layer ranges contiguous so inference only transfers activations at
-    // partition boundaries. Every group of four Qwen3.5 layers has the same
-    // 3x linear-attention + 1x full-attention pattern, so an even layer split
-    // is also close to an even byte split for up to eight devices.
+    // partition boundaries. The configured schedule is regular for Qwen3.5,
+    // so an even layer split is also close to an even byte split.
     const int64_t layer_count = config_.num_hidden_layers;
     const int64_t device_count = static_cast<int64_t>(devices.size());
     for (int64_t device_index = 0; device_index < device_count; ++device_index) {

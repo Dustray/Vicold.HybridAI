@@ -162,9 +162,10 @@ std::vector<int64_t> tokenize(const std::string& text) {
     return {151644, 872, 198, 151645};
 }
 
-std::string decode_ids(const std::vector<int64_t>& ids) {
+std::string decode_ids(const std::vector<int64_t>& ids,
+                       bool skip_special_tokens = false) {
     if (g_tokenizer != nullptr && g_tokenizer->is_loaded()) {
-        return g_tokenizer->decode(ids, false);
+        return g_tokenizer->decode(ids, skip_special_tokens);
     }
     std::string out = "<decoded> ";
     for (int64_t id : ids) {
@@ -595,8 +596,9 @@ int main(int argc, char* argv[]) {
                       << std::endl;
             return 1;
         }
-        constexpr int kMaxNewTokens = 8;
+        constexpr int kMaxNewTokens = 100;
         std::vector<int64_t> generated_ids = input_ids;
+        const size_t prompt_token_count = generated_ids.size();
         const int64_t max_cache_len =
             static_cast<int64_t>(input_ids.size()) + kMaxNewTokens;
         if (max_cache_len > config.max_position_embeddings) {
@@ -897,9 +899,16 @@ int main(int argc, char* argv[]) {
                   << "] id=" << next_id;
         if (!device_argmax) std::cout << ", logit=" << best_logit;
         std::cout << (device_argmax ? " (device argmax)" : "") << std::endl;
+        if (tok_status.ok() && tokenizer.is_eos_token(next_id)) {
+            std::cout << "[Stop] EOS token generated." << std::endl;
+            break;
         }
-        std::cout << "\n[Generated text]\n" << decode_ids(generated_ids)
-              << std::endl;
+        }
+        const std::vector<int64_t> generated_suffix(
+            generated_ids.begin() + static_cast<ptrdiff_t>(prompt_token_count),
+            generated_ids.end());
+        std::cout << "\n[Generated text]\n"
+                  << decode_ids(generated_suffix, true) << std::endl;
         return 0;
     }
 
@@ -1012,8 +1021,7 @@ int main(int argc, char* argv[]) {
     std::string prompt;
     if (tok_status.ok()) {
         prompt = tokenizer.build_chat_prompt(
-            {{"user", "Hello, how are you?"}}, true);
-        prompt += "<think>\n\n</think>\n\n";
+            {{"user", "Hello, how are you?"}}, true, false);
     } else {
         prompt =
             "<|im_start|>user\nHello, how are you?<|im_end|>\n"
@@ -1275,15 +1283,15 @@ Tensor qwen_deltanet_reference(const Tensor& input,
     const int64_t key_dim = config.linear_key_head_dim;
     const int64_t value_dim = config.linear_value_head_dim;
     const int64_t tokens = input.shape().dim(0);
-    Tensor grouped_qkv = Linear::forward(
+    Tensor qkv_projection = Linear::forward(
         input, layer.in_proj_qkv.values, true);
     Tensor z = Linear::forward(input, layer.in_proj_z.values, true);
     Tensor a = Linear::forward(input, layer.in_proj_a, true);
     Tensor b = Linear::forward(input, layer.in_proj_b, true);
-    if (grouped_qkv.buffer() == nullptr || z.buffer() == nullptr ||
+    if (qkv_projection.buffer() == nullptr || z.buffer() == nullptr ||
         a.buffer() == nullptr || b.buffer() == nullptr) return Tensor();
     DeltaNetQKV qkv = GatedDeltaNet::grouped_causal_conv(
-        grouped_qkv, layer.conv1d_weight, qk_heads, value_heads, key_dim,
+        qkv_projection, layer.conv1d_weight, qk_heads, value_heads, key_dim,
         value_dim, config.linear_conv_kernel_dim, active_cache);
     if (!qkv.valid()) return Tensor();
     Tensor recurrent = GatedDeltaNet::recurrent(

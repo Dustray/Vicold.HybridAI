@@ -21,8 +21,10 @@ public:
 
     bool is_loaded() const noexcept { return !vocab_.empty(); }
 
-    // Encode text to token ids. Special tokens present in the text are
-    // recognized when add_special_tokens is true.
+    // Encode text to token ids. Added tokens already present in the input are
+    // always recognized atomically. The tokenizer currently has no automatic
+    // BOS/post-processor step, so add_special_tokens is reserved for future
+    // compatibility.
     std::vector<int64_t> encode(const std::string& text,
                                 bool add_special_tokens = true) const;
 
@@ -37,7 +39,12 @@ public:
         bool add_generation_prompt = true,
         bool enable_thinking = true) const;
 
-    int64_t eos_token_id() const noexcept { return eos_token_id_; }
+    const std::vector<int64_t>& eos_token_ids() const noexcept {
+        return eos_token_ids_;
+    }
+    bool is_eos_token(int64_t id) const noexcept;
+    int64_t pad_token_id() const noexcept { return pad_token_id_; }
+    int64_t bos_token_id() const noexcept { return bos_token_id_; }
 
 private:
     // Build the canonical GPT-2 ByteLevel byte <-> unicode mapping.
@@ -80,12 +87,16 @@ private:
                        PairHash>
         merges_;
     std::unordered_map<std::string, int64_t> added_tokens_;
-    std::vector<bool> added_token_flags_;
+    struct AddedTokenInfo {
+        std::string content;
+        bool special = false;
+    };
+    std::unordered_map<int64_t, AddedTokenInfo> id_to_added_token_;
 
     std::unordered_map<uint8_t, char32_t> bytes_to_unicode_;
     std::unordered_map<char32_t, uint8_t> unicode_to_bytes_;
 
-    int64_t eos_token_id_ = -1;
+    std::vector<int64_t> eos_token_ids_;
     int64_t pad_token_id_ = -1;
     int64_t bos_token_id_ = -1;
 };

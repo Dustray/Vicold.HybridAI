@@ -4,8 +4,14 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace hybridai::models {
+
+enum class Qwen3LayerType {
+    LinearAttention,
+    FullAttention,
+};
 
 struct Qwen3Config {
     int64_t hidden_size = 5120;
@@ -24,6 +30,16 @@ struct Qwen3Config {
     int64_t linear_key_head_dim = 128;
     int64_t linear_value_head_dim = 128;
     int64_t linear_conv_kernel_dim = 4;
+    std::vector<Qwen3LayerType> layer_types;
+    int64_t full_attention_interval = 4;
+    bool attn_output_gate = true;
+    std::string output_gate_type = "swish";
+    std::string mamba_ssm_dtype = "float32";
+    bool use_cache = true;
+    int64_t bos_token_id = -1;
+    std::vector<int64_t> eos_token_ids;
+    int64_t pad_token_id = -1;
+    bool tie_word_embeddings = false;
 
     Status load_json(const std::string& path);
 };

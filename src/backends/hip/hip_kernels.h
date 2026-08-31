@@ -67,6 +67,22 @@ Status deltanet_recurrent(
     int64_t token_count, int64_t num_qk_heads, int64_t num_value_heads,
     int64_t key_head_dim, int64_t value_head_dim, float eps,
     void* stream_handle);
+
+// Explicit kernel entry points used by HIP numerical equivalence tests. The
+// normal deltanet_recurrent() API remains on the portable generic path.
+Status deltanet_recurrent_generic_for_test(
+    void* dst, void* recurrent_state, const void* query, const void* key,
+    const void* value, const void* a, const void* beta, const void* a_log,
+    const void* dt_bias, const void* norm_weight, const void* z, DType dtype,
+    int64_t token_count, int64_t num_qk_heads, int64_t num_value_heads,
+    int64_t key_head_dim, int64_t value_head_dim, float eps,
+    void* stream_handle);
+Status deltanet_recurrent_decode128_for_test(
+    void* dst, void* recurrent_state, const void* query, const void* key,
+    const void* value, const void* a, const void* beta, const void* a_log,
+    const void* dt_bias, const void* norm_weight, const void* z, DType dtype,
+    int64_t num_qk_heads, int64_t num_value_heads, float eps,
+    void* stream_handle);
 Status argmax_last_row(int64_t* dst, const void* src, DType dtype,
                        int64_t rows, int64_t columns, void* stream_handle);
 

@@ -1,5 +1,6 @@
 #include "backends/backend_registry.h"
 #include "backends/interface/backend.h"
+#include "backends/hip/hip_kernels.h"
 
 #include <gtest/gtest.h>
 
@@ -845,6 +846,188 @@ TEST_F(HipKernelTest, DeltaNetRecurrentMatchesDeltaRuleReference) {
         EXPECT_NEAR(actual[j], expected[j], 1e-5f);
     for (int64_t i = 0; i < key_dim * value_dim; ++i)
         EXPECT_NEAR(actual_state[i], expected_state[i], 1e-5f);
+}
+
+TEST_F(HipKernelTest, DeltaNetDecode128MatchesGenericForQwenShape) {
+    constexpr int64_t qk_heads = 16;
+    constexpr int64_t value_heads = 48;
+    constexpr int64_t key_dim = 128;
+    constexpr int64_t value_dim = 128;
+    constexpr size_t state_count = value_heads * key_dim * value_dim;
+    constexpr size_t query_count = qk_heads * key_dim;
+    constexpr size_t value_count = value_heads * value_dim;
+
+    auto make_values = [](size_t count, float scale, float bias) {
+        std::vector<float> values(count);
+        for (size_t index = 0; index < count; ++index)
+            values[index] = std::sin(static_cast<float>(index) * scale) + bias;
+        return values;
+    };
+
+    const auto query = make_values(query_count, 0.013f, 0.1f);
+    const auto key = make_values(query_count, 0.017f, -0.2f);
+    const auto value = make_values(value_count, 0.011f, 0.3f);
+    const auto z = make_values(value_count, 0.019f, -0.1f);
+    const auto norm = make_values(value_dim, 0.023f, 1.0f);
+    const auto initial_state = make_values(state_count, 0.007f, 0.02f);
+    const std::vector<float> a(value_heads, 0.15f);
+    const std::vector<float> beta(value_heads, -0.35f);
+    const std::vector<float> a_log(value_heads, -0.7f);
+    const std::vector<float> dt_bias(value_heads, 0.2f);
+
+    auto q = upload(query);
+    auto k = upload(key);
+    auto v = upload(value);
+    auto a_buffer = upload(a);
+    auto beta_buffer = upload(beta);
+    auto a_log_buffer = upload(a_log);
+    auto dt_bias_buffer = upload(dt_bias);
+    auto norm_buffer = upload(norm);
+    auto z_buffer = upload(z);
+    auto generic_state = upload(initial_state);
+    auto decode_state = upload(initial_state);
+    auto generic_output = backend_->create_buffer(value_count * sizeof(float),
+                                                   MemoryType::Device);
+    auto decode_output = backend_->create_buffer(value_count * sizeof(float),
+                                                 MemoryType::Device);
+    ASSERT_NE(generic_output, nullptr);
+    ASSERT_NE(decode_output, nullptr);
+
+    ASSERT_TRUE(hip_kernels::deltanet_recurrent_generic_for_test(
+        generic_output->data(), generic_state->data(), q->data(), k->data(),
+        v->data(), a_buffer->data(), beta_buffer->data(), a_log_buffer->data(),
+        dt_bias_buffer->data(), norm_buffer->data(), z_buffer->data(),
+        DType::FP32, 1, qk_heads, value_heads, key_dim, value_dim, 1e-6f,
+        nullptr).ok());
+    ASSERT_TRUE(hip_kernels::deltanet_recurrent_decode128_for_test(
+        decode_output->data(), decode_state->data(), q->data(), k->data(),
+        v->data(), a_buffer->data(), beta_buffer->data(), a_log_buffer->data(),
+        dt_bias_buffer->data(), norm_buffer->data(), z_buffer->data(),
+        DType::FP32, qk_heads, value_heads, 1e-6f, nullptr).ok());
+
+    const auto generic = download<float>(generic_output, value_count);
+    const auto decode = download<float>(decode_output, value_count);
+    const auto generic_state_host = download<float>(generic_state, state_count);
+    const auto decode_state_host = download<float>(decode_state, state_count);
+    const float q_square_sum = [&] {
+        float sum = 0.0f;
+        for (float x : query) sum += x * x;
+        return sum;
+    }();
+    const float q_scale = 1.0f / std::sqrt(q_square_sum + 1.0e-6f) /
+                         std::sqrt(static_cast<float>(key_dim));
+    const size_t diagnostic_index = 2913;
+    const size_t diagnostic_head = diagnostic_index / value_dim;
+    const size_t diagnostic_column = diagnostic_index % value_dim;
+    float diagnostic_raw = 0.0f;
+    for (int64_t i = 0; i < key_dim; ++i)
+        diagnostic_raw +=
+            query[(diagnostic_head / 3) * key_dim + i] * q_scale *
+            generic_state_host[diagnostic_head * key_dim * value_dim +
+                               i * value_dim + diagnostic_column];
+    float max_output_error = 0.0f;
+    float max_state_error = 0.0f;
+    size_t max_output_index = 0;
+    size_t max_state_index = 0;
+    for (size_t index = 0; index < value_count; ++index)
+        if (const float error = std::fabs(generic[index] - decode[index]);
+            error > max_output_error) {
+            max_output_error = error;
+            max_output_index = index;
+        }
+    for (size_t index = 0; index < state_count; ++index)
+        if (const float error = std::fabs(generic_state_host[index] -
+                                          decode_state_host[index]);
+            error > max_state_error) {
+            max_state_error = error;
+            max_state_index = index;
+        }
+    EXPECT_LT(max_output_error, 1e-5f)
+        << "index=" << max_output_index << " generic="
+        << generic[max_output_index] << " decode=" << decode[max_output_index]
+        << " q_scale=" << q_scale << " diagnostic_raw=" << diagnostic_raw
+        << " max_state_error=" << max_state_error
+        << " state_index=" << max_state_index;
+    EXPECT_LT(max_state_error, 1e-5f);
+}
+
+TEST_F(HipKernelTest, DeltaNetDecode128Bf16MatchesGenericForQwenShape) {
+    constexpr int64_t qk_heads = 16;
+    constexpr int64_t value_heads = 48;
+    constexpr int64_t key_dim = 128;
+    constexpr int64_t value_dim = 128;
+    constexpr size_t state_count = value_heads * key_dim * value_dim;
+    constexpr size_t query_count = qk_heads * key_dim;
+    constexpr size_t value_count = value_heads * value_dim;
+    auto make_values = [](size_t count, float scale, float bias) {
+        std::vector<float> values(count);
+        for (size_t index = 0; index < count; ++index)
+            values[index] = std::sin(static_cast<float>(index) * scale) + bias;
+        return values;
+    };
+    auto to_bf16 = [](const std::vector<float>& values) {
+        std::vector<uint16_t> result(values.size());
+        for (size_t index = 0; index < values.size(); ++index)
+            result[index] = fp32_to_bf16(values[index]);
+        return result;
+    };
+
+    const auto query = make_values(query_count, 0.013f, 0.1f);
+    const auto key = make_values(query_count, 0.017f, -0.2f);
+    const auto value = make_values(value_count, 0.011f, 0.3f);
+    const auto z = make_values(value_count, 0.019f, -0.1f);
+    const auto norm = make_values(value_dim, 0.023f, 1.0f);
+    const auto initial_state = make_values(state_count, 0.007f, 0.02f);
+    const std::vector<float> a(value_heads, 0.15f);
+    const std::vector<float> beta(value_heads, -0.35f);
+    const std::vector<float> a_log(value_heads, -0.7f);
+    const std::vector<float> dt_bias(value_heads, 0.2f);
+
+    auto q = upload(to_bf16(query));
+    auto k = upload(to_bf16(key));
+    auto v = upload(to_bf16(value));
+    auto a_buffer = upload(to_bf16(a));
+    auto beta_buffer = upload(to_bf16(beta));
+    auto a_log_buffer = upload(to_bf16(a_log));
+    auto dt_bias_buffer = upload(to_bf16(dt_bias));
+    auto norm_buffer = upload(to_bf16(norm));
+    auto z_buffer = upload(to_bf16(z));
+    auto generic_state = upload(initial_state);
+    auto decode_state = upload(initial_state);
+    auto generic_output = backend_->create_buffer(value_count * sizeof(uint16_t),
+                                                   MemoryType::Device);
+    auto decode_output = backend_->create_buffer(value_count * sizeof(uint16_t),
+                                                 MemoryType::Device);
+    ASSERT_NE(generic_output, nullptr);
+    ASSERT_NE(decode_output, nullptr);
+    ASSERT_TRUE(hip_kernels::deltanet_recurrent_generic_for_test(
+        generic_output->data(), generic_state->data(), q->data(), k->data(),
+        v->data(), a_buffer->data(), beta_buffer->data(), a_log_buffer->data(),
+        dt_bias_buffer->data(), norm_buffer->data(), z_buffer->data(),
+        DType::BF16, 1, qk_heads, value_heads, key_dim, value_dim, 1e-6f,
+        nullptr).ok());
+    ASSERT_TRUE(hip_kernels::deltanet_recurrent_decode128_for_test(
+        decode_output->data(), decode_state->data(), q->data(), k->data(),
+        v->data(), a_buffer->data(), beta_buffer->data(), a_log_buffer->data(),
+        dt_bias_buffer->data(), norm_buffer->data(), z_buffer->data(),
+        DType::BF16, qk_heads, value_heads, 1e-6f, nullptr).ok());
+
+    const auto generic = download<uint16_t>(generic_output, value_count);
+    const auto decode = download<uint16_t>(decode_output, value_count);
+    const auto generic_state_host = download<float>(generic_state, state_count);
+    const auto decode_state_host = download<float>(decode_state, state_count);
+    float max_output_error = 0.0f;
+    float max_state_error = 0.0f;
+    for (size_t index = 0; index < value_count; ++index)
+        max_output_error = std::max(
+            max_output_error,
+            std::fabs(bf16_to_fp32(generic[index]) - bf16_to_fp32(decode[index])));
+    for (size_t index = 0; index < state_count; ++index)
+        max_state_error = std::max(
+            max_state_error, std::fabs(generic_state_host[index] -
+                                       decode_state_host[index]));
+    EXPECT_LT(max_output_error, 1e-5f);
+    EXPECT_LT(max_state_error, 1e-5f);
 }
 
 } // namespace

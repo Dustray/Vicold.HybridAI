@@ -642,6 +642,114 @@ __global__ void deltanet_recurrent_kernel(
     }
 }
 
+// Qwen3.5/Qwen3.8 decode specialization. The recurrent state is 128x128,
+// and decode supplies one token at a time. The generic kernel launches 256
+// threads although only 128 output columns are active. This specialization
+// keeps 128 active lanes and uses wavefront shuffles only for reductions.
+template <typename T>
+__global__ void deltanet_recurrent_decode128_kernel(
+    T* dst, float* recurrent_state, const T* query, const T* key,
+    const T* value, const T* a, const T* beta, const T* a_log,
+    const T* dt_bias, const T* norm_weight, const T* z,
+    int64_t num_qk_heads, int64_t num_value_heads, float eps) {
+    constexpr int64_t kKeyDim = 128;
+    constexpr int64_t kValueDim = 128;
+    constexpr int kWaveCount = 128 / warpSize;
+    const int64_t value_head = blockIdx.x;
+    const int64_t lane = threadIdx.x;
+    if (value_head >= num_value_heads) return;
+
+    const int64_t heads_per_group = num_value_heads / num_qk_heads;
+    const int64_t qk_head = value_head / heads_per_group;
+    const T* q = query + qk_head * kKeyDim;
+    const T* k = key + qk_head * kKeyDim;
+    const T* v = value + value_head * kValueDim;
+    T* out = dst + value_head * kValueDim;
+    float* state = recurrent_state + value_head * kKeyDim * kValueDim;
+
+    __shared__ float wave_sums[8];
+    __shared__ float q_scale_shared;
+    __shared__ float k_scale_shared;
+    __shared__ float decay_shared;
+    __shared__ float beta_shared;
+
+    float q_partial = 0.0f;
+    float k_partial = 0.0f;
+    for (int64_t i = lane; i < kKeyDim; i += blockDim.x) {
+        const float q_value = load_value(q, i);
+        const float k_value = load_value(k, i);
+        q_partial += q_value * q_value;
+        k_partial += k_value * k_value;
+    }
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        q_partial += __shfl_down(q_partial, offset);
+        k_partial += __shfl_down(k_partial, offset);
+    }
+    const int wave = static_cast<int>(lane) / warpSize;
+    const int lane_in_wave = static_cast<int>(lane) % warpSize;
+    if (lane_in_wave == 0) {
+        wave_sums[wave] = q_partial;
+        wave_sums[wave + kWaveCount] = k_partial;
+    }
+    __syncthreads();
+
+    if (lane == 0) {
+        float q_sum = 0.0f;
+        float k_sum = 0.0f;
+        for (int wave_index = 0; wave_index < kWaveCount; ++wave_index) {
+            q_sum += wave_sums[wave_index];
+            k_sum += wave_sums[wave_index + kWaveCount];
+        }
+        q_scale_shared = rsqrtf(q_sum + 1.0e-6f) * rsqrtf(128.0f);
+        k_scale_shared = rsqrtf(k_sum + 1.0e-6f);
+        const float decay_arg = load_value(dt_bias, value_head) +
+                                load_value(a, value_head);
+        const float softplus = fmaxf(decay_arg, 0.0f) +
+                               log1pf(expf(-fabsf(decay_arg)));
+        decay_shared = expf(-expf(load_value(a_log, value_head)) * softplus);
+        const float beta_logit = load_value(beta, value_head);
+        beta_shared = 1.0f / (1.0f + expf(-beta_logit));
+    }
+    __syncthreads();
+
+    const int64_t j = lane;
+    float retrieved = 0.0f;
+    for (int64_t i = 0; i < kKeyDim; ++i) {
+        float& state_value = state[i * kValueDim + j];
+        state_value *= decay_shared;
+        retrieved += load_value(k, i) * k_scale_shared * state_value;
+    }
+    const float corrected = load_value(v, j) - retrieved;
+    for (int64_t i = 0; i < kKeyDim; ++i) {
+        state[i * kValueDim + j] +=
+            beta_shared * load_value(k, i) * k_scale_shared * corrected;
+    }
+    const float q_scale = q_scale_shared;
+    float output = 0.0f;
+    for (int64_t i = 0; i < kKeyDim; ++i)
+        output += load_value(q, i) * q_scale * state[i * kValueDim + j];
+    store_value(out, j, output);
+
+    float rms_partial = output * output;
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        rms_partial += __shfl_down(rms_partial, offset);
+    if (lane_in_wave == 0) wave_sums[wave] = rms_partial;
+    __syncthreads();
+    if (lane == 0) {
+        float rms_sum = 0.0f;
+        for (int wave_index = 0; wave_index < kWaveCount; ++wave_index)
+            rms_sum += wave_sums[wave_index];
+        wave_sums[0] = rsqrtf(rms_sum / static_cast<float>(kValueDim) + eps);
+    }
+    __syncthreads();
+
+    const T* gate = z + value_head * kValueDim;
+    const float gate_value = load_value(gate, j);
+    const float silu_gate = gate_value / (1.0f + expf(-gate_value));
+    store_value(out, j, load_value(out, j) * wave_sums[0] *
+                         load_value(norm_weight, j) * silu_gate);
+}
+
 template <typename T>
 __global__ void argmax_last_row_kernel(int64_t* dst, const T* src,
                                        int64_t rows, int64_t columns) {
@@ -883,6 +991,19 @@ Status launch_deltanet_recurrent(
     int64_t key_head_dim, int64_t value_head_dim, int64_t norm_weight_count,
     float eps,
     hipStream_t stream) {
+    if (token_count == 1 && key_head_dim == 128 && value_head_dim == 128) {
+        hipLaunchKernelGGL(
+            deltanet_recurrent_decode128_kernel<T>,
+            dim3(static_cast<unsigned int>(num_value_heads)), dim3(128), 0,
+            stream, static_cast<T*>(dst), static_cast<float*>(recurrent_state),
+            static_cast<const T*>(query), static_cast<const T*>(key),
+            static_cast<const T*>(value), static_cast<const T*>(a),
+            static_cast<const T*>(beta), static_cast<const T*>(a_log),
+            static_cast<const T*>(dt_bias), static_cast<const T*>(norm_weight),
+            static_cast<const T*>(z), num_qk_heads, num_value_heads, eps);
+        return hip_status(hipGetLastError(),
+                          "launch DeltaNet decode128 kernel");
+    }
     hipLaunchKernelGGL(deltanet_recurrent_kernel<T>,
                        dim3(static_cast<unsigned int>(num_value_heads)),
                        dim3(kBlockSize), 0, stream, static_cast<T*>(dst),
@@ -897,6 +1018,26 @@ Status launch_deltanet_recurrent(
                        num_value_heads, key_head_dim, value_head_dim,
                        norm_weight_count, eps);
     return hip_status(hipGetLastError(), "launch DeltaNet recurrent kernel");
+}
+
+template <typename T>
+Status launch_deltanet_recurrent_decode128_for_test(
+    void* dst, void* recurrent_state, const void* query, const void* key,
+    const void* value, const void* a, const void* beta, const void* a_log,
+    const void* dt_bias, const void* norm_weight, const void* z,
+    int64_t num_qk_heads, int64_t num_value_heads, float eps,
+    hipStream_t stream) {
+    hipLaunchKernelGGL(
+        deltanet_recurrent_decode128_kernel<T>,
+        dim3(static_cast<unsigned int>(num_value_heads)), dim3(128), 0,
+        stream, static_cast<T*>(dst), static_cast<float*>(recurrent_state),
+        static_cast<const T*>(query), static_cast<const T*>(key),
+        static_cast<const T*>(value), static_cast<const T*>(a),
+        static_cast<const T*>(beta), static_cast<const T*>(a_log),
+        static_cast<const T*>(dt_bias), static_cast<const T*>(norm_weight),
+        static_cast<const T*>(z), num_qk_heads, num_value_heads, eps);
+    return hip_status(hipGetLastError(),
+                      "launch DeltaNet decode128 test kernel");
 }
 
 template <typename T>
@@ -1227,6 +1368,53 @@ Status deltanet_recurrent(
             as_stream(stream_handle));
     return Status(StatusCode::UnsupportedDType,
                   "Unsupported HIP DeltaNet recurrent dtype");
+}
+
+Status deltanet_recurrent_generic_for_test(
+    void* dst, void* recurrent_state, const void* query, const void* key,
+    const void* value, const void* a, const void* beta, const void* a_log,
+    const void* dt_bias, const void* norm_weight, const void* z, DType dtype,
+    int64_t token_count, int64_t num_qk_heads, int64_t num_value_heads,
+    int64_t key_head_dim, int64_t value_head_dim, float eps,
+    void* stream_handle) {
+    if (dtype == DType::FP32)
+        return launch_deltanet_recurrent<float>(
+            dst, recurrent_state, query, key, value, a, beta, a_log, dt_bias,
+            norm_weight, z, token_count, num_qk_heads, num_value_heads,
+            key_head_dim, value_head_dim, value_head_dim, eps,
+            as_stream(stream_handle));
+    if (dtype == DType::BF16)
+        return launch_deltanet_recurrent<hip_bfloat16>(
+            dst, recurrent_state, query, key, value, a, beta, a_log, dt_bias,
+            norm_weight, z, token_count, num_qk_heads, num_value_heads,
+            key_head_dim, value_head_dim, value_head_dim, eps,
+            as_stream(stream_handle));
+    return Status(StatusCode::UnsupportedDType,
+                  "Unsupported HIP DeltaNet generic test dtype");
+}
+
+Status deltanet_recurrent_decode128_for_test(
+    void* dst, void* recurrent_state, const void* query, const void* key,
+    const void* value, const void* a, const void* beta, const void* a_log,
+    const void* dt_bias, const void* norm_weight, const void* z, DType dtype,
+    int64_t num_qk_heads, int64_t num_value_heads, float eps,
+    void* stream_handle) {
+    if (num_qk_heads <= 0 || num_value_heads <= 0 ||
+        num_value_heads % num_qk_heads != 0 || eps <= 0.0f)
+        return Status(StatusCode::InvalidArgument,
+                      "Invalid HIP DeltaNet decode128 test arguments");
+    if (dtype == DType::FP32)
+        return launch_deltanet_recurrent_decode128_for_test<float>(
+            dst, recurrent_state, query, key, value, a, beta, a_log, dt_bias,
+            norm_weight, z, num_qk_heads, num_value_heads, eps,
+            as_stream(stream_handle));
+    if (dtype == DType::BF16)
+        return launch_deltanet_recurrent_decode128_for_test<hip_bfloat16>(
+            dst, recurrent_state, query, key, value, a, beta, a_log, dt_bias,
+            norm_weight, z, num_qk_heads, num_value_heads, eps,
+            as_stream(stream_handle));
+    return Status(StatusCode::UnsupportedDType,
+                  "Unsupported HIP DeltaNet decode128 test dtype");
 }
 
 Status argmax_last_row(int64_t* dst, const void* src, DType dtype,

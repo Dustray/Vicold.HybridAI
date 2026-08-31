@@ -39,6 +39,7 @@
 #include <iostream>
 #include <memory>
 #include <limits>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <cmath>
@@ -526,6 +527,29 @@ int main(int argc, char* argv[]) {
             std::cout << "\n[Tokenizer] Not loaded: "
                       << tok_status.message() << std::endl;
         }
+        std::vector<int64_t> eos_token_ids = config.eos_token_ids;
+        if (tok_status.ok()) {
+            eos_token_ids.insert(eos_token_ids.end(),
+                                 tokenizer.eos_token_ids().begin(),
+                                 tokenizer.eos_token_ids().end());
+        }
+        std::sort(eos_token_ids.begin(), eos_token_ids.end());
+        eos_token_ids.erase(
+            std::unique(eos_token_ids.begin(), eos_token_ids.end()),
+            eos_token_ids.end());
+        if (eos_token_ids.empty()) {
+            std::cerr << "[WARN] No EOS token IDs were found in config.json "
+                         "or generation_config.json; generation will stop at "
+                         "the token limit."
+                      << std::endl;
+        } else {
+            std::cout << "  eos_token_ids: [";
+            for (size_t index = 0; index < eos_token_ids.size(); ++index) {
+                if (index != 0) std::cout << ", ";
+                std::cout << eos_token_ids[index];
+            }
+            std::cout << "]" << std::endl;
+        }
         const std::string user_text = "Hello, how are you?";
         std::string prompt;
         if (tok_status.ok()) {
@@ -935,7 +959,9 @@ int main(int argc, char* argv[]) {
             std::cout << (device_argmax ? " (device argmax)" : "")
                       << std::endl;
         }
-        if (tok_status.ok() && tokenizer.is_eos_token(next_id)) {
+        const bool is_eos = std::binary_search(
+            eos_token_ids.begin(), eos_token_ids.end(), next_id);
+        if (is_eos) {
             if (verbose_step) {
                 std::cout << "[Stop] EOS token generated." << std::endl;
             }

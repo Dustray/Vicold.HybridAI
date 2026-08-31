@@ -140,6 +140,50 @@ TEST(CoreTest, TensorContiguousCopy) {
     EXPECT_FLOAT_EQ(result[5], 5.0f);
 }
 
+TEST(CoreTest, TensorContiguousRejectsOutOfBoundsStrides) {
+    Device cpu = Device::Cpu();
+    auto backend = BackendRegistry::instance().create_backend(cpu);
+    ASSERT_NE(backend, nullptr);
+    auto buffer = backend->create_buffer(6 * sizeof(float), MemoryType::Host);
+    ASSERT_NE(buffer, nullptr);
+
+    Tensor invalid_view(Shape{3, 2}, DType::FP32, cpu, buffer,
+                        std::vector<int64_t>{4, 1});
+    ASSERT_FALSE(invalid_view.is_contiguous());
+    EXPECT_EQ(invalid_view.contiguous().data(), nullptr);
+}
+
+TEST(CoreTest, TensorContiguousCopyOnHip) {
+    InitializeBuiltinBackends();
+    const Device gpu(0, DeviceType::DiscreteGPU, "hip", false);
+    auto backend = BackendRegistry::instance().create_backend(gpu);
+    ASSERT_NE(backend, nullptr);
+    if (!backend->is_available()) {
+        GTEST_SKIP() << "No usable HIP device is available";
+    }
+
+    const std::vector<float> source = {0, 1, 2, 3, 4, 5};
+    auto buffer = backend->create_buffer(source.size() * sizeof(float),
+                                         MemoryType::Device);
+    ASSERT_NE(buffer, nullptr);
+    ASSERT_TRUE(backend->memcpy_h2d(buffer.get(), source.data(),
+                                    source.size() * sizeof(float)).ok());
+
+    Tensor view(Shape{3, 2}, DType::FP32, gpu, buffer,
+                std::vector<int64_t>{1, 3});
+    ASSERT_FALSE(view.is_contiguous());
+    Tensor contiguous = view.contiguous();
+    ASSERT_TRUE(contiguous.is_contiguous());
+    ASSERT_NE(contiguous.data(), nullptr);
+
+    std::vector<float> actual(source.size());
+    ASSERT_TRUE(backend->memcpy_d2h(actual.data(), contiguous.buffer().get(),
+                                    actual.size() * sizeof(float)).ok());
+    ASSERT_TRUE(backend->synchronize().ok());
+    const std::vector<float> expected = {0, 3, 1, 4, 2, 5};
+    EXPECT_EQ(actual, expected);
+}
+
 TEST(CoreTest, TensorContiguousAlready) {
     Device cpu = Device::Cpu();
     auto backend = BackendRegistry::instance().create_backend(cpu);

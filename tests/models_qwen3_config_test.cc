@@ -3,12 +3,22 @@
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
 
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <vector>
 
 namespace hybridai::models {
 namespace {
+
+std::filesystem::path real_qwen_model_path() {
+    if (const char* configured = std::getenv("HYBRIDAI_QWEN_MODEL_DIR");
+        configured != nullptr && configured[0] != '\0') {
+        return configured;
+    }
+    return "/public/home/panyq/yiny/modelscope/models/"
+           "Qwen--Qwen3.8-27B/snapshots/master";
+}
 
 TEST(Qwen3ConfigTest, LoadsTextConfigAndRopeParameters) {
     const auto path = std::filesystem::temp_directory_path() /
@@ -110,10 +120,9 @@ TEST(Qwen3ConfigTest, RejectsUnsupportedSsmDtype) {
 }
 
 TEST(Qwen3ConfigTest, LoadsDownloadedQwen38ConfigWhenAvailable) {
-    const std::filesystem::path path =
-        "/public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master/config.json";
+    const std::filesystem::path path = real_qwen_model_path() / "config.json";
     if (!std::filesystem::exists(path)) {
-        GTEST_SKIP() << "Downloaded Qwen3.8 model is not available";
+        GTEST_SKIP() << "Qwen model is not available at " << path.parent_path();
     }
 
     Qwen3Config parsed;

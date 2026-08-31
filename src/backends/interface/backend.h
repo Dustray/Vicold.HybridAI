@@ -210,6 +210,20 @@ public:
     // construction. This keeps kernel selection in ops/ independent of the
     // concrete backend implementation.
     virtual void register_kernels() {}
+
+    // Keep newly added optional primitives at the end of the vtable so
+    // independently built clients remain ABI-compatible with older headers.
+    virtual Status add_row_bias(Buffer*, const Buffer*, DType, int64_t,
+                                int64_t, Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend row bias add unavailable");
+    }
+    virtual Status strided_copy(Buffer*, const Buffer*, DType, int64_t,
+                                const int64_t*, const int64_t*, int64_t,
+                                Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend strided copy unavailable");
+    }
 };
 
 // Factory function signature for backend registration

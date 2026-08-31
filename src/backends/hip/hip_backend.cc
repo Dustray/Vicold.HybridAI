@@ -770,6 +770,59 @@ Status HipBackend::add(Buffer* dst, const Buffer* lhs, const Buffer* rhs,
 #endif
 }
 
+Status HipBackend::add_row_bias(Buffer* dst, const Buffer* bias, DType dtype,
+                                int64_t rows, int64_t columns,
+                                Stream* stream) {
+#if defined(HYBRIDAI_HAS_HIP) && defined(HYBRIDAI_HAS_HIP_KERNELS)
+    if (rows <= 0 || columns <= 0) {
+        return Status(StatusCode::InvalidArgument,
+                      "Invalid row bias dimensions");
+    }
+    Status status = validate_kernel_buffer(
+        dst, device_, static_cast<size_t>(rows * columns) *
+                          SizeOfDType(dtype), "dst");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(
+        bias, device_, static_cast<size_t>(columns) * SizeOfDType(dtype),
+        "bias");
+    if (!status.ok()) return status;
+    if (hipSetDevice(device_.id()) != hipSuccess)
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    return hip_kernels::add_row_bias(
+        dst->data(), bias->data(), dtype, rows, columns,
+        native_stream(stream));
+#else
+    (void)dst; (void)bias; (void)dtype; (void)rows; (void)columns; (void)stream;
+    return Status(StatusCode::NotImplemented, "HIP kernels are unavailable");
+#endif
+}
+
+Status HipBackend::strided_copy(Buffer* dst, const Buffer* src, DType dtype,
+                                int64_t count, const int64_t* shape,
+                                const int64_t* strides, int64_t ndim,
+                                Stream* stream) {
+#if defined(HYBRIDAI_HAS_HIP) && defined(HYBRIDAI_HAS_HIP_KERNELS)
+    if (count <= 0 || shape == nullptr || strides == nullptr || ndim <= 0) {
+        return Status(StatusCode::InvalidArgument,
+                      "Invalid strided copy arguments");
+    }
+    Status status = validate_kernel_buffer(
+        dst, device_, static_cast<size_t>(count) * SizeOfDType(dtype), "dst");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(src, device_, SizeOfDType(dtype), "src");
+    if (!status.ok()) return status;
+    if (hipSetDevice(device_.id()) != hipSuccess)
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    return hip_kernels::strided_copy(
+        dst->data(), src->data(), dtype, count, shape, strides, ndim,
+        native_stream(stream));
+#else
+    (void)dst; (void)src; (void)dtype; (void)count; (void)shape;
+    (void)strides; (void)ndim; (void)stream;
+    return Status(StatusCode::NotImplemented, "HIP kernels are unavailable");
+#endif
+}
+
 Status HipBackend::embedding_gather(Buffer* dst, const Buffer* embedding,
                                     const Buffer* ids, DType dtype,
                                     int64_t num_ids, int64_t vocab_size,

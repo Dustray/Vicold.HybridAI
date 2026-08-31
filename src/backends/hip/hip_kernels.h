@@ -13,6 +13,11 @@ Status cast(void* dst, const void* src, DType dst_type, DType src_type,
             int64_t count, void* stream_handle);
 Status add(void* dst, const void* lhs, const void* rhs, DType dtype,
            int64_t count, void* stream_handle);
+Status add_row_bias(void* dst, const void* bias, DType dtype, int64_t rows,
+                    int64_t columns, void* stream_handle);
+Status strided_copy(void* dst, const void* src, DType dtype, int64_t count,
+                    const int64_t* shape, const int64_t* strides,
+                    int64_t ndim, void* stream_handle);
 Status embedding_gather(void* dst, const void* embedding, const int64_t* ids,
                         DType dtype, int64_t num_ids, int64_t vocab_size,
                         int64_t hidden_size, void* stream_handle);

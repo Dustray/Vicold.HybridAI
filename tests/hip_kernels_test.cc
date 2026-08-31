@@ -163,6 +163,50 @@ TEST_F(HipKernelTest, EmbeddingAddAndArgmaxMatchReference) {
     EXPECT_EQ(index[0], 3);
 }
 
+TEST_F(HipKernelTest, RowBiasAddBroadcastsAcrossRows) {
+    const std::vector<float> values = {
+        1.0f, 2.0f, 3.0f,
+        4.0f, 5.0f, 6.0f,
+    };
+    auto output = upload(values);
+    auto bias = upload(std::vector<float>{0.5f, -1.0f, 2.0f});
+
+    ASSERT_TRUE(backend_->add_row_bias(output.get(), bias.get(), DType::FP32,
+                                        2, 3).ok());
+    const auto actual = download<float>(output, values.size());
+    const std::vector<float> expected = {
+        1.5f, 1.0f, 5.0f,
+        4.5f, 4.0f, 8.0f,
+    };
+    EXPECT_EQ(actual, expected);
+}
+
+TEST_F(HipKernelTest, Bf16RowBiasAddKeepsBf16Storage) {
+    const std::vector<float> values_fp32 = {
+        1.25f, -2.0f, 3.5f,
+        4.0f, 0.75f, -6.25f,
+    };
+    const std::vector<float> bias_fp32 = {0.5f, -0.25f, 1.0f};
+    std::vector<uint16_t> values(values_fp32.size());
+    std::vector<uint16_t> bias(bias_fp32.size());
+    for (size_t index = 0; index < values.size(); ++index)
+        values[index] = fp32_to_bf16(values_fp32[index]);
+    for (size_t index = 0; index < bias.size(); ++index)
+        bias[index] = fp32_to_bf16(bias_fp32[index]);
+
+    auto output = upload(values);
+    auto bias_buffer = upload(bias);
+    ASSERT_TRUE(backend_->add_row_bias(output.get(), bias_buffer.get(),
+                                        DType::BF16, 2, 3).ok());
+    const auto actual = download<uint16_t>(output, values.size());
+    for (size_t index = 0; index < actual.size(); ++index) {
+        const float expected = bf16_to_fp32(fp32_to_bf16(
+            bf16_to_fp32(values[index]) +
+            bf16_to_fp32(bias[index % bias.size()])));
+        EXPECT_FLOAT_EQ(bf16_to_fp32(actual[index]), expected);
+    }
+}
+
 TEST_F(HipKernelTest, RmsNormUnaryAndSiluMulMatchReference) {
     const std::vector<float> input = {1.0f, 2.0f, 3.0f, 4.0f,
                                       -1.0f, -2.0f, -3.0f, -4.0f};

@@ -59,6 +59,10 @@ Status Linear::validate(const Tensor& input, const Tensor& weight,
             return Status(StatusCode::InvalidArgument,
                             "Linear bias dtype mismatch");
         }
+        if (bias->device() != input.device()) {
+            return Status(StatusCode::InvalidArgument,
+                            "Linear bias must be on the same device as input");
+        }
         if (bias->shape().ndim() != 1) {
             return Status(StatusCode::InvalidArgument,
                             "Linear bias must be 1-D");
@@ -77,7 +81,6 @@ Status Linear::validate(const Tensor& input, const Tensor& weight,
 Tensor Linear::forward(const Tensor& input, const Tensor& weight,
                        bool transpose_weight, const Tensor* bias,
                        Stream* stream) {
-    (void)bias;
     Status status = validate(input, weight, transpose_weight, bias);
     if (!status.ok()) {
         return Tensor();
@@ -133,7 +136,23 @@ Tensor Linear::forward(const Tensor& input, const Tensor& weight,
         return Tensor();
     }
 
-    // TODO: add bias after GEMM.
+    if (bias != nullptr) {
+        if (input.device().is_gpu()) {
+            status = backend->add_row_bias(output_buffer.get(),
+                                           bias->buffer().get(), output_dtype,
+                                           m, n, stream);
+            if (!status.ok()) return Tensor();
+        } else {
+            if (output_dtype != DType::FP32) return Tensor();
+            float* output = static_cast<float*>(output_buffer->data());
+            const float* bias_data = static_cast<const float*>(bias->data());
+            for (int64_t row = 0; row < m; ++row) {
+                for (int64_t column = 0; column < n; ++column) {
+                    output[row * n + column] += bias_data[column];
+                }
+            }
+        }
+    }
 
     return Tensor(output_shape, output_dtype, input.device(),
                   std::move(output_buffer));

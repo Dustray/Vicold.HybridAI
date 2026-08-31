@@ -97,6 +97,32 @@ Tensor Tensor::contiguous() const {
     const int64_t n = numel();
     const size_t elem_size = SizeOfDType(dtype_);
 
+    int64_t maximum_source_index = 0;
+    for (size_t dimension = 0; dimension < strides_.size(); ++dimension) {
+        if (shape_.dim(dimension) <= 0 || strides_[dimension] < 0) {
+            return Tensor();
+        }
+        maximum_source_index +=
+            (shape_.dim(dimension) - 1) * strides_[dimension];
+    }
+    const size_t required_source_bytes =
+        static_cast<size_t>(maximum_source_index + 1) * elem_size;
+    if (required_source_bytes > buffer_->size()) {
+        return Tensor();
+    }
+
+    if (device_.is_gpu()) {
+        std::vector<int64_t> dimensions(shape_.ndim());
+        for (size_t dimension = 0; dimension < shape_.ndim(); ++dimension) {
+            dimensions[dimension] = shape_.dim(dimension);
+        }
+        Status status = backend->strided_copy(
+            dst_buffer.get(), buffer_.get(), dtype_, n, dimensions.data(),
+            strides_.data(), static_cast<int64_t>(shape_.ndim()));
+        if (!status.ok()) return Tensor();
+        return Tensor(shape_, dtype_, device_, std::move(dst_buffer));
+    }
+
     // Generic strided -> contiguous copy. Optimized for common cases below.
     if (strides_.size() == 1) {
         // 1-D: just copy with stride

@@ -51,6 +51,41 @@ __global__ void add_kernel(T* dst, const T* lhs, const T* rhs, int64_t count) {
 }
 
 template <typename T>
+__global__ void add_row_bias_kernel(T* dst, const T* bias, int64_t count,
+                                    int64_t columns) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                          threadIdx.x;
+    if (index < count) {
+        store_value(dst, index,
+                    load_value(dst, index) + load_value(bias, index % columns));
+    }
+}
+
+constexpr int64_t kMaxStridedDimensions = 8;
+
+struct StridedLayout {
+    int64_t shape[kMaxStridedDimensions];
+    int64_t strides[kMaxStridedDimensions];
+    int64_t ndim;
+};
+
+template <typename T>
+__global__ void strided_copy_kernel(T* dst, const T* src, int64_t count,
+                                    StridedLayout layout) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                          threadIdx.x;
+    if (index >= count) return;
+    int64_t remaining = index;
+    int64_t source_index = 0;
+    for (int64_t dimension = layout.ndim - 1; dimension >= 0; --dimension) {
+        const int64_t coordinate = remaining % layout.shape[dimension];
+        remaining /= layout.shape[dimension];
+        source_index += coordinate * layout.strides[dimension];
+    }
+    dst[index] = src[source_index];
+}
+
+template <typename T>
 __global__ void embedding_gather_kernel(T* dst, const T* embedding,
                                         const int64_t* ids, int64_t num_ids,
                                         int64_t vocab_size,
@@ -571,6 +606,25 @@ Status launch_add(void* dst, const void* lhs, const void* rhs, int64_t count,
 }
 
 template <typename T>
+Status launch_add_row_bias(void* dst, const void* bias, int64_t rows,
+                           int64_t columns, hipStream_t stream) {
+    const int64_t count = rows * columns;
+    hipLaunchKernelGGL(add_row_bias_kernel<T>, grid_for(count),
+                       dim3(kBlockSize), 0, stream, static_cast<T*>(dst),
+                       static_cast<const T*>(bias), count, columns);
+    return hip_status(hipGetLastError(), "launch row bias add kernel");
+}
+
+template <typename T>
+Status launch_strided_copy(void* dst, const void* src, int64_t count,
+                           const StridedLayout& layout, hipStream_t stream) {
+    hipLaunchKernelGGL(strided_copy_kernel<T>, grid_for(count),
+                       dim3(kBlockSize), 0, stream, static_cast<T*>(dst),
+                       static_cast<const T*>(src), count, layout);
+    return hip_status(hipGetLastError(), "launch strided copy kernel");
+}
+
+template <typename T>
 Status launch_embedding(void* dst, const void* embedding, const int64_t* ids,
                         int64_t num_ids, int64_t vocab_size,
                         int64_t hidden_size, hipStream_t stream) {
@@ -797,6 +851,59 @@ Status add(void* dst, const void* lhs, const void* rhs, DType dtype,
         return launch_add<hip_bfloat16>(dst, lhs, rhs, count,
                                         as_stream(stream_handle));
     return Status(StatusCode::UnsupportedDType, "Unsupported HIP add dtype");
+}
+
+Status add_row_bias(void* dst, const void* bias, DType dtype, int64_t rows,
+                    int64_t columns, void* stream_handle) {
+    if (dst == nullptr || bias == nullptr || rows <= 0 || columns <= 0) {
+        return Status(StatusCode::InvalidArgument,
+                      "Invalid HIP row bias add arguments");
+    }
+    if (dtype == DType::FP32)
+        return launch_add_row_bias<float>(dst, bias, rows, columns,
+                                          as_stream(stream_handle));
+    if (dtype == DType::BF16)
+        return launch_add_row_bias<hip_bfloat16>(
+            dst, bias, rows, columns, as_stream(stream_handle));
+    return Status(StatusCode::UnsupportedDType,
+                  "Unsupported HIP row bias add dtype");
+}
+
+Status strided_copy(void* dst, const void* src, DType dtype, int64_t count,
+                    const int64_t* shape, const int64_t* strides,
+                    int64_t ndim, void* stream_handle) {
+    if (dst == nullptr || src == nullptr || count <= 0 || shape == nullptr ||
+        strides == nullptr || ndim <= 0 || ndim > kMaxStridedDimensions) {
+        return Status(StatusCode::InvalidArgument,
+                      "Invalid HIP strided copy arguments");
+    }
+    StridedLayout layout{};
+    layout.ndim = ndim;
+    for (int64_t dimension = 0; dimension < ndim; ++dimension) {
+        if (shape[dimension] <= 0 || strides[dimension] < 0) {
+            return Status(StatusCode::InvalidArgument,
+                          "Invalid HIP strided layout");
+        }
+        layout.shape[dimension] = shape[dimension];
+        layout.strides[dimension] = strides[dimension];
+    }
+    if (dtype == DType::FP32)
+        return launch_strided_copy<float>(dst, src, count, layout,
+                                          as_stream(stream_handle));
+    if (dtype == DType::BF16)
+        return launch_strided_copy<hip_bfloat16>(
+            dst, src, count, layout, as_stream(stream_handle));
+    if (dtype == DType::FP16)
+        return launch_strided_copy<__half>(dst, src, count, layout,
+                                           as_stream(stream_handle));
+    if (dtype == DType::INT8 || dtype == DType::FP8_E4M3)
+        return launch_strided_copy<uint8_t>(dst, src, count, layout,
+                                            as_stream(stream_handle));
+    if (dtype == DType::INT32)
+        return launch_strided_copy<int32_t>(dst, src, count, layout,
+                                            as_stream(stream_handle));
+    return Status(StatusCode::UnsupportedDType,
+                  "Unsupported HIP strided copy dtype");
 }
 
 Status embedding_gather(void* dst, const void* embedding, const int64_t* ids,

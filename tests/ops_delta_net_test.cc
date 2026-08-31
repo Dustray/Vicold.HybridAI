@@ -96,5 +96,35 @@ TEST_F(DeltaNetTest, ValidationRejectsMismatchedWo) {
     EXPECT_FALSE(status.ok());
 }
 
+TEST(DeltaNetCacheTest, ResetReleasesAllRequestState) {
+    InitializeBuiltinBackends();
+    auto backend =
+        BackendRegistry::instance().create_backend(Device::Cpu());
+    ASSERT_NE(backend, nullptr);
+
+    auto conv_buffer = backend->create_buffer(4 * sizeof(float),
+                                               MemoryType::Host);
+    auto recurrent_buffer = backend->create_buffer(6 * sizeof(float),
+                                                    MemoryType::Host);
+    ASSERT_NE(conv_buffer, nullptr);
+    ASSERT_NE(recurrent_buffer, nullptr);
+
+    ops::DeltaNetCache cache;
+    cache.conv_state = Tensor(Shape{2, 2}, DType::FP32, Device::Cpu(),
+                              std::move(conv_buffer));
+    cache.recurrent_state = Tensor(Shape{1, 2, 3}, DType::FP32,
+                                   Device::Cpu(),
+                                   std::move(recurrent_buffer));
+    cache.length = 17;
+    ASSERT_TRUE(cache.initialized());
+
+    cache.reset();
+
+    EXPECT_FALSE(cache.initialized());
+    EXPECT_EQ(cache.conv_state.buffer(), nullptr);
+    EXPECT_EQ(cache.recurrent_state.buffer(), nullptr);
+    EXPECT_EQ(cache.length, 0);
+}
+
 } // namespace
 } // namespace hybridai

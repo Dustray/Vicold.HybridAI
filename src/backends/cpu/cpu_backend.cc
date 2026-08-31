@@ -93,7 +93,10 @@ Status naive_gemm_f32(void* c_data, const void* a_data, const void* b_data,
             for (int64_t l = 0; l < k; ++l) {
                 acc += a[a_idx(i, l)] * b[b_idx(l, j)];
             }
-            c[c_idx(i, j)] = alpha * acc + beta * c[c_idx(i, j)];
+            const int64_t index = c_idx(i, j);
+            c[index] = beta == 0.0f
+                           ? alpha * acc
+                           : alpha * acc + beta * c[index];
         }
     }
     return Status::OK();

@@ -47,6 +47,13 @@ public:
                 DType src_type, int64_t count, Stream* stream) override;
     Status add(Buffer* dst, const Buffer* lhs, const Buffer* rhs, DType dtype,
                int64_t count, Stream* stream) override;
+    Status add_row_bias(Buffer* dst, const Buffer* bias, DType dtype,
+                        int64_t rows, int64_t columns,
+                        Stream* stream) override;
+    Status strided_copy(Buffer* dst, const Buffer* src, DType dtype,
+                        int64_t count, const int64_t* shape,
+                        const int64_t* strides, int64_t ndim,
+                        Stream* stream) override;
     Status embedding_gather(Buffer* dst, const Buffer* embedding,
                             const Buffer* ids, DType dtype, int64_t num_ids,
                             int64_t vocab_size, int64_t hidden_size,

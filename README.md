@@ -39,6 +39,7 @@ Vicold.HybridAI/
 │   ├── models/                 # Qwen3 配置与权重
 │   └── ops/                    # 算子实现与 KernelRegistry
 ├── tests/                      # GTest 测试
+├── benchmark/                  # 延迟、吞吐及后续服务性能基准
 ├── doc/                        # 项目文档
 └── envdevice.md                # 当前开发机 ROCm 环境记录
 ```
@@ -200,6 +201,13 @@ ctest --test-dir build-tests --output-on-failure
 注意：测试依赖 GoogleTest。如果系统没有可用的 GoogleTest，且仓库中
 没有准备 `third_party/deps_local/googletest-1.15.2`，CMake 会尝试从
 GitHub 获取。当前主要端到端验证方式是直接运行 `qwen_infer`。
+
+## Benchmark
+
+启用 `HYBRIDAI_BUILD_BENCHMARKS=ON` 可构建直接链接共享库的
+`hybridai_benchmark_runner`。Linux + HIP 下的延迟、串行吞吐测试及
+serving、prefix caching、MoE 的当前能力边界见
+[`benchmark/README.md`](benchmark/README.md)。
 
 ### Windows 默认构建（CPU + 测试）
 

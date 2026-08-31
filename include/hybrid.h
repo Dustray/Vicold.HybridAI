@@ -59,8 +59,13 @@ struct HYBRIDAI_API GenerationOptions {
 struct HYBRIDAI_API GenerationResult {
     std::vector<int64_t> token_ids;
     std::string text;
+    int64_t prompt_tokens = 0;
     double elapsed_seconds = 0.0;
+    double prefill_seconds = 0.0;
+    double time_to_first_token_seconds = 0.0;
+    double decode_seconds = 0.0;
     double decode_tokens_per_second = 0.0;
+    std::vector<double> decode_step_seconds;
 };
 
 class HYBRIDAI_API Generator {

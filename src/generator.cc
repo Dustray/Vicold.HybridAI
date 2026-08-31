@@ -117,6 +117,11 @@ ApiStatus Generator::generate(const GenerationOptions& options,
     using Clock = std::chrono::steady_clock;
     const auto start = Clock::now();
     int64_t decode_count = 0;
+    std::vector<double> decode_step_seconds;
+    decode_step_seconds.reserve(static_cast<size_t>(options.max_new_tokens));
+    double prefill_seconds = 0.0;
+    double first_token_seconds = 0.0;
+    Clock::time_point previous_token = start;
     for (int32_t step = 0; step < options.max_new_tokens; ++step) {
         const std::vector<int64_t> ids =
             step == 0 ? generated : std::vector<int64_t>{generated.back()};
@@ -230,7 +235,17 @@ ApiStatus Generator::generate(const GenerationOptions& options,
             }
         }
         generated.push_back(next);
-        if (step > 0) ++decode_count;
+        const auto token_completed = Clock::now();
+        if (step == 0) {
+            prefill_seconds = std::chrono::duration<double>(
+                token_completed - start).count();
+            first_token_seconds = prefill_seconds;
+        } else {
+            ++decode_count;
+            decode_step_seconds.push_back(std::chrono::duration<double>(
+                token_completed - previous_token).count());
+        }
+        previous_token = token_completed;
         if (std::binary_search(eos.begin(), eos.end(), next)) break;
     }
     const auto suffix = std::vector<int64_t>(generated.begin() +
@@ -238,9 +253,17 @@ ApiStatus Generator::generate(const GenerationOptions& options,
                                              generated.end());
     result->token_ids = suffix;
     result->text = impl_->tokenizer_.decode(suffix, true);
+    result->prompt_tokens = static_cast<int64_t>(prompt_count);
     result->elapsed_seconds = std::chrono::duration<double>(Clock::now() - start).count();
-    result->decode_tokens_per_second = decode_count > 0
-        ? static_cast<double>(decode_count) / result->elapsed_seconds : 0.0;
+    result->prefill_seconds = prefill_seconds;
+    result->time_to_first_token_seconds = first_token_seconds;
+    result->decode_step_seconds = std::move(decode_step_seconds);
+    result->decode_seconds = 0.0;
+    for (double seconds : result->decode_step_seconds) {
+        result->decode_seconds += seconds;
+    }
+    result->decode_tokens_per_second = result->decode_seconds > 0.0
+        ? static_cast<double>(decode_count) / result->decode_seconds : 0.0;
     return {};
 }
 

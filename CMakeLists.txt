@@ -56,7 +56,7 @@ if(HYBRIDAI_BUILD_TESTS)
 endif()
 
 if(HYBRIDAI_BUILD_BENCHMARKS)
-    add_subdirectory(benchmarks)
+    add_subdirectory(benchmark)
 endif()
 
 # Demo executables (simple inference examples without test framework)

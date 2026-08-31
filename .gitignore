@@ -7,6 +7,7 @@ third_party/deps_local/*
 /out/
 /cmake-build-*/
 /demo/build/
+/results/
 
 # CMake-generated Visual Studio projects and solutions
 *.vcxproj

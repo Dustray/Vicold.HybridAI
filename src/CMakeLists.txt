@@ -1,5 +1,6 @@
 target_sources(hybridai
     PRIVATE
+        generator.cc
         core/status.h
         core/dtype.h
         core/shape.h
@@ -29,6 +30,8 @@ target_sources(hybridai
         backends/cpu/cpu_backend.cc
         backends/cpu/cpu_backend_factory.cc
 )
+
+target_compile_definitions(hybridai PRIVATE HYBRIDAI_BUILDING_LIBRARY)
 
 target_link_libraries(hybridai
     PUBLIC

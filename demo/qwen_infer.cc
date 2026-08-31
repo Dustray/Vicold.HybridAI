@@ -374,6 +374,7 @@ Tensor qwen_deltanet_reference(const Tensor& input,
                                DeltaNetCache* cache = nullptr);
 } // namespace
 
+#ifndef HYBRIDAI_EMBEDDED_QWEN_INFER
 int main(int argc, char* argv[]) {
     // 尽早刷新，确保即使后续崩溃也能看到启动痕迹
     std::cout << "[qwen_infer] enter main, argc=" << argc << std::endl;
@@ -1205,6 +1206,7 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
+#endif
 
 namespace {
 

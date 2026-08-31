@@ -29,7 +29,7 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set_target_properties(hybridai PROPERTIES
         IMPORTED_LOCATION "${HYBRIDAI_LIBRARY}"
         INTERFACE_INCLUDE_DIRECTORIES
-            "${HYBRIDAI_ROOT}/src;${HYBRIDAI_ROOT}/third_party/nlohmann_json/include"
+            "${HYBRIDAI_ROOT}/include;${HYBRIDAI_ROOT}/src;${HYBRIDAI_ROOT}/third_party/nlohmann_json/include"
     )
 
     # qwen_infer contains optional direct HIP/rocBLAS diagnostics. Locate the
@@ -58,6 +58,9 @@ target_link_libraries(simple_infer PRIVATE hybridai)
 add_executable(qwen_infer qwen_infer.cc)
 target_link_libraries(qwen_infer PRIVATE hybridai)
 
+add_executable(generate generate.cc)
+target_link_libraries(generate PRIVATE hybridai)
+
 if(TARGET hip::host AND TARGET roc::rocblas)
     target_compile_definitions(qwen_infer PRIVATE HYBRIDAI_HAS_HIP)
     target_link_libraries(qwen_infer PRIVATE hip::host roc::rocblas)
@@ -66,13 +69,13 @@ endif()
 add_executable(test_tokenizer test_tokenizer.cc)
 target_link_libraries(test_tokenizer PRIVATE hybridai)
 
-set_target_properties(simple_infer qwen_infer test_tokenizer PROPERTIES
+set_target_properties(simple_infer qwen_infer generate test_tokenizer PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     get_filename_component(HYBRIDAI_LIBRARY_DIR "${HYBRIDAI_LIBRARY}" DIRECTORY)
-    set_target_properties(simple_infer qwen_infer test_tokenizer PROPERTIES
+    set_target_properties(simple_infer qwen_infer generate test_tokenizer PROPERTIES
         BUILD_RPATH "${HYBRIDAI_LIBRARY_DIR}"
     )
 endif()

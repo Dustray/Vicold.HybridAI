@@ -14,6 +14,21 @@
 			"isBackground": false,
 			"problemMatcher": ["$gcc"],
 			"group": "build"
+		},
+		{
+			"label": "Build Operator Benchmark",
+			"type": "process",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"build-operator-benchmark",
+				"--target",
+				"hybridai_operator_benchmark",
+				"--parallel"
+			],
+			"isBackground": false,
+			"problemMatcher": ["$gcc"],
+			"group": "build"
 		}
 	]
 }

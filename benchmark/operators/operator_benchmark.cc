@@ -495,7 +495,9 @@ int run_cached_gqa(const Options& options,
     if (!measure(operation, backend.get(), stream.get(), start.get(), end.get(),
                  options.warmup, options.runs, &samples)) return 1;
     if (!check_typed_result(backend, output.get(), query_count, options.dtype,
-                            0.0f, 10.0f, "cached GQA")) {
+                            0.1f,
+                            options.dtype == DType::BF16 ? 2e-3f : 1e-4f,
+                            "cached GQA")) {
         return 1;
     }
     std::cout << std::fixed << std::setprecision(6)

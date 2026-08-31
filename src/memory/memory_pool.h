@@ -62,15 +62,20 @@ private:
         bool active = false;
     };
 
-    Backend* backend_ = nullptr;
+    struct ActiveBlock {
+        size_t bucket = 0;
+        size_t size = 0;
+    };
+
+    std::unique_ptr<Allocator> allocator_;
     MemoryType type_;
     Options options_;
 
     std::vector<size_t> bucket_sizes_;
     // bucket_index -> list of free blocks
     std::map<size_t, std::list<Block>> free_blocks_;
-    // ptr -> (bucket_index, iterator into free_blocks_)
-    std::map<void*, std::pair<size_t, std::list<Block>::iterator>> active_blocks_;
+    // ptr -> allocation metadata
+    std::map<void*, ActiveBlock> active_blocks_;
 
     mutable std::mutex mutex_;
     size_t pooled_bytes_ = 0;

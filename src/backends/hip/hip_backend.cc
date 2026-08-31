@@ -4,6 +4,7 @@
 #endif
 
 #include "backends/hip/hip_backend.h"
+#include "memory/memory_pool.h"
 
 #ifdef HYBRIDAI_HAS_HIP_KERNELS
 #include "backends/hip/hip_kernels.h"
@@ -245,6 +246,8 @@ hipMemcpyKind copy_direction(MemoryType dst, MemoryType src) {
 struct HipBackend::Impl {
 #ifdef HYBRIDAI_HAS_HIP
     std::shared_ptr<void> rocblas;
+    std::mutex pool_mutex;
+    std::unordered_map<MemoryType, std::shared_ptr<memory::MemoryPool>> pools;
 #endif
 };
 
@@ -404,14 +407,34 @@ std::shared_ptr<Buffer> HipBackend::create_buffer(size_t size,
     if (hipSetDevice(device_.id()) != hipSuccess) {
         return nullptr;
     }
-    auto allocator = create_allocator(type);
+
+    std::shared_ptr<memory::MemoryPool> allocator;
+    {
+        std::lock_guard<std::mutex> lock(impl_->pool_mutex);
+        auto found = impl_->pools.find(type);
+        if (found == impl_->pools.end()) {
+            memory::MemoryPool::Options options;
+            // Decode activations are small and highly repetitive. Keep large
+            // persistent model weights on exact direct allocations so bucket
+            // rounding does not inflate the resident model footprint.
+            options.max_bucket_size = 8 * 1024 * 1024;
+            options.bucket_growth = 1.25;
+            options.max_pooled_bytes = 256 * 1024 * 1024;
+            allocator = std::make_shared<memory::MemoryPool>(this, type,
+                                                              options);
+            impl_->pools.emplace(type, allocator);
+        } else {
+            allocator = found->second;
+        }
+    }
+
     void* ptr = nullptr;
     Status status = allocator->allocate(size, &ptr);
     if (!status.ok()) {
         return nullptr;
     }
-    auto deleter = [allocator = std::move(allocator)](void* p) mutable {
-        allocator->deallocate(p);
+    auto deleter = [allocator](void* p) {
+        (void)allocator->deallocate(p);
     };
     return std::shared_ptr<Buffer>(
         new HipBuffer(ptr, size, device_, type),

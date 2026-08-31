@@ -3,6 +3,7 @@
 #include "ops/registry.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 
 namespace hybridai {
@@ -62,6 +63,8 @@ class HostEvent final : public Event {
 public:
     Status record(Stream* stream) override {
         (void)stream;
+        timestamp_ = Clock::now();
+        recorded_ = true;
         return Status::OK();
     }
     Status wait(Stream* stream) override {
@@ -69,6 +72,28 @@ public:
         return Status::OK();
     }
     Status synchronize() override { return Status::OK(); }
+
+    Status elapsed_time_since(const Event& start,
+                              double* milliseconds) const override {
+        if (milliseconds == nullptr) {
+            return Status(StatusCode::InvalidArgument,
+                          "CPU event output cannot be null");
+        }
+        const auto* begin = dynamic_cast<const HostEvent*>(&start);
+        if (begin == nullptr || !begin->recorded_ || !recorded_) {
+            return Status(StatusCode::InvalidArgument,
+                          "CPU events must be recorded before timing");
+        }
+        *milliseconds = std::chrono::duration<double, std::milli>(
+                            timestamp_ - begin->timestamp_)
+                            .count();
+        return Status::OK();
+    }
+
+private:
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point timestamp_{};
+    bool recorded_ = false;
 };
 
 // Naive FP32 GEMM for reference / CPU fallback

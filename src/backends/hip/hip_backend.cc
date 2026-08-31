@@ -168,6 +168,24 @@ public:
         return hip_error_to_status(hipEventSynchronize(event_));
     }
 
+    Status elapsed_time_since(const Event& start,
+                              double* milliseconds) const override {
+        if (milliseconds == nullptr) {
+            return Status(StatusCode::InvalidArgument,
+                          "HIP event output cannot be null");
+        }
+        const auto* begin = dynamic_cast<const HipEvent*>(&start);
+        if (begin == nullptr || begin->event_ == nullptr || event_ == nullptr) {
+            return Status(StatusCode::InvalidArgument,
+                          "HIP events must belong to the same HIP backend");
+        }
+        float elapsed = 0.0f;
+        Status status = hip_error_to_status(
+            hipEventElapsedTime(&elapsed, begin->event_, event_));
+        if (status.ok()) *milliseconds = static_cast<double>(elapsed);
+        return status;
+    }
+
 private:
     hipEvent_t event_ = nullptr;
 };
@@ -204,6 +222,10 @@ public:
 class HipStream final : public Stream {
 public:
     Status synchronize() override {
+        return Status(StatusCode::BackendError,
+                      "HIP backend compiled without HIP support");
+    }
+    Status elapsed_time_since(const Event&, double*) const override {
         return Status(StatusCode::BackendError,
                       "HIP backend compiled without HIP support");
     }

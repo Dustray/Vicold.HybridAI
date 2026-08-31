@@ -49,6 +49,11 @@ public:
     virtual Status record(Stream* stream) = 0;
     virtual Status wait(Stream* stream) = 0;
     virtual Status synchronize() = 0;
+    // Return elapsed time from `start` to this event in milliseconds. Both
+    // events must belong to the same backend and have been recorded in a
+    // compatible stream/context.
+    virtual Status elapsed_time_since(const Event& start,
+                                      double* milliseconds) const = 0;
 };
 
 // Abstract device buffer handle

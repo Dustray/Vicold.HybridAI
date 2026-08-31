@@ -19,6 +19,7 @@ option(BUILD_SHARED_LIBS "Build HybridAI as a shared library" ON)
 option(HYBRIDAI_BUILD_TESTS "Build unit tests" OFF)
 option(HYBRIDAI_BUILD_CLI "Build command line interface" OFF)
 option(HYBRIDAI_BUILD_BENCHMARKS "Build benchmarks" OFF)
+option(HYBRIDAI_BUILD_OPERATOR_BENCHMARKS "Build operator microbenchmarks" OFF)
 option(HYBRIDAI_BUILD_DEMOS "Build demo executables" OFF)
 set(HYBRIDAI_HIP_ARCHITECTURES "gfx936" CACHE STRING
     "Semicolon-separated AMD GPU architectures for custom HIP kernels")
@@ -57,6 +58,10 @@ endif()
 
 if(HYBRIDAI_BUILD_BENCHMARKS)
     add_subdirectory(benchmark)
+endif()
+
+if(HYBRIDAI_BUILD_OPERATOR_BENCHMARKS)
+    add_subdirectory(benchmark/operators)
 endif()
 
 # Demo executables (simple inference examples without test framework)

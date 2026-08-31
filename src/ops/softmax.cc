@@ -33,7 +33,7 @@ Tensor Softmax::forward(const Tensor& input, Stream* stream) {
         return Tensor();
     }
 
-    auto backend = BackendRegistry::instance().create_backend(input.device());
+    auto backend = BackendRegistry::instance().get_backend(input.device());
     if (backend == nullptr) {
         return Tensor();
     }

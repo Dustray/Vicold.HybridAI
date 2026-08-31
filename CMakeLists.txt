@@ -20,6 +20,8 @@ option(HYBRIDAI_BUILD_TESTS "Build unit tests" OFF)
 option(HYBRIDAI_BUILD_CLI "Build command line interface" OFF)
 option(HYBRIDAI_BUILD_BENCHMARKS "Build benchmarks" OFF)
 option(HYBRIDAI_BUILD_DEMOS "Build demo executables" OFF)
+set(HYBRIDAI_HIP_ARCHITECTURES "gfx936" CACHE STRING
+    "Semicolon-separated AMD GPU architectures for custom HIP kernels")
 
 if(NOT HYBRIDAI_ENABLE_HIP AND NOT HYBRIDAI_ENABLE_CUDA AND NOT HYBRIDAI_ENABLE_CPU)
     message(FATAL_ERROR "At least one backend must be enabled (CPU/CUDA/HIP).")

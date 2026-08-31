@@ -8,6 +8,8 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+
 namespace hybridai {
 namespace {
 

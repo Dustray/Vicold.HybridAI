@@ -49,7 +49,7 @@ Status FP8Dequantizer::dequantize(const Tensor& input, Tensor* output,
                       "FP8Dequantizer scales must be an FP32 tensor");
     }
 
-    auto backend = BackendRegistry::instance().create_backend(input.device());
+    auto backend = BackendRegistry::instance().get_backend(input.device());
     if (backend == nullptr) {
         return Status(StatusCode::InvalidDevice,
                       "No backend available for FP8 dequantization");
@@ -114,7 +114,7 @@ Status FP8Dequantizer::dequantize_2d(const Tensor& input,
                       "2D FP8 scale shape does not match input blocks");
     }
 
-    auto backend = BackendRegistry::instance().create_backend(input.device());
+    auto backend = BackendRegistry::instance().get_backend(input.device());
     if (backend == nullptr) {
         return Status(StatusCode::InvalidDevice,
                       "No backend available for FP8 dequantization");

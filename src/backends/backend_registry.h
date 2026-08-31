@@ -15,6 +15,7 @@ public:
 
     void register_backend(std::string_view name, BackendFactory factory);
     std::unique_ptr<Backend> create_backend(const Device& device);
+    std::shared_ptr<Backend> get_backend(const Device& device);
 
     bool has_backend(std::string_view name) const;
 
@@ -27,6 +28,7 @@ private:
 
     mutable std::mutex mutex_;
     std::unordered_map<std::string, BackendFactory> factories_;
+    std::unordered_map<std::string, std::shared_ptr<Backend>> backends_;
 };
 
 // Explicitly initialize all built-in backends. Call this in executables

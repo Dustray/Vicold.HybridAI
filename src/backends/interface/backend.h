@@ -112,6 +112,99 @@ public:
                         int64_t m, int64_t n, int64_t k, float alpha,
                         float beta, Stream* stream = nullptr) = 0;
 
+    // Typed tensor kernels used by inference hot paths. Backends that do not
+    // provide native implementations return NotImplemented so ops can retain
+    // their CPU reference fallback without exposing native GPU APIs.
+    virtual Status cast(Buffer*, const Buffer*, DType, DType, int64_t,
+                        Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented, "Backend cast unavailable");
+    }
+    virtual Status add(Buffer*, const Buffer*, const Buffer*, DType, int64_t,
+                       Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented, "Backend add unavailable");
+    }
+    virtual Status embedding_gather(Buffer*, const Buffer*, const Buffer*,
+                                    DType, int64_t, int64_t, int64_t,
+                                    Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend embedding gather unavailable");
+    }
+    virtual Status rmsnorm(Buffer*, const Buffer*, const Buffer*, DType,
+                           int64_t, int64_t, float, bool,
+                           Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend RMSNorm unavailable");
+    }
+    virtual Status unary(Buffer*, const Buffer*, DType, int64_t, int, float,
+                         Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend unary kernel unavailable");
+    }
+    virtual Status silu_mul(Buffer*, const Buffer*, const Buffer*, DType,
+                            int64_t, Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend fused SiLU multiply unavailable");
+    }
+    virtual Status split_q_gate(Buffer*, Buffer*, const Buffer*, DType,
+                                int64_t, int64_t, int64_t,
+                                Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend query/gate split unavailable");
+    }
+    virtual Status partial_rope(Buffer*, const Buffer*, DType, int64_t,
+                                int64_t, int64_t, int64_t, int64_t, float,
+                                Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend partial RoPE unavailable");
+    }
+    virtual Status causal_gqa(Buffer*, const Buffer*, const Buffer*,
+                              const Buffer*, const Buffer*, DType, int64_t,
+                              int64_t, int64_t, int64_t,
+                              Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend causal GQA unavailable");
+    }
+    virtual Status append_kv_cache(Buffer*, Buffer*, const Buffer*,
+                                   const Buffer*, DType, int64_t, int64_t,
+                                   int64_t, int64_t, int64_t,
+                                   Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend KV cache append unavailable");
+    }
+    virtual Status cached_gqa(Buffer*, const Buffer*, const Buffer*,
+                              const Buffer*, const Buffer*, DType, int64_t,
+                              int64_t, int64_t, int64_t, int64_t,
+                              Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend cached GQA unavailable");
+    }
+    virtual Status causal_conv1d_silu(Buffer*, Buffer*, const Buffer*,
+                                      const Buffer*, DType, int64_t, int64_t,
+                                      int64_t, Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend causal conv1d unavailable");
+    }
+    virtual Status deltanet_grouped_conv(
+        Buffer*, Buffer*, Buffer*, Buffer*, const Buffer*, const Buffer*,
+        DType, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+        Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend grouped DeltaNet conv unavailable");
+    }
+    virtual Status deltanet_recurrent(
+        Buffer*, Buffer*, const Buffer*, const Buffer*, const Buffer*,
+        const Buffer*, const Buffer*, const Buffer*, const Buffer*,
+        const Buffer*, const Buffer*, DType, int64_t, int64_t, int64_t,
+        int64_t, int64_t, float, Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend DeltaNet recurrent kernel unavailable");
+    }
+    virtual Status argmax_last_row(Buffer*, const Buffer*, DType, int64_t,
+                                   int64_t, Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend argmax unavailable");
+    }
+
     // Kernel registration hook. Backends may pre-register custom kernels (e.g.
     // hand-written tile kernels) into the global KernelRegistry during
     // construction. This keeps kernel selection in ops/ independent of the

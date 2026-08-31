@@ -47,7 +47,7 @@ Tensor Tensor::to(Device target) const {
         return Tensor(shape_, dtype_, target, nullptr);
     }
 
-    auto backend = BackendRegistry::instance().create_backend(target);
+    auto backend = BackendRegistry::instance().get_backend(target);
     if (backend == nullptr) {
         return Tensor(); // invalid/unsupported target
     }
@@ -84,7 +84,7 @@ Tensor Tensor::contiguous() const {
         return *this;
     }
 
-    auto backend = BackendRegistry::instance().create_backend(device_);
+    auto backend = BackendRegistry::instance().get_backend(device_);
     if (backend == nullptr) {
         return Tensor();
     }

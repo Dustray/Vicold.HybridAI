@@ -91,7 +91,65 @@ if(HYBRIDAI_ENABLE_HIP)
             # Expose ROCm headers to consumers as well.
             target_include_directories(hybridai PUBLIC "${HYBRIDAI_ROCM_INCLUDE}")
         else()
-            target_sources(hybridai PRIVATE hip_backend.cc)
+            # Compile device kernels with hipcc while keeping the project CXX
+            # only. This works with normal `cmake ..` builds even when the host
+            # compiler is GCC/Clang, and avoids requiring CMake HIP language
+            # support from vendor-specific SDK packages.
+            if(NOT HYBRIDAI_HIPCC)
+                find_program(HYBRIDAI_HIPCC NAMES hipcc
+                             HINTS "${HYBRIDAI_ROCM_ROOT}/bin")
+            endif()
+            if(NOT HYBRIDAI_HIPCC)
+                message(FATAL_ERROR "HIP was found but hipcc is unavailable")
+            endif()
+
+            set(HYBRIDAI_HIP_KERNEL_SOURCE
+                "${CMAKE_CURRENT_SOURCE_DIR}/hip_kernels.hip")
+            set(HYBRIDAI_HIP_KERNEL_OBJECT
+                "${CMAKE_CURRENT_BINARY_DIR}/hip_kernels.hip.o")
+            set(HYBRIDAI_HIP_KERNEL_ARCH_FLAGS)
+            set(HYBRIDAI_EFFECTIVE_HIP_ARCHITECTURES
+                "${HYBRIDAI_HIP_ARCHITECTURES}")
+            if(CMAKE_HIP_ARCHITECTURES)
+                set(HYBRIDAI_EFFECTIVE_HIP_ARCHITECTURES
+                    "${CMAKE_HIP_ARCHITECTURES}")
+            endif()
+            foreach(HYBRIDAI_HIP_ARCH IN LISTS
+                    HYBRIDAI_EFFECTIVE_HIP_ARCHITECTURES)
+                list(APPEND HYBRIDAI_HIP_KERNEL_ARCH_FLAGS
+                    "--offload-arch=${HYBRIDAI_HIP_ARCH}")
+            endforeach()
+            message(STATUS "HybridAI HIP kernel architectures: "
+                           "${HYBRIDAI_EFFECTIVE_HIP_ARCHITECTURES}")
+            add_custom_command(
+                OUTPUT "${HYBRIDAI_HIP_KERNEL_OBJECT}"
+                COMMAND "${HYBRIDAI_HIPCC}" -std=c++20 -fPIC
+                    ${HYBRIDAI_HIP_KERNEL_ARCH_FLAGS}
+                    "-I${PROJECT_SOURCE_DIR}/src"
+                        -c "${HYBRIDAI_HIP_KERNEL_SOURCE}"
+                        -o "${HYBRIDAI_HIP_KERNEL_OBJECT}"
+                DEPENDS
+                    "${HYBRIDAI_HIP_KERNEL_SOURCE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/hip_kernels.h"
+                VERBATIM
+                COMMAND_EXPAND_LISTS
+                COMMENT "Compiling HybridAI HIP kernels"
+            )
+            add_custom_target(hybridai_hip_kernels
+                DEPENDS "${HYBRIDAI_HIP_KERNEL_OBJECT}")
+            add_dependencies(hybridai hybridai_hip_kernels)
+            set_source_files_properties(
+                "${HYBRIDAI_HIP_KERNEL_OBJECT}"
+                PROPERTIES
+                    GENERATED TRUE
+                    EXTERNAL_OBJECT TRUE
+            )
+            target_sources(hybridai PRIVATE
+                hip_backend.cc
+                hip_kernels.h
+                "${HYBRIDAI_HIP_KERNEL_OBJECT}"
+            )
+            target_compile_definitions(hybridai PRIVATE HYBRIDAI_HAS_HIP_KERNELS)
         endif()
         target_link_libraries(hybridai
             PUBLIC

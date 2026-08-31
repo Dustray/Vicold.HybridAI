@@ -97,7 +97,7 @@ Tensor Linear::forward(const Tensor& input, const Tensor& weight,
         // For now fall through to backend gemm.
     }
 
-    auto backend = BackendRegistry::instance().create_backend(input.device());
+    auto backend = BackendRegistry::instance().get_backend(input.device());
     if (backend == nullptr) {
         return Tensor();
     }

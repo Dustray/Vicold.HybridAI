@@ -6,6 +6,19 @@
 namespace hybridai {
 namespace ops {
 
+struct AttentionKVCache {
+    Tensor key;
+    Tensor value;
+    int64_t length = 0;
+    int64_t capacity = 0;
+
+    bool initialized() const noexcept {
+        return key.buffer() != nullptr && value.buffer() != nullptr;
+    }
+
+    void reset() noexcept { length = 0; }
+};
+
 // Gated GQA Attention for Qwen3.8 (standard attention layer).
 //
 // Hyperparameters from Qwen3.8-27B-FP8:
@@ -38,12 +51,38 @@ public:
                           const Tensor& k_norm = Tensor(),
                           float rms_norm_eps = 1.0e-6f);
 
+    // Stateful GPU forward. On the first call the cache is allocated for
+    // max_seq_len tokens; subsequent calls append only the new K/V rows.
+    // input may contain a full prompt (prefill) or one token (decode).
+    static Tensor forward_cached(const Tensor& input,
+                                 const Tensor& wq, const Tensor& wk,
+                                 const Tensor& wv, const Tensor& wo,
+                                 int64_t num_q_heads, int64_t num_kv_heads,
+                                 int64_t head_dim, int64_t rope_head_dim,
+                                 int64_t max_seq_len, AttentionKVCache* cache,
+                                 float rope_base = 10000.0f,
+                                 Stream* stream = nullptr,
+                                 const Tensor& q_norm = Tensor(),
+                                 const Tensor& k_norm = Tensor(),
+                                 float rms_norm_eps = 1.0e-6f);
+
     static Status validate(const Tensor& input,
                            const Tensor& wq, const Tensor& wk,
                            const Tensor& wv, const Tensor& wo,
                            int64_t num_q_heads, int64_t num_kv_heads,
                            int64_t head_dim, int64_t rope_head_dim,
                            float rope_base);
+
+private:
+    static Tensor forward_impl(const Tensor& input,
+                               const Tensor& wq, const Tensor& wk,
+                               const Tensor& wv, const Tensor& wo,
+                               int64_t num_q_heads, int64_t num_kv_heads,
+                               int64_t head_dim, int64_t rope_head_dim,
+                               float rope_base, Stream* stream,
+                               const Tensor& q_norm, const Tensor& k_norm,
+                               float rms_norm_eps, int64_t max_seq_len,
+                               AttentionKVCache* cache);
 };
 
 } // namespace ops

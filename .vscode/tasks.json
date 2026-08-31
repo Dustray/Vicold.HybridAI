@@ -4,7 +4,7 @@
 		{
 			"label": "Build HybridAI Debug",
 			"type": "process",
-			"command": "C:\\Program Files\\CMake\\bin\\cmake.exe",
+			"command": "cmake",
 			"args": [
 				"--build",
 				"build",
@@ -12,9 +12,7 @@
 				"Debug"
 			],
 			"isBackground": false,
-			"problemMatcher": [
-				"$msCompile"
-			],
+			"problemMatcher": ["$gcc"],
 			"group": "build"
 		}
 	]

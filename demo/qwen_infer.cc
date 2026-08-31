@@ -4,7 +4,12 @@
 // 当前 HIP 路径已将完整文本权重按连续层加载到最多八张离散 GPU；后续
 // 在此入口接入 BF16 kernel、partition activation 传输和 prefill/decode。
 //
+// 编译：cmake --build .. --target qwen_infer --parallel
+//
 // 用法：qwen_infer <model_dir> [backend=cpu|hip] [max_devices=8]
+// 运行示例（在项目根目录执行）：
+//   LD_LIBRARY_PATH="$PWD/build:${LD_LIBRARY_PATH:-}" \
+//       ./demo/build/bin/qwen_infer /path/to/Qwen3.8-27B hip 8
 
 #include "backends/backend_registry.h"
 #include "core/device.h"
@@ -19,6 +24,7 @@
 #include "ops/fp8_dequant.h"
 #include "ops/elementwise.h"
 #include "ops/attention.h"
+#include "ops/delta_net.h"
 #include "tokenizer/qwen_tokenizer.h"
 #include "ops/linear.h"
 #include "ops/rmsnorm.h"
@@ -198,29 +204,31 @@ Status lookup_embedding(const Tensor& embedding, const std::vector<int64_t>& ids
                       "Failed to allocate embedding output");
     }
 
-    const size_t embedding_bytes =
-        static_cast<size_t>(embedding.shape().numel()) *
-        SizeOfDType(DType::BF16);
-    std::vector<uint16_t> host_embedding(
-        static_cast<size_t>(embedding.shape().numel()));
-    Status status = backend->memcpy_d2h(
-        host_embedding.data(), embedding.buffer().get(), embedding_bytes);
-    if (!status.ok()) return status;
-
-    std::vector<uint16_t> host_output(
-        ids.size() * static_cast<size_t>(hidden_size));
-    for (size_t row = 0; row < ids.size(); ++row) {
-        const size_t source_offset =
-            static_cast<size_t>(ids[row]) *
-            static_cast<size_t>(hidden_size);
-        std::memcpy(host_output.data() +
-                        row * static_cast<size_t>(hidden_size),
-                    host_embedding.data() + source_offset, row_bytes);
+    Status status;
+    if (device.is_gpu()) {
+        auto ids_buffer = backend->create_buffer(
+            ids.size() * sizeof(int64_t), MemoryType::Device);
+        if (ids_buffer == nullptr) {
+            return Status(StatusCode::OutOfMemory,
+                          "Failed to allocate embedding ids");
+        }
+        status = backend->memcpy_h2d(ids_buffer.get(), ids.data(),
+                                     ids.size() * sizeof(int64_t));
+        if (!status.ok()) return status;
+        status = backend->embedding_gather(
+            buffer.get(), embedding.buffer().get(), ids_buffer.get(),
+            DType::BF16, static_cast<int64_t>(ids.size()), vocab_size,
+            hidden_size);
+        if (!status.ok()) return status;
+    } else {
+        const auto* source = static_cast<const uint16_t*>(embedding.data());
+        auto* destination = static_cast<uint16_t*>(buffer->data());
+        for (size_t row = 0; row < ids.size(); ++row) {
+            std::memcpy(destination + row * static_cast<size_t>(hidden_size),
+                        source + static_cast<size_t>(ids[row]) * hidden_size,
+                        row_bytes);
+        }
     }
-
-    status = backend->memcpy_h2d(buffer.get(), host_output.data(),
-                                 output_bytes);
-    if (!status.ok()) return status;
 
     *output = Tensor(
         Shape{static_cast<int64_t>(ids.size()), hidden_size}, DType::BF16,
@@ -341,10 +349,6 @@ void inspect_tensor(const std::string& name, const Tensor& tensor) {
     std::cout << "] dtype=" << static_cast<int>(tensor.dtype()) << std::endl;
 }
 
-Tensor bf16_to_fp32(const Tensor& input, Backend* backend,
-                    const Device& device);
-Tensor fp32_to_bf16(const Tensor& input, Backend* backend,
-                    const Device& device);
 Tensor qwen_rmsnorm_reference(const Tensor& input, const Tensor& weight,
                               Backend* backend, const Device& device,
                               float eps = 1e-6f);
@@ -355,12 +359,14 @@ Tensor qwen_mlp_reference(const Tensor& input, const Qwen3LayerWeights& layer,
 Tensor qwen_attention_reference(const Tensor& input,
                                 const Qwen3LayerWeights& layer,
                                 Backend* backend, const Device& device,
-                                const Qwen3Config& config);
+                                const Qwen3Config& config,
+                                AttentionKVCache* cache = nullptr,
+                                int64_t max_cache_len = 0);
 Tensor qwen_deltanet_reference(const Tensor& input,
                                const Qwen3LayerWeights& layer,
                                Backend* backend, const Device& device,
-                               const Qwen3Config& config);
-
+                               const Qwen3Config& config,
+                               DeltaNetCache* cache = nullptr);
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -591,9 +597,25 @@ int main(int argc, char* argv[]) {
         }
         constexpr int kMaxNewTokens = 8;
         std::vector<int64_t> generated_ids = input_ids;
+        const int64_t max_cache_len =
+            static_cast<int64_t>(input_ids.size()) + kMaxNewTokens;
+        if (max_cache_len > config.max_position_embeddings) {
+            std::cerr << "[ERROR] Prompt plus generated tokens exceeds model "
+                         "context capacity" << std::endl;
+            return 1;
+        }
+        std::vector<AttentionKVCache> attention_caches(
+            static_cast<size_t>(config.num_hidden_layers));
+        std::vector<DeltaNetCache> deltanet_caches(
+            static_cast<size_t>(config.num_hidden_layers));
         for (int generation_step = 0; generation_step < kMaxNewTokens;
              ++generation_step) {
-            input_ids = generated_ids;
+            input_ids = generation_step == 0
+                ? generated_ids
+                : std::vector<int64_t>{generated_ids.back()};
+            std::cout << (generation_step == 0 ? "[Prefill] tokens="
+                                               : "[Decode] tokens=")
+                      << input_ids.size() << std::endl;
             Tensor embedded;
         status = lookup_embedding(
             weights.shared.embed_tokens, input_ids,
@@ -610,39 +632,16 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        const size_t embedded_bytes =
-            static_cast<size_t>(embedded.shape().numel()) *
-            SizeOfDType(DType::BF16);
-        std::vector<uint16_t> embedded_host(
-            static_cast<size_t>(embedded.shape().numel()));
-        status = embedding_backend->memcpy_d2h(
-            embedded_host.data(), embedded.buffer().get(), embedded_bytes);
-        if (!status.ok()) {
-            std::cerr << "[ERROR] Embedding D2H check failed: "
-                      << status.message() << std::endl;
-            return 1;
-        }
         std::cout << "Real BF16 embedding lookup ok: ["
                   << embedded.shape().dim(0) << ","
-                  << embedded.shape().dim(1) << "], D2H first value=0x"
-                  << std::hex << embedded_host.front() << std::dec
-                  << std::endl;
+                  << embedded.shape().dim(1) << "]" << std::endl;
 
-        // 首段真实前向：embedding -> input RMSNorm -> MLP -> residual。
-        // 目前 RMSNorm/激活仍是 FP32 reference，因此这里显式做 BF16/FP32
-        // staging；权重本身仍直接使用 GPU 上的真实 BF16 tensor。
+        // 真实前向全程保持模型原生 BF16 tensor；kernel 内部可以使用
+        // FP32 累加，但不创建 FP32 activation 或 weight staging tensor。
         const Qwen3LayerWeights& first_layer = weights.layers.front();
-        Tensor hidden_fp32 = bf16_to_fp32(
-            embedded, embedding_backend.get(), devices.front());
-        Tensor norm_input = bf16_to_fp32(
-            first_layer.input_layernorm, embedding_backend.get(), devices.front());
-        if (hidden_fp32.buffer() == nullptr || norm_input.buffer() == nullptr) {
-            std::cerr << "[ERROR] Failed to stage embedding/layer norm to FP32"
-                      << std::endl;
-            return 1;
-        }
         Tensor normalized = qwen_rmsnorm_reference(
-            hidden_fp32, norm_input, embedding_backend.get(), devices.front());
+            embedded, first_layer.input_layernorm, embedding_backend.get(),
+            devices.front(), config.rms_norm_eps);
         if (normalized.buffer() == nullptr) {
             std::cerr << "[ERROR] Real layer RMSNorm failed" << std::endl;
             return 1;
@@ -651,18 +650,18 @@ int main(int argc, char* argv[]) {
         if (first_layer.is_attention_layer) {
             linear_output = qwen_attention_reference(
                 normalized, first_layer, embedding_backend.get(), devices.front(),
-                config);
+                config, &attention_caches.front(), max_cache_len);
         } else {
             linear_output = qwen_deltanet_reference(
                 normalized, first_layer, embedding_backend.get(), devices.front(),
-                config);
+                config, &deltanet_caches.front());
         }
         if (linear_output.buffer() == nullptr) {
             std::cerr << "[ERROR] Real layer attention/DeltaNet failed" << std::endl;
             return 1;
         }
         Tensor layer0_output = make_residual(
-            hidden_fp32, linear_output, embedding_backend.get(),
+            embedded, linear_output, embedding_backend.get(),
             devices.front());
         if (layer0_output.buffer() == nullptr) {
             std::cerr << "[ERROR] Real layer residual failed" << std::endl;
@@ -674,27 +673,15 @@ int main(int argc, char* argv[]) {
                       << status.message() << std::endl;
             return 1;
         }
-        std::vector<float> layer0_host(static_cast<size_t>(layer0_output.numel()));
-        status = embedding_backend->memcpy_d2h(
-            layer0_host.data(), layer0_output.buffer().get(), layer0_output.nbytes());
-        if (!status.ok()) {
-            std::cerr << "[ERROR] Real layer D2H check failed: "
-                      << status.message() << std::endl;
-            return 1;
-        }
         std::cout << "Real layer 0 attention/DeltaNet path ok: output=["
                   << layer0_output.shape().dim(0) << ","
-                  << layer0_output.shape().dim(1) << "], first="
-                  << layer0_host.front() << std::endl;
+                  << layer0_output.shape().dim(1) << "]" << std::endl;
 
         // 补齐第 0 层的 post-mixer RMSNorm、MLP 和第二个 residual。
         // Decoder layer 的两个子层都必须执行，不能只验证第一个 mixer。
-        Tensor layer0_post_norm_weight = bf16_to_fp32(
-            first_layer.post_attention_layernorm, embedding_backend.get(),
-            devices.front());
         Tensor layer0_post_norm = qwen_rmsnorm_reference(
-            layer0_output, layer0_post_norm_weight, embedding_backend.get(),
-            devices.front(), config.rms_norm_eps);
+            layer0_output, first_layer.post_attention_layernorm,
+            embedding_backend.get(), devices.front(), config.rms_norm_eps);
         if (layer0_post_norm.buffer() == nullptr) {
             std::cerr << "[ERROR] Layer 0 post-mixer RMSNorm failed"
                       << std::endl;
@@ -707,24 +694,15 @@ int main(int argc, char* argv[]) {
             std::cerr << "[ERROR] Layer 0 MLP failed" << std::endl;
             return 1;
         }
-        Tensor layer0_mlp_fp32 = bf16_to_fp32(
-            layer0_mlp, embedding_backend.get(), devices.front());
         Tensor hidden_state = make_residual(
-            layer0_output, layer0_mlp_fp32, embedding_backend.get(),
+            layer0_output, layer0_mlp, embedding_backend.get(),
             devices.front());
         if (hidden_state.buffer() == nullptr) {
             std::cerr << "[ERROR] Layer 0 MLP residual failed" << std::endl;
             return 1;
         }
-        print_tensor_stats("layer0.output", layer0_output,
-                           embedding_backend.get());
-        print_tensor_stats("layer0.mlp", layer0_mlp_fp32,
-                           embedding_backend.get());
-        print_tensor_stats("layer0.hidden", hidden_state,
-                           embedding_backend.get());
-
         // 继续执行其余层的真实 Attention/DeltaNet、MLP 和残差路径。
-        // 这是便于数值对齐的单卡 reference path；尚未使用 KV/state cache。
+        // Prefill 后每一轮只处理最新 token，逐层复用 KV/state cache。
         for (int64_t layer_index = 1;
              layer_index < config.num_hidden_layers; ++layer_index) {
             const Qwen3LayerWeights& layer =
@@ -746,16 +724,9 @@ int main(int argc, char* argv[]) {
                     return 1;
                 }
             }
-            Tensor layer_norm = bf16_to_fp32(
-                layer.input_layernorm, layer_backend.get(), layer_device);
-            if (layer_norm.buffer() == nullptr) {
-                std::cerr << "[ERROR] Failed to stage layer " << layer_index
-                          << " input norm" << std::endl;
-                return 1;
-            }
             Tensor normalized_state = qwen_rmsnorm_reference(
-                hidden_state, layer_norm, layer_backend.get(),
-                layer_device);
+                hidden_state, layer.input_layernorm, layer_backend.get(),
+                layer_device, config.rms_norm_eps);
             if (normalized_state.buffer() == nullptr) {
                 std::cerr << "[ERROR] Layer " << layer_index
                           << " RMSNorm failed" << std::endl;
@@ -765,7 +736,9 @@ int main(int argc, char* argv[]) {
             if (layer.is_attention_layer) {
                 attention_output = qwen_attention_reference(
                     normalized_state, layer, layer_backend.get(),
-                    layer_device, config);
+                    layer_device, config,
+                    &attention_caches[static_cast<size_t>(layer_index)],
+                    max_cache_len);
                 if (attention_output.buffer() == nullptr) {
                     std::cerr << "[ERROR] Layer " << layer_index
                               << " attention failed" << std::endl;
@@ -779,12 +752,9 @@ int main(int argc, char* argv[]) {
                               << " attention residual failed" << std::endl;
                     return 1;
                 }
-                Tensor post_norm_weight = bf16_to_fp32(
-                    layer.post_attention_layernorm, layer_backend.get(),
-                    layer_device);
                 Tensor post_norm_state = qwen_rmsnorm_reference(
-                    hidden_state, post_norm_weight, layer_backend.get(),
-                    layer_device);
+                    hidden_state, layer.post_attention_layernorm,
+                    layer_backend.get(), layer_device, config.rms_norm_eps);
                 if (post_norm_state.buffer() == nullptr) {
                     std::cerr << "[ERROR] Layer " << layer_index
                               << " post-attention RMSNorm failed" << std::endl;
@@ -794,7 +764,8 @@ int main(int argc, char* argv[]) {
             } else {
                 attention_output = qwen_deltanet_reference(
                     normalized_state, layer, layer_backend.get(),
-                    layer_device, config);
+                    layer_device, config,
+                    &deltanet_caches[static_cast<size_t>(layer_index)]);
                 if (attention_output.buffer() == nullptr) {
                     std::cerr << "[ERROR] Layer " << layer_index
                               << " DeltaNet failed" << std::endl;
@@ -808,12 +779,9 @@ int main(int argc, char* argv[]) {
                               << " DeltaNet residual failed" << std::endl;
                     return 1;
                 }
-                Tensor post_norm_weight = bf16_to_fp32(
-                    layer.post_attention_layernorm, layer_backend.get(),
-                    layer_device);
                 Tensor post_norm_state = qwen_rmsnorm_reference(
-                    hidden_state, post_norm_weight, layer_backend.get(),
-                    layer_device);
+                    hidden_state, layer.post_attention_layernorm,
+                    layer_backend.get(), layer_device, config.rms_norm_eps);
                 if (post_norm_state.buffer() == nullptr) {
                     std::cerr << "[ERROR] Layer " << layer_index
                               << " post-DeltaNet RMSNorm failed" << std::endl;
@@ -828,24 +796,17 @@ int main(int argc, char* argv[]) {
                           << " MLP failed" << std::endl;
                 return 1;
             }
-            Tensor layer_mlp_fp32 = bf16_to_fp32(
-                layer_mlp, layer_backend.get(), layer_device);
             hidden_state = make_residual(
-                hidden_state, layer_mlp_fp32,
+                hidden_state, layer_mlp,
                 layer_backend.get(), layer_device);
             if (hidden_state.buffer() == nullptr) {
                 std::cerr << "[ERROR] Layer " << layer_index
                           << " residual failed" << std::endl;
                 return 1;
             }
-            if (layer_index == 1 || layer_index == 3 || layer_index == 4 ||
-                layer_index == 63) {
-                print_tensor_stats("layer.hidden", hidden_state,
-                                   layer_backend.get());
-            }
             if ((layer_index + 1) % 8 == 0 ||
                 layer_index + 1 == config.num_hidden_layers) {
-                std::cout << "  reference forward layers: "
+                std::cout << "  forward layers: "
                           << (layer_index + 1) << "/"
                           << config.num_hidden_layers << std::endl;
             }
@@ -867,23 +828,16 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
-        Tensor final_norm_weight = bf16_to_fp32(
-            weights.shared.final_norm, final_backend.get(), final_device);
-        if (final_norm_weight.buffer() == nullptr) {
-            std::cerr << "[ERROR] Failed to stage final norm" << std::endl;
-            return 1;
-        }
         Tensor final_hidden = qwen_rmsnorm_reference(
-            hidden_state, final_norm_weight, final_backend.get(), final_device);
-        Tensor final_hidden_bf16 = fp32_to_bf16(
-            final_hidden, final_backend.get(), final_device);
-        if (final_hidden_bf16.buffer() == nullptr) {
+            hidden_state, weights.shared.final_norm, final_backend.get(),
+            final_device, config.rms_norm_eps);
+        if (final_hidden.buffer() == nullptr) {
             std::cerr << "[ERROR] Final norm failed" << std::endl;
             return 1;
         }
 
         Tensor logits = Linear::forward(
-            final_hidden_bf16, weights.shared.lm_head, true);
+            final_hidden, weights.shared.lm_head, true);
         if (logits.buffer() == nullptr) {
             std::cerr << "[ERROR] Real lm_head failed" << std::endl;
             return 1;
@@ -894,36 +848,55 @@ int main(int argc, char* argv[]) {
                       << status.message() << std::endl;
             return 1;
         }
-        std::vector<uint16_t> logits_host(static_cast<size_t>(logits.numel()));
-        status = final_backend->memcpy_d2h(
-            logits_host.data(), logits.buffer().get(), logits.nbytes());
-        if (!status.ok()) {
-            std::cerr << "[ERROR] Logits D2H failed: " << status.message()
-                      << std::endl;
-            return 1;
-        }
-        const size_t last_offset =
-            (static_cast<size_t>(logits.shape().dim(0)) - 1) *
-            static_cast<size_t>(logits.shape().dim(1));
         int64_t next_id = 0;
         float best_logit = -std::numeric_limits<float>::infinity();
-        for (int64_t token = 0; token < logits.shape().dim(1); ++token) {
-            uint32_t bits = static_cast<uint32_t>(logits_host[
-                last_offset + static_cast<size_t>(token)]) << 16;
-            float value = 0.0f;
-            std::memcpy(&value, &bits, sizeof(float));
-            if (value > best_logit) {
-                best_logit = value;
-                next_id = token;
+        bool device_argmax = false;
+        if (logits.device().type() == DeviceType::DiscreteGPU) {
+            auto result_buffer = final_backend->create_buffer(
+                sizeof(int64_t), MemoryType::Device);
+            if (result_buffer != nullptr) {
+                status = final_backend->argmax_last_row(
+                    result_buffer.get(), logits.buffer().get(), logits.dtype(),
+                    logits.shape().dim(0), logits.shape().dim(1));
+                if (status.ok()) {
+                    status = final_backend->memcpy_d2h(
+                        &next_id, result_buffer.get(), sizeof(next_id));
+                    device_argmax = status.ok();
+                }
+            }
+        }
+        if (!device_argmax) {
+            std::vector<uint16_t> logits_host(
+                static_cast<size_t>(logits.numel()));
+            status = final_backend->memcpy_d2h(
+                logits_host.data(), logits.buffer().get(), logits.nbytes());
+            if (!status.ok()) {
+                std::cerr << "[ERROR] Logits D2H failed: " << status.message()
+                          << std::endl;
+                return 1;
+            }
+            const size_t last_offset =
+                (static_cast<size_t>(logits.shape().dim(0)) - 1) *
+                static_cast<size_t>(logits.shape().dim(1));
+            for (int64_t token = 0; token < logits.shape().dim(1); ++token) {
+                uint32_t bits = static_cast<uint32_t>(logits_host[
+                    last_offset + static_cast<size_t>(token)]) << 16;
+                float value = 0.0f;
+                std::memcpy(&value, &bits, sizeof(float));
+                if (value > best_logit) {
+                    best_logit = value;
+                    next_id = token;
+                }
             }
         }
         generated_ids.push_back(next_id);
-        std::cout << "Full reference forward + lm_head ok: logits=["
+        std::cout << "Full GPU forward + lm_head ok: logits=["
                   << logits.shape().dim(0) << "," << logits.shape().dim(1)
                   << "]" << std::endl;
         std::cout << "[Greedy step " << (generation_step + 1)
-              << "] id=" << next_id
-                  << ", logit=" << best_logit << std::endl;
+                  << "] id=" << next_id;
+        if (!device_argmax) std::cout << ", logit=" << best_logit;
+        std::cout << (device_argmax ? " (device argmax)" : "") << std::endl;
         }
         std::cout << "\n[Generated text]\n" << decode_ids(generated_ids)
               << std::endl;
@@ -1147,133 +1120,70 @@ int main(int argc, char* argv[]) {
 
 namespace {
 
-// 当前 HIP 算子仍以 FP32 host/unified tensor 为输入。这个适配器只用于
-// 单卡功能验证：把设备上的 BF16 tensor 复制到主机，转换为 FP32 后再上传。
-Tensor bf16_to_fp32(const Tensor& input, Backend* backend, const Device& device) {
-    if (backend == nullptr || input.dtype() != DType::BF16 ||
-        input.buffer() == nullptr) {
-        return Tensor();
-    }
-    std::vector<uint16_t> src(static_cast<size_t>(input.numel()));
-    if (!backend->memcpy_d2h(src.data(), input.buffer().get(), input.nbytes()).ok()) {
-        return Tensor();
-    }
-    std::vector<float> dst(src.size());
-    for (size_t i = 0; i < src.size(); ++i) {
-        uint32_t bits = static_cast<uint32_t>(src[i]) << 16;
-        std::memcpy(&dst[i], &bits, sizeof(float));
-    }
-    auto buffer = backend->create_buffer(dst.size() * sizeof(float), MemoryType::Unified);
-    if (buffer == nullptr || !backend->memcpy_h2d(buffer.get(), dst.data(),
-                                                   dst.size() * sizeof(float)).ok()) {
-        return Tensor();
-    }
-    return Tensor(input.shape(), DType::FP32, device, std::move(buffer));
-}
-
-Tensor fp32_to_bf16(const Tensor& input, Backend* backend,
-                    const Device& device) {
-    if (backend == nullptr || input.dtype() != DType::FP32 ||
-        input.buffer() == nullptr) {
-        return Tensor();
-    }
-    std::vector<float> src(static_cast<size_t>(input.numel()));
-    if (!backend->memcpy_d2h(src.data(), input.buffer().get(), input.nbytes()).ok()) {
-        return Tensor();
-    }
-    std::vector<uint16_t> dst(src.size());
-    for (size_t i = 0; i < src.size(); ++i) {
-        uint32_t bits = 0;
-        std::memcpy(&bits, &src[i], sizeof(float));
-        dst[i] = static_cast<uint16_t>(bits >> 16);
-    }
-    auto buffer = backend->create_buffer(dst.size() * sizeof(uint16_t), MemoryType::Device);
-    if (buffer == nullptr || !backend->memcpy_h2d(buffer.get(), dst.data(),
-                                                   dst.size() * sizeof(uint16_t)).ok()) {
-        return Tensor();
-    }
-    return Tensor(input.shape(), DType::BF16, device, std::move(buffer));
-}
-
 Tensor qwen_rmsnorm_reference(const Tensor& input, const Tensor& weight,
                               Backend* backend, const Device& device,
                               float eps) {
-    if (backend == nullptr || input.dtype() != DType::FP32 ||
-        weight.dtype() != DType::FP32 || input.buffer() == nullptr ||
+    if (backend == nullptr || input.dtype() != weight.dtype() ||
+        input.buffer() == nullptr ||
         weight.buffer() == nullptr || input.shape().ndim() == 0 ||
         weight.shape().ndim() != 1 ||
-        weight.shape().dim(0) != input.shape().dim(input.shape().ndim() - 1)) {
+        weight.shape().dim(0) != input.shape().dim(input.shape().ndim() - 1) ||
+        input.device() != device || weight.device() != device) {
         return Tensor();
     }
-    const int64_t hidden_size = input.shape().dim(input.shape().ndim() - 1);
-    const int64_t rows = input.numel() / hidden_size;
-    std::vector<float> x(static_cast<size_t>(input.numel()));
-    std::vector<float> w(static_cast<size_t>(weight.numel()));
-    if (!backend->memcpy_d2h(x.data(), input.buffer().get(), input.nbytes()).ok() ||
-        !backend->memcpy_d2h(w.data(), weight.buffer().get(), weight.nbytes()).ok()) {
-        return Tensor();
-    }
-    for (int64_t row = 0; row < rows; ++row) {
-        float mean_sq = 0.0f;
-        float* values = x.data() + static_cast<size_t>(row * hidden_size);
-        for (int64_t d = 0; d < hidden_size; ++d) mean_sq += values[d] * values[d];
-        const float inv_rms = 1.0f / std::sqrt(mean_sq / hidden_size + eps);
-        for (int64_t d = 0; d < hidden_size; ++d) {
-            values[d] = values[d] * inv_rms * (1.0f + w[static_cast<size_t>(d)]);
-        }
-    }
-    auto buffer = backend->create_buffer(x.size() * sizeof(float), MemoryType::Unified);
-    if (buffer == nullptr ||
-        !backend->memcpy_h2d(buffer.get(), x.data(), x.size() * sizeof(float)).ok()) {
-        return Tensor();
-    }
-    return Tensor(input.shape(), DType::FP32, device, std::move(buffer));
+    return RMSNorm::forward(input, weight, eps, nullptr, true);
 }
 
 Tensor make_residual(const Tensor& lhs, const Tensor& rhs, Backend* backend,
                      const Device& device) {
-    if (backend == nullptr || lhs.dtype() != DType::FP32 ||
-        rhs.dtype() != DType::FP32 || lhs.shape() != rhs.shape()) {
+    if (backend == nullptr || lhs.dtype() != rhs.dtype() ||
+        lhs.shape() != rhs.shape() || lhs.device() != device ||
+        rhs.device() != device || lhs.buffer() == nullptr ||
+        rhs.buffer() == nullptr) {
         return Tensor();
     }
     const size_t count = static_cast<size_t>(lhs.numel());
-    std::vector<float> a(count), b(count), out(count);
-    if (!backend->memcpy_d2h(a.data(), lhs.buffer().get(), lhs.nbytes()).ok() ||
-        !backend->memcpy_d2h(b.data(), rhs.buffer().get(), rhs.nbytes()).ok()) {
-        return Tensor();
+    auto buffer = backend->create_buffer(lhs.nbytes(),
+                                         device.is_gpu() ? MemoryType::Device
+                                                         : MemoryType::Host);
+    if (buffer == nullptr) return Tensor();
+    if (device.is_gpu()) {
+        Status status = backend->add(buffer.get(), lhs.buffer().get(),
+                                     rhs.buffer().get(), lhs.dtype(),
+                                     static_cast<int64_t>(count));
+        if (!status.ok()) return Tensor();
+    } else {
+        if (lhs.dtype() != DType::FP32) return Tensor();
+        const float* a = static_cast<const float*>(lhs.data());
+        const float* b = static_cast<const float*>(rhs.data());
+        float* out = static_cast<float*>(buffer->data());
+        for (size_t i = 0; i < count; ++i) out[i] = a[i] + b[i];
     }
-    for (size_t i = 0; i < count; ++i) out[i] = a[i] + b[i];
-    auto buffer = backend->create_buffer(count * sizeof(float), MemoryType::Unified);
-    if (buffer == nullptr || !backend->memcpy_h2d(buffer.get(), out.data(),
-                                                   out.size() * sizeof(float)).ok()) {
-        return Tensor();
-    }
-    return Tensor(lhs.shape(), DType::FP32, device, std::move(buffer));
+    return Tensor(lhs.shape(), lhs.dtype(), device, std::move(buffer));
 }
 
 Tensor qwen_mlp_reference(const Tensor& input, const Qwen3LayerWeights& layer,
                           Backend* backend, const Device& device) {
-    Tensor input_bf16 = fp32_to_bf16(input, backend, device);
-    if (input_bf16.buffer() == nullptr) {
-        std::cerr << "[MLP] FP32 -> BF16 activation conversion failed"
-                  << std::endl;
+    if (backend == nullptr || input.buffer() == nullptr ||
+        input.device() != device ||
+        input.dtype() != layer.mlp_gate_proj.values.dtype()) {
         return Tensor();
     }
-    Status validation = Linear::validate(input_bf16, layer.mlp_gate_proj.values, true,
+    Status validation = Linear::validate(input, layer.mlp_gate_proj.values, true,
                                          nullptr);
     if (!validation.ok()) {
         std::cerr << "[MLP] gate validation failed: " << validation.message()
                   << std::endl;
         return Tensor();
     }
-    validation = Linear::validate(input_bf16, layer.mlp_up_proj.values, true, nullptr);
+    validation = Linear::validate(input, layer.mlp_up_proj.values, true, nullptr);
     if (!validation.ok()) {
         std::cerr << "[MLP] up validation failed: " << validation.message()
                   << std::endl;
         return Tensor();
     }
-    Tensor gate = Linear::forward(input_bf16, layer.mlp_gate_proj.values, true);
-    Tensor up = Linear::forward(input_bf16, layer.mlp_up_proj.values, true);
+    Tensor gate = Linear::forward(input, layer.mlp_gate_proj.values, true);
+    Tensor up = Linear::forward(input, layer.mlp_up_proj.values, true);
     if (gate.buffer() == nullptr || up.buffer() == nullptr) {
         std::cerr << "[MLP] gate/up GEMM returned an empty tensor; gate shape=["
                   << layer.mlp_gate_proj.values.shape().dim(0) << ","
@@ -1282,23 +1192,7 @@ Tensor qwen_mlp_reference(const Tensor& input, const Qwen3LayerWeights& layer,
                   << std::endl;
         return Tensor();
     }
-    std::vector<float> gate_host(static_cast<size_t>(gate.numel()));
-    std::vector<float> up_host(static_cast<size_t>(up.numel()));
-    if (!backend->memcpy_d2h(gate_host.data(), gate.buffer().get(), gate.nbytes()).ok() ||
-        !backend->memcpy_d2h(up_host.data(), up.buffer().get(), up.nbytes()).ok()) {
-        return Tensor();
-    }
-    for (size_t i = 0; i < gate_host.size(); ++i) {
-        const float x = gate_host[i];
-        gate_host[i] = x / (1.0f + std::exp(-x)) * up_host[i];
-    }
-    auto act_fp32 = backend->create_buffer(gate_host.size() * sizeof(float), MemoryType::Unified);
-    if (act_fp32 == nullptr || !backend->memcpy_h2d(act_fp32.get(), gate_host.data(),
-                                                     gate_host.size() * sizeof(float)).ok()) {
-        return Tensor();
-    }
-    Tensor activated_fp32(gate.shape(), DType::FP32, device, std::move(act_fp32));
-    Tensor activated = fp32_to_bf16(activated_fp32, backend, device);
+    Tensor activated = Elementwise::silu_mul(gate, up);
     if (activated.buffer() == nullptr) return Tensor();
     validation = Linear::validate(activated, layer.mlp_down_proj.values, true,
                                   nullptr);
@@ -1320,7 +1214,9 @@ Tensor qwen_mlp_reference(const Tensor& input, const Qwen3LayerWeights& layer,
 Tensor qwen_attention_reference(const Tensor& input,
                                 const Qwen3LayerWeights& layer,
                                 Backend* backend, const Device& device,
-                                const Qwen3Config& config) {
+                                const Qwen3Config& config,
+                                AttentionKVCache* cache,
+                                int64_t max_cache_len) {
     (void)device;
     if (!layer.is_attention_layer || backend == nullptr) return Tensor();
     const Tensor& wq = layer.q_proj.values;
@@ -1347,6 +1243,13 @@ Tensor qwen_attention_reference(const Tensor& input,
                   << " o=" << describe(wo) << std::endl;
         return Tensor();
     }
+    if (cache != nullptr) {
+        return GatedGQAAttention::forward_cached(
+            input, wq, wk, wv, wo, config.num_attention_heads,
+            config.num_key_value_heads, config.head_dim,
+            config.rope_head_dim, max_cache_len, cache, config.rope_theta,
+            nullptr, layer.q_norm, layer.k_norm, config.rms_norm_eps);
+    }
     return GatedGQAAttention::forward(
         input, wq, wk, wv, wo, config.num_attention_heads,
         config.num_key_value_heads, config.head_dim, config.rope_head_dim,
@@ -1357,205 +1260,44 @@ Tensor qwen_attention_reference(const Tensor& input,
 Tensor qwen_deltanet_reference(const Tensor& input,
                                const Qwen3LayerWeights& layer,
                                Backend* backend, const Device& device,
-                               const Qwen3Config& config) {
+                               const Qwen3Config& config,
+                               DeltaNetCache* cache) {
+    DeltaNetCache local_cache;
+    DeltaNetCache* active_cache = cache == nullptr ? &local_cache : cache;
     if (backend == nullptr || input.buffer() == nullptr ||
-        input.dtype() != DType::FP32 || layer.in_proj_qkv.values.buffer() == nullptr ||
+        !input.device().is_gpu() || input.device() != device ||
+        input.dtype() != DType::BF16 || input.shape().ndim() != 2 ||
+        layer.in_proj_qkv.values.buffer() == nullptr ||
         layer.in_proj_z.values.buffer() == nullptr ||
-        layer.linear_out_proj.values.buffer() == nullptr) {
-        return Tensor();
-    }
+        layer.linear_out_proj.values.buffer() == nullptr) return Tensor();
     const int64_t qk_heads = config.linear_num_key_heads;
-    const int64_t v_heads = config.linear_num_value_heads;
-    const int64_t key_head_dim = config.linear_key_head_dim;
-    const int64_t value_head_dim = config.linear_value_head_dim;
-    const int64_t key_width = qk_heads * key_head_dim;
-    const int64_t v_width = v_heads * value_head_dim;
-    const int64_t seq_len = input.shape().dim(0);
-    if (input.shape().ndim() != 2 || input.shape().dim(1) != 5120 ||
-        layer.in_proj_qkv.values.shape().dim(0) != key_width * 2 + v_width ||
-        layer.in_proj_z.values.shape().dim(0) != v_width) {
-        return Tensor();
-    }
-
-    Tensor input_bf16 = fp32_to_bf16(input, backend, device);
-    if (input_bf16.buffer() == nullptr) return Tensor();
-    Tensor qkv_tensor = Linear::forward(input_bf16, layer.in_proj_qkv.values, true);
-    Tensor z = Linear::forward(input_bf16, layer.in_proj_z.values, true);
-    Tensor a_tensor = Linear::forward(input_bf16, layer.in_proj_a, true);
-    Tensor b_tensor = Linear::forward(input_bf16, layer.in_proj_b, true);
-    if (qkv_tensor.buffer() == nullptr || z.buffer() == nullptr ||
-        a_tensor.buffer() == nullptr || b_tensor.buffer() == nullptr) return Tensor();
-
-    std::vector<uint16_t> qkv_bf16(static_cast<size_t>(qkv_tensor.numel()));
-    std::vector<uint16_t> z_bf16(static_cast<size_t>(z.numel()));
-    if (!backend->memcpy_d2h(qkv_bf16.data(), qkv_tensor.buffer().get(), qkv_tensor.nbytes()).ok() ||
-        !backend->memcpy_d2h(z_bf16.data(), z.buffer().get(), z.nbytes()).ok()) {
-        return Tensor();
-    }
-    auto bf16_value = [](uint16_t x) {
-        uint32_t bits = static_cast<uint32_t>(x) << 16;
-        float value = 0.0f;
-        std::memcpy(&value, &bits, sizeof(value));
-        return value;
-    };
-    std::vector<float> qkv_values(static_cast<size_t>(qkv_tensor.numel()));
-    std::vector<float> zf(static_cast<size_t>(z.numel()));
-    for (size_t i = 0; i < qkv_values.size(); ++i) qkv_values[i] = bf16_value(qkv_bf16[i]);
-    for (size_t i = 0; i < zf.size(); ++i) zf[i] = bf16_value(z_bf16[i]);
-
-    // Transformers first views the projection as
-    // [num_key_heads, key_dim + key_dim + heads_per_group * value_dim]
-    // and only then splits q/k/v.  Therefore the checkpoint rows are grouped
-    // per key head, rather than stored as [all_q, all_k, all_v].  Rebuild the
-    // flat stream consumed by the causal depthwise convolution.
-    const int64_t heads_per_group = v_heads / qk_heads;
-    const int64_t group_value_width = heads_per_group * value_head_dim;
-    const int64_t group_width = key_head_dim * 2 + group_value_width;
-    const int64_t qkv_width = key_width * 2 + v_width;
-    std::vector<float> grouped_qkv = std::move(qkv_values);
-    qkv_values.assign(static_cast<size_t>(seq_len * qkv_width), 0.0f);
-    std::vector<float> grouped_z = std::move(zf);
-    zf.assign(static_cast<size_t>(seq_len * v_width), 0.0f);
-    for (int64_t t = 0; t < seq_len; ++t) {
-        const float* source = grouped_qkv.data() + t * qkv_width;
-        float* target = qkv_values.data() + t * qkv_width;
-        for (int64_t group = 0; group < qk_heads; ++group) {
-            const int64_t source_base = group * group_width;
-            std::memcpy(target + group * key_head_dim,
-                        source + source_base,
-                        static_cast<size_t>(key_head_dim) * sizeof(float));
-            std::memcpy(target + key_width + group * key_head_dim,
-                        source + source_base + key_head_dim,
-                        static_cast<size_t>(key_head_dim) * sizeof(float));
-            std::memcpy(target + key_width * 2 +
-                            group * group_value_width,
-                        source + source_base + key_head_dim * 2,
-                        static_cast<size_t>(group_value_width) * sizeof(float));
-            std::memcpy(zf.data() + t * v_width + group * group_value_width,
-                        grouped_z.data() + t * v_width +
-                            group * group_value_width,
-                        static_cast<size_t>(group_value_width) * sizeof(float));
-        }
-    }
-
-    // Apply the causal depthwise conv1d used by Qwen's DeltaNet input path.
-    // The weight is [10240, 1, 4]; zero-padding is used for the prefill prefix.
-    std::vector<float> conv(qkv_values.size(), 0.0f);
-    std::vector<uint16_t> conv_w_bf16(static_cast<size_t>(layer.conv1d_weight.numel()));
-    if (!backend->memcpy_d2h(conv_w_bf16.data(), layer.conv1d_weight.buffer().get(),
-                             layer.conv1d_weight.nbytes()).ok()) return Tensor();
-    for (int64_t t = 0; t < seq_len; ++t) {
-        for (int64_t c = 0; c < qkv_width; ++c) {
-            float value = 0.0f;
-            for (int64_t j = 0; j < 4; ++j) {
-                const int64_t source_t = t - 3 + j;
-                if (source_t >= 0 && source_t < seq_len) {
-                    value += qkv_values[static_cast<size_t>(source_t * qkv_width + c)] *
-                             bf16_value(conv_w_bf16[static_cast<size_t>(c * 4 + j)]);
-                }
-            }
-            // Qwen's causal depthwise convolution is followed by SiLU before
-            // splitting the stream into q, k and v.
-            conv[static_cast<size_t>(t * qkv_width + c)] =
-                value / (1.0f + std::exp(-value));
-        }
-    }
-
-    std::vector<uint16_t> a_bf16(static_cast<size_t>(a_tensor.numel()));
-    std::vector<uint16_t> b_bf16(static_cast<size_t>(b_tensor.numel()));
-    std::vector<uint16_t> alog_bf16(static_cast<size_t>(layer.a_log.numel()));
-    std::vector<uint16_t> dt_bf16(static_cast<size_t>(layer.dt_bias.numel()));
-    std::vector<uint16_t> norm_bf16(static_cast<size_t>(layer.linear_attn_norm.numel()));
-    if (!backend->memcpy_d2h(a_bf16.data(), a_tensor.buffer().get(), a_tensor.nbytes()).ok() ||
-        !backend->memcpy_d2h(b_bf16.data(), b_tensor.buffer().get(), b_tensor.nbytes()).ok() ||
-        !backend->memcpy_d2h(alog_bf16.data(), layer.a_log.buffer().get(), layer.a_log.nbytes()).ok() ||
-        !backend->memcpy_d2h(dt_bf16.data(), layer.dt_bias.buffer().get(), layer.dt_bias.nbytes()).ok() ||
-        !backend->memcpy_d2h(norm_bf16.data(), layer.linear_attn_norm.buffer().get(), layer.linear_attn_norm.nbytes()).ok()) return Tensor();
-    std::vector<float> a(static_cast<size_t>(seq_len * v_heads), 0.0f);
-    std::vector<float> beta(a.size(), 0.0f);
-    for (int64_t t = 0; t < seq_len; ++t) {
-        for (int64_t h = 0; h < v_heads; ++h) {
-            const int64_t group = h / heads_per_group;
-            const int64_t within = h % heads_per_group;
-            const size_t grouped_index = static_cast<size_t>(
-                t * v_heads + group * heads_per_group + within);
-            const float av = bf16_value(a_bf16[grouped_index]);
-            const float bv = bf16_value(b_bf16[grouped_index]);
-            a[static_cast<size_t>(t * v_heads + h)] = av;
-            beta[static_cast<size_t>(t * v_heads + h)] =
-                1.0f / (1.0f + std::exp(-bv));
-        }
-    }
-
-    std::vector<float> output(static_cast<size_t>(seq_len * v_width), 0.0f);
-    std::vector<float> state(static_cast<size_t>(v_heads * key_head_dim * value_head_dim), 0.0f);
-    for (int64_t t = 0; t < seq_len; ++t) {
-        for (int64_t vh = 0; vh < v_heads; ++vh) {
-            const int64_t qh = vh / 3;
-            // The recurrent decay is parameterized as
-            // exp(-exp(A_log) * softplus(a + dt_bias)).
-            const float decay_arg = bf16_value(dt_bf16[vh]) +
-                                    a[static_cast<size_t>(t * v_heads + vh)];
-            const float softplus_arg = std::max(decay_arg, 0.0f) +
-                                       std::log1p(std::exp(-std::abs(decay_arg)));
-            const float decay = std::exp(
-                -std::exp(bf16_value(alog_bf16[vh])) * softplus_arg);
-            float* s = state.data() + static_cast<size_t>(vh * key_head_dim * value_head_dim);
-            for (int64_t i = 0; i < key_head_dim * value_head_dim; ++i) s[i] *= decay;
-            const float* k = conv.data() + static_cast<size_t>(t * qkv_width + key_width + qh * key_head_dim);
-            const float* v = conv.data() + static_cast<size_t>(t * qkv_width + key_width * 2 + vh * value_head_dim);
-            const float b = beta[static_cast<size_t>(t * v_heads + vh)];
-            float* out = output.data() + static_cast<size_t>(t * v_width + vh * value_head_dim);
-            float q_norm = 0.0f;
-            float k_norm = 0.0f;
-            const float* q = conv.data() + static_cast<size_t>(t * qkv_width + qh * key_head_dim);
-            for (int64_t i = 0; i < key_head_dim; ++i) {
-                q_norm += q[i] * q[i];
-                k_norm += k[i] * k[i];
-            }
-            // Match transformers' FLA l2norm exactly: normalization is over
-            // the vector sum, not the RMS mean.
-            q_norm = 1.0f / std::sqrt(q_norm + 1e-6f);
-            k_norm = 1.0f / std::sqrt(k_norm + 1e-6f);
-            for (int64_t j = 0; j < value_head_dim; ++j) {
-                float retrieved = 0.0f;
-                for (int64_t i = 0; i < key_head_dim; ++i)
-                    retrieved += (k[i] * k_norm) * s[i * value_head_dim + j];
-                const float corrected = v[j] - b * retrieved;
-                for (int64_t i = 0; i < key_head_dim; ++i)
-                    s[i * value_head_dim + j] += b * (k[i] * k_norm) * corrected;
-            }
-            constexpr float query_scale = 1.0f / 11.313708498984761f;
-            for (int64_t j = 0; j < value_head_dim; ++j)
-                for (int64_t i = 0; i < key_head_dim; ++i)
-                    out[j] += (q[i] * q_norm * query_scale) * s[i * value_head_dim + j];
-            float rms = 0.0f;
-            for (int64_t j = 0; j < value_head_dim; ++j) rms += out[j] * out[j];
-            rms = 1.0f / std::sqrt(rms / value_head_dim + config.rms_norm_eps);
-            for (int64_t j = 0; j < value_head_dim; ++j) {
-                // DeltaNet uses RMSNormGated, whose learned weight is the
-                // ordinary multiplicative weight (unlike Qwen3.5's main
-                // decoder RMSNorm, which uses the (1 + weight) form).
-                out[j] *= rms * bf16_value(norm_bf16[static_cast<size_t>(j)]);
-            }
-        }
-    }
-    // z is the SiLU gate for the value stream.
-    for (size_t i = 0; i < output.size(); ++i) {
-        const float gate = zf[i];
-        output[i] *= gate / (1.0f + std::exp(-gate));
-    }
-    auto out_buf = backend->create_buffer(output.size() * sizeof(float), MemoryType::Unified);
-    if (out_buf == nullptr || !backend->memcpy_h2d(out_buf.get(), output.data(),
-                                                    output.size() * sizeof(float)).ok()) return Tensor();
-    Tensor recurrent(Shape{seq_len, v_width}, DType::FP32, device,
-                       std::move(out_buf));
-    Tensor recurrent_bf16 = fp32_to_bf16(
-        recurrent, backend, device);
-    if (recurrent_bf16.buffer() == nullptr) return Tensor();
+    const int64_t value_heads = config.linear_num_value_heads;
+    const int64_t key_dim = config.linear_key_head_dim;
+    const int64_t value_dim = config.linear_value_head_dim;
+    const int64_t tokens = input.shape().dim(0);
+    Tensor grouped_qkv = Linear::forward(
+        input, layer.in_proj_qkv.values, true);
+    Tensor z = Linear::forward(input, layer.in_proj_z.values, true);
+    Tensor a = Linear::forward(input, layer.in_proj_a, true);
+    Tensor b = Linear::forward(input, layer.in_proj_b, true);
+    if (grouped_qkv.buffer() == nullptr || z.buffer() == nullptr ||
+        a.buffer() == nullptr || b.buffer() == nullptr) return Tensor();
+    DeltaNetQKV qkv = GatedDeltaNet::grouped_causal_conv(
+        grouped_qkv, layer.conv1d_weight, qk_heads, value_heads, key_dim,
+        value_dim, config.linear_conv_kernel_dim, active_cache);
+    if (!qkv.valid()) return Tensor();
+    Tensor recurrent = GatedDeltaNet::recurrent(
+        qkv.query, qkv.key, qkv.value,
+        a.reshape(Shape{tokens, value_heads}),
+        b.reshape(Shape{tokens, value_heads}),
+        z.reshape(Shape{tokens, value_heads, value_dim}), layer.a_log,
+        layer.dt_bias, layer.linear_attn_norm, qk_heads, value_heads, key_dim,
+        value_dim, config.rms_norm_eps, active_cache);
+    if (recurrent.buffer() == nullptr) return Tensor();
     Tensor projected = Linear::forward(
-        recurrent_bf16, layer.linear_out_proj.values, true);
-    return bf16_to_fp32(projected, backend, device);
+        recurrent.reshape(Shape{tokens, value_heads * value_dim}),
+        layer.linear_out_proj.values, true);
+    return projected;
 }
 
 } // namespace

@@ -43,6 +43,71 @@ public:
                 bool trans_a, bool trans_b, int64_t m, int64_t n, int64_t k,
                 float alpha, float beta, Stream* stream) override;
 
+    Status cast(Buffer* dst, const Buffer* src, DType dst_type,
+                DType src_type, int64_t count, Stream* stream) override;
+    Status add(Buffer* dst, const Buffer* lhs, const Buffer* rhs, DType dtype,
+               int64_t count, Stream* stream) override;
+    Status embedding_gather(Buffer* dst, const Buffer* embedding,
+                            const Buffer* ids, DType dtype, int64_t num_ids,
+                            int64_t vocab_size, int64_t hidden_size,
+                            Stream* stream) override;
+    Status rmsnorm(Buffer* dst, const Buffer* src, const Buffer* weight,
+                   DType dtype, int64_t rows, int64_t hidden_size, float eps,
+                   bool add_unit_offset, Stream* stream) override;
+    Status unary(Buffer* dst, const Buffer* src, DType dtype, int64_t count,
+                 int op, float param, Stream* stream) override;
+    Status silu_mul(Buffer* dst, const Buffer* gate, const Buffer* up,
+                    DType dtype, int64_t count, Stream* stream) override;
+    Status split_q_gate(Buffer* query, Buffer* gate, const Buffer* source,
+                        DType dtype, int64_t rows, int64_t heads,
+                        int64_t head_dim, Stream* stream) override;
+    Status partial_rope(Buffer* dst, const Buffer* src, DType dtype,
+                        int64_t seq_len, int64_t num_heads,
+                        int64_t head_dim, int64_t rope_head_dim,
+                        int64_t position_offset, float base,
+                        Stream* stream) override;
+    Status causal_gqa(Buffer* dst, const Buffer* query, const Buffer* key,
+                      const Buffer* value, const Buffer* gate, DType dtype,
+                      int64_t seq_len, int64_t num_query_heads,
+                      int64_t num_kv_heads, int64_t head_dim,
+                      Stream* stream) override;
+    Status append_kv_cache(Buffer* key_cache, Buffer* value_cache,
+                           const Buffer* key, const Buffer* value, DType dtype,
+                           int64_t token_count, int64_t num_kv_heads,
+                           int64_t head_dim, int64_t cache_offset,
+                           int64_t cache_capacity,
+                           Stream* stream = nullptr) override;
+    Status cached_gqa(Buffer* dst, const Buffer* query,
+                      const Buffer* key_cache, const Buffer* value_cache,
+                      const Buffer* gate, DType dtype, int64_t query_len,
+                      int64_t cache_len, int64_t num_query_heads,
+                      int64_t num_kv_heads, int64_t head_dim,
+                      Stream* stream = nullptr) override;
+    Status causal_conv1d_silu(Buffer* dst, Buffer* conv_state,
+                              const Buffer* src, const Buffer* weight,
+                              DType dtype, int64_t token_count,
+                              int64_t channels, int64_t kernel_size,
+                              Stream* stream = nullptr) override;
+    Status deltanet_grouped_conv(
+        Buffer* query, Buffer* key, Buffer* value, Buffer* conv_state,
+        const Buffer* grouped_qkv, const Buffer* weight, DType dtype,
+        int64_t token_count, int64_t num_qk_heads,
+        int64_t num_value_heads, int64_t key_head_dim,
+        int64_t value_head_dim, int64_t kernel_size,
+        Stream* stream = nullptr) override;
+    Status deltanet_recurrent(
+        Buffer* dst, Buffer* recurrent_state, const Buffer* query,
+        const Buffer* key, const Buffer* value, const Buffer* a,
+        const Buffer* beta, const Buffer* a_log, const Buffer* dt_bias,
+        const Buffer* norm_weight, const Buffer* z, DType dtype,
+        int64_t token_count, int64_t num_qk_heads,
+        int64_t num_value_heads, int64_t key_head_dim,
+        int64_t value_head_dim, float eps,
+        Stream* stream = nullptr) override;
+    Status argmax_last_row(Buffer* dst, const Buffer* src, DType dtype,
+                           int64_t rows, int64_t columns,
+                           Stream* stream) override;
+
     void register_kernels() override;
 
 private:

@@ -40,7 +40,7 @@ Tensor RoPE::forward(const Tensor& input, int64_t head_dim,
         return Tensor();
     }
 
-    auto backend = BackendRegistry::instance().create_backend(input.device());
+    auto backend = BackendRegistry::instance().get_backend(input.device());
     if (backend == nullptr) {
         return Tensor();
     }
@@ -103,6 +103,61 @@ Tensor RoPE::forward(const Tensor& input, int64_t head_dim,
         }
     }
 
+    return Tensor(input.shape(), input.dtype(), input.device(),
+                  std::move(output_buffer));
+}
+
+Tensor RoPE::partial(const Tensor& input, int64_t rope_head_dim,
+                     int64_t position_offset, float base, Stream* stream) {
+    if (input.buffer() == nullptr || input.shape().ndim() != 3 ||
+        (input.dtype() != DType::FP32 && input.dtype() != DType::BF16) ||
+        rope_head_dim <= 0 || (rope_head_dim % 2) != 0 ||
+        rope_head_dim > input.shape().dim(2) || position_offset < 0 ||
+        base <= 0.0f) {
+        return Tensor();
+    }
+    auto backend = BackendRegistry::instance().get_backend(input.device());
+    if (backend == nullptr) return Tensor();
+    auto output_buffer = backend->create_buffer(input.nbytes(),
+                                                 input.buffer()->memory_type());
+    if (output_buffer == nullptr) return Tensor();
+    const int64_t seq_len = input.shape().dim(0);
+    const int64_t num_heads = input.shape().dim(1);
+    const int64_t head_dim = input.shape().dim(2);
+    if (input.device().type() != DeviceType::CPU) {
+        Status status = backend->partial_rope(
+            output_buffer.get(), input.buffer().get(), input.dtype(), seq_len,
+            num_heads, head_dim, rope_head_dim, position_offset, base, stream);
+        if (!status.ok()) return Tensor();
+        return Tensor(input.shape(), input.dtype(), input.device(),
+                      std::move(output_buffer));
+    }
+    if (input.dtype() != DType::FP32) return Tensor();
+    const float* src = static_cast<const float*>(input.data());
+    float* dst = static_cast<float*>(output_buffer->data());
+    const int64_t half = rope_head_dim / 2;
+    for (int64_t sequence = 0; sequence < seq_len; ++sequence) {
+        for (int64_t head = 0; head < num_heads; ++head) {
+            const float* source = src +
+                (sequence * num_heads + head) * head_dim;
+            float* target = dst + (sequence * num_heads + head) * head_dim;
+            std::memcpy(target, source,
+                        static_cast<size_t>(head_dim) * sizeof(float));
+            for (int64_t dimension = 0; dimension < half; ++dimension) {
+                const float theta =
+                    static_cast<float>(position_offset + sequence) /
+                    std::pow(base,
+                             2.0f * static_cast<float>(dimension) /
+                                 static_cast<float>(rope_head_dim));
+                const float cosine = std::cos(theta);
+                const float sine = std::sin(theta);
+                const float x = source[dimension];
+                const float y = source[dimension + half];
+                target[dimension] = x * cosine - y * sine;
+                target[dimension + half] = y * cosine + x * sine;
+            }
+        }
+    }
     return Tensor(input.shape(), input.dtype(), input.device(),
                   std::move(output_buffer));
 }

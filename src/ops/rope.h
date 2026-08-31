@@ -20,6 +20,11 @@ public:
     static Tensor forward(const Tensor& input, int64_t head_dim,
                         float base = 10000.0f, Stream* stream = nullptr);
 
+    static Tensor partial(const Tensor& input, int64_t rope_head_dim,
+                          int64_t position_offset = 0,
+                          float base = 10000.0f,
+                          Stream* stream = nullptr);
+
     static Status validate(const Tensor& input, int64_t head_dim, float base);
 };
 

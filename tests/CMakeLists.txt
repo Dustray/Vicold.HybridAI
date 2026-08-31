@@ -3,6 +3,7 @@ add_executable(hybridai_test
     core_test.cc
     memory_test.cc
     backend_test.cc
+    hip_kernels_test.cc
     ops_test.cc
     ops_elementwise_test.cc
     ops_rmsnorm_test.cc

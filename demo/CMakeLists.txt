@@ -67,7 +67,7 @@ add_executable(test_tokenizer test_tokenizer.cc)
 target_link_libraries(test_tokenizer PRIVATE hybridai)
 
 set_target_properties(simple_infer qwen_infer test_tokenizer PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)

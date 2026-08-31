@@ -33,14 +33,13 @@ Status RMSNorm::validate(const Tensor& input, const Tensor& weight, float eps) {
 }
 
 Tensor RMSNorm::forward(const Tensor& input, const Tensor& weight,
-                        float eps, Stream* stream) {
-    (void)stream;
+                        float eps, Stream* stream, bool add_unit_offset) {
     Status status = validate(input, weight, eps);
     if (!status.ok()) {
         return Tensor();
     }
 
-    auto backend = BackendRegistry::instance().create_backend(input.device());
+    auto backend = BackendRegistry::instance().get_backend(input.device());
     if (backend == nullptr) {
         return Tensor();
     }
@@ -56,6 +55,19 @@ Tensor RMSNorm::forward(const Tensor& input, const Tensor& weight,
     int64_t num_rows = 1;
     for (size_t i = 0; i + 1 < ndim; ++i) {
         num_rows *= input.shape().dim(i);
+    }
+
+    if (input.device().is_gpu()) {
+        status = backend->rmsnorm(
+            output_buffer.get(), input.buffer().get(), weight.buffer().get(),
+            input.dtype(), num_rows, hidden_size, eps, add_unit_offset, stream);
+        if (!status.ok()) return Tensor();
+        return Tensor(input.shape(), input.dtype(), input.device(),
+                      std::move(output_buffer));
+    }
+
+    if (input.dtype() != DType::FP32) {
+        return Tensor();
     }
 
     const float* src = static_cast<const float*>(input.data());
@@ -74,7 +86,8 @@ Tensor RMSNorm::forward(const Tensor& input, const Tensor& weight,
         float inv_rms = 1.0f / rms;
 
         for (int64_t i = 0; i < hidden_size; ++i) {
-            row_out[i] = row_in[i] * inv_rms * w[i];
+            row_out[i] = row_in[i] * inv_rms *
+                         (w[i] + (add_unit_offset ? 1.0f : 0.0f));
         }
     }
 

@@ -23,6 +23,17 @@ Tensor convert_dtype_host(const Tensor& input, DType output_dtype,
     if (backend == nullptr || input.buffer() == nullptr) return Tensor();
     if (input.dtype() == output_dtype) return input;
     const size_t count = static_cast<size_t>(input.numel());
+    if (input.device().type() != DeviceType::CPU) {
+        auto buffer = backend->create_buffer(
+            count * SizeOfDType(output_dtype), input.buffer()->memory_type());
+        if (buffer == nullptr ||
+            !backend->cast(buffer.get(), input.buffer().get(), output_dtype,
+                           input.dtype(), static_cast<int64_t>(count)).ok()) {
+            return Tensor();
+        }
+        return Tensor(input.shape(), output_dtype, input.device(),
+                      std::move(buffer));
+    }
     std::vector<uint8_t> source(input.nbytes());
     if (!backend->memcpy_d2h(source.data(), input.buffer().get(),
                              input.nbytes()).ok()) {
@@ -56,12 +67,18 @@ Tensor convert_dtype_host(const Tensor& input, DType output_dtype,
 }
 
 Tensor apply_partial_rope(const Tensor& input, int64_t rope_head_dim,
-                          float base, Backend* backend) {
+                          int64_t position_offset, float base,
+                          Backend* backend) {
     if (backend == nullptr || input.buffer() == nullptr ||
-        input.dtype() != DType::FP32 || input.shape().ndim() != 3 ||
+    (input.dtype() != DType::FP32 &&
+     !(input.device().is_gpu() && input.dtype() == DType::BF16)) ||
+    input.shape().ndim() != 3 ||
         rope_head_dim <= 0 || rope_head_dim > input.shape().dim(2) ||
         (rope_head_dim % 2) != 0) {
         return Tensor();
+    }
+    if (input.device().type() != DeviceType::CPU) {
+        return RoPE::partial(input, rope_head_dim, position_offset, base);
     }
     const int64_t seq_len = input.shape().dim(0);
     const int64_t num_heads = input.shape().dim(1);
@@ -82,7 +99,7 @@ Tensor apply_partial_rope(const Tensor& input, int64_t rope_head_dim,
             std::memcpy(rotary.data(), head,
                         static_cast<size_t>(rope_head_dim) * sizeof(float));
             for (int64_t j = 0; j < half; ++j) {
-                const float theta = static_cast<float>(s) /
+                const float theta = static_cast<float>(position_offset + s) /
                     std::pow(base, 2.0f * static_cast<float>(j) /
                                        static_cast<float>(rope_head_dim));
                 const float c = std::cos(theta);
@@ -111,9 +128,10 @@ Status GatedGQAAttention::validate(const Tensor& input,
                                     int64_t head_dim, int64_t rope_head_dim,
                                     float rope_base) {
     (void)rope_base;
-    if (input.dtype() != DType::FP32) {
+    if (input.dtype() != DType::FP32 &&
+        !(input.device().is_gpu() && input.dtype() == DType::BF16)) {
         return Status(StatusCode::UnsupportedDType,
-                        "GatedGQAAttention supports FP32 activation with FP32 or BF16 weights");
+                        "GatedGQAAttention supports CPU FP32 and GPU FP32/BF16 activations");
     }
     if (input.shape().ndim() < 2) {
         return Status(StatusCode::InvalidArgument,
@@ -187,6 +205,31 @@ Tensor GatedGQAAttention::forward(const Tensor& input,
                                  const Tensor& q_norm_weight,
                                  const Tensor& k_norm_weight,
                                  float rms_norm_eps) {
+    return forward_impl(input, wq, wk, wv, wo, num_q_heads, num_kv_heads,
+                        head_dim, rope_head_dim, rope_base, stream,
+                        q_norm_weight, k_norm_weight, rms_norm_eps, 0, nullptr);
+}
+
+Tensor GatedGQAAttention::forward_cached(
+    const Tensor& input, const Tensor& wq, const Tensor& wk,
+    const Tensor& wv, const Tensor& wo, int64_t num_q_heads,
+    int64_t num_kv_heads, int64_t head_dim, int64_t rope_head_dim,
+    int64_t max_seq_len, AttentionKVCache* cache, float rope_base,
+    Stream* stream, const Tensor& q_norm_weight,
+    const Tensor& k_norm_weight, float rms_norm_eps) {
+    return forward_impl(input, wq, wk, wv, wo, num_q_heads, num_kv_heads,
+                        head_dim, rope_head_dim, rope_base, stream,
+                        q_norm_weight, k_norm_weight, rms_norm_eps,
+                        max_seq_len, cache);
+}
+
+Tensor GatedGQAAttention::forward_impl(
+    const Tensor& input, const Tensor& wq, const Tensor& wk,
+    const Tensor& wv, const Tensor& wo, int64_t num_q_heads,
+    int64_t num_kv_heads, int64_t head_dim, int64_t rope_head_dim,
+    float rope_base, Stream* stream, const Tensor& q_norm_weight,
+    const Tensor& k_norm_weight, float rms_norm_eps, int64_t max_seq_len,
+    AttentionKVCache* cache) {
     Status status = validate(input, wq, wk, wv, wo,
                              num_q_heads, num_kv_heads,
                              head_dim, rope_head_dim, rope_base);
@@ -200,11 +243,19 @@ Tensor GatedGQAAttention::forward(const Tensor& input,
         seq_len *= input.shape().dim(i);
     }
 
-    auto backend = BackendRegistry::instance().create_backend(input.device());
+    auto backend = BackendRegistry::instance().get_backend(input.device());
     if (backend == nullptr) {
         return Tensor();
     }
-    const bool mixed_bf16 = wq.dtype() == DType::BF16;
+    const bool use_cache = cache != nullptr;
+    if (use_cache && (input.device().type() == DeviceType::CPU ||
+                      max_seq_len <= 0 || cache->length < 0 ||
+                      cache->length + seq_len > max_seq_len)) {
+        return Tensor();
+    }
+    const bool gpu_native = input.device().is_gpu();
+    const bool mixed_bf16 = !gpu_native && wq.dtype() == DType::BF16;
+    const DType activation_dtype = input.dtype();
     Tensor projection_input = mixed_bf16
         ? convert_dtype_host(input, DType::BF16, backend.get()) : input;
     if (projection_input.buffer() == nullptr) {
@@ -218,9 +269,11 @@ Tensor GatedGQAAttention::forward(const Tensor& input,
     if (q.data() == nullptr || k.data() == nullptr || v.data() == nullptr) {
         return Tensor();
     }
-    q = convert_dtype_host(q, DType::FP32, backend.get());
-    k = convert_dtype_host(k, DType::FP32, backend.get());
-    v = convert_dtype_host(v, DType::FP32, backend.get());
+    if (!gpu_native) {
+        q = convert_dtype_host(q, DType::FP32, backend.get());
+        k = convert_dtype_host(k, DType::FP32, backend.get());
+        v = convert_dtype_host(v, DType::FP32, backend.get());
+    }
     if (q.buffer() == nullptr || k.buffer() == nullptr || v.buffer() == nullptr) {
         return Tensor();
     }
@@ -232,43 +285,63 @@ Tensor GatedGQAAttention::forward(const Tensor& input,
     if (has_gate) {
         const int64_t query_numel = seq_len * num_q_heads * head_dim;
         auto query_buf = backend->create_buffer(
-            static_cast<size_t>(query_numel) * sizeof(float),
+            static_cast<size_t>(query_numel) * SizeOfDType(activation_dtype),
             input.buffer()->memory_type());
         auto gate_buf = backend->create_buffer(
-            static_cast<size_t>(query_numel) * sizeof(float),
+            static_cast<size_t>(query_numel) * SizeOfDType(activation_dtype),
             input.buffer()->memory_type());
         if (query_buf == nullptr || gate_buf == nullptr) return Tensor();
-        const float* q_all = static_cast<const float*>(q.data());
-        float* query_ptr = static_cast<float*>(query_buf->data());
-        float* gate_ptr = static_cast<float*>(gate_buf->data());
-        // The checkpoint layout is [seq, heads, 2 * head_dim], matching
-        // torch.chunk(..., 2, dim=-1). Query and gate are adjacent within
-        // each head rather than two contiguous full-width matrices.
-        for (int64_t t = 0; t < seq_len; ++t) {
-            for (int64_t h = 0; h < num_q_heads; ++h) {
-                const float* head = q_all +
-                    (t * num_q_heads + h) * (2 * head_dim);
-                float* query_head = query_ptr +
-                    (t * num_q_heads + h) * head_dim;
-                float* gate_head = gate_ptr +
-                    (t * num_q_heads + h) * head_dim;
-                std::memcpy(query_head, head,
-                            static_cast<size_t>(head_dim) * sizeof(float));
-                std::memcpy(gate_head, head + head_dim,
-                            static_cast<size_t>(head_dim) * sizeof(float));
+        if (input.device().type() != DeviceType::CPU) {
+            if (!backend->split_q_gate(
+                    query_buf.get(), gate_buf.get(), q.buffer().get(),
+                    activation_dtype, seq_len, num_q_heads, head_dim,
+                    stream).ok()) {
+                return Tensor();
+            }
+        } else {
+            const float* q_all = static_cast<const float*>(q.data());
+            float* query_ptr = static_cast<float*>(query_buf->data());
+            float* gate_ptr = static_cast<float*>(gate_buf->data());
+            for (int64_t t = 0; t < seq_len; ++t) {
+                for (int64_t h = 0; h < num_q_heads; ++h) {
+                    const float* head = q_all +
+                        (t * num_q_heads + h) * (2 * head_dim);
+                    float* query_head = query_ptr +
+                        (t * num_q_heads + h) * head_dim;
+                    float* gate_head = gate_ptr +
+                        (t * num_q_heads + h) * head_dim;
+                    std::memcpy(query_head, head,
+                                static_cast<size_t>(head_dim) * sizeof(float));
+                    std::memcpy(gate_head, head + head_dim,
+                                static_cast<size_t>(head_dim) * sizeof(float));
+                }
             }
         }
-        q_query = Tensor(Shape{seq_len, num_q_heads * head_dim}, DType::FP32,
-                         input.device(), std::move(query_buf));
-        q_gate = Tensor(Shape{seq_len, num_q_heads * head_dim}, DType::FP32,
-                        input.device(), std::move(gate_buf));
+        q_query = Tensor(Shape{seq_len, num_q_heads * head_dim},
+                 activation_dtype, input.device(),
+                 std::move(query_buf));
+        q_gate = Tensor(Shape{seq_len, num_q_heads * head_dim},
+                activation_dtype, input.device(),
+                std::move(gate_buf));
     }
     Tensor q_3d(q_query.reshape(Shape{seq_len, num_q_heads, head_dim}));
     Tensor k_3d(k.reshape(Shape{seq_len, num_kv_heads, head_dim}));
 
-    // Qwen3.5 applies a per-head RMSNorm to Q and K before RoPE. The
-    // checkpoint stores these weights as BF16 vectors, while this reference
-    // path operates on FP32 activations.
+    // Qwen3.5 applies a per-head RMSNorm to Q and K before RoPE. GPU tensors
+    // keep their native dtype; the RMSNorm kernel performs FP32 accumulation
+    // internally and writes the result back in the original dtype.
+    if (input.device().type() != DeviceType::CPU &&
+        q_norm_weight.buffer() != nullptr &&
+        k_norm_weight.buffer() != nullptr) {
+        if (q_norm_weight.dtype() != activation_dtype ||
+            k_norm_weight.dtype() != activation_dtype)
+            return Tensor();
+        q_3d = RMSNorm::forward(
+            q_3d, q_norm_weight, rms_norm_eps, stream, true);
+        k_3d = RMSNorm::forward(
+            k_3d, k_norm_weight, rms_norm_eps, stream, true);
+        if (q_3d.buffer() == nullptr || k_3d.buffer() == nullptr) return Tensor();
+    } else {
     std::vector<float> q_norm_host(static_cast<size_t>(head_dim), 1.0f);
     std::vector<float> k_norm_host(static_cast<size_t>(head_dim), 1.0f);
     auto read_norm = [&](const Tensor& weight, std::vector<float>* dst) {
@@ -308,10 +381,14 @@ Tensor GatedGQAAttention::forward(const Tensor& input,
     };
     if (!apply_head_rms(&q_3d, num_q_heads, q_norm_host) ||
         !apply_head_rms(&k_3d, num_kv_heads, k_norm_host)) return Tensor();
+    }
 
-    Tensor q_rot = apply_partial_rope(q_3d, rope_head_dim, rope_base,
+    const int64_t position_offset = use_cache ? cache->length : 0;
+    Tensor q_rot = apply_partial_rope(q_3d, rope_head_dim, position_offset,
+                                      rope_base,
                                       backend.get());
-    Tensor k_rot = apply_partial_rope(k_3d, rope_head_dim, rope_base,
+    Tensor k_rot = apply_partial_rope(k_3d, rope_head_dim, position_offset,
+                                      rope_base,
                                       backend.get());
     if (q_rot.data() == nullptr || k_rot.data() == nullptr) {
         return Tensor();
@@ -324,11 +401,67 @@ Tensor GatedGQAAttention::forward(const Tensor& input,
 
     // Buffer for concatenated attention output [seq_len, num_q_heads, head_dim].
     const size_t attn_out_bytes =
-        static_cast<size_t>(seq_len * num_q_heads * head_dim) * sizeof(float);
+        static_cast<size_t>(seq_len * num_q_heads * head_dim) *
+        SizeOfDType(activation_dtype);
     auto attn_out_buf = backend->create_buffer(attn_out_bytes,
                                                input.buffer()->memory_type());
     if (attn_out_buf == nullptr) {
         return Tensor();
+    }
+    if (input.device().type() != DeviceType::CPU) {
+        Status attention_status;
+        if (use_cache) {
+            const Shape cache_shape{max_seq_len, num_kv_heads, head_dim};
+            const size_t cache_bytes = static_cast<size_t>(
+                max_seq_len * num_kv_heads * head_dim) *
+                SizeOfDType(activation_dtype);
+            if (!cache->initialized()) {
+                auto key_cache = backend->create_buffer(
+                    cache_bytes, input.buffer()->memory_type());
+                auto value_cache = backend->create_buffer(
+                    cache_bytes, input.buffer()->memory_type());
+                if (key_cache == nullptr || value_cache == nullptr)
+                    return Tensor();
+                cache->key = Tensor(cache_shape, activation_dtype, input.device(),
+                                    std::move(key_cache));
+                cache->value = Tensor(cache_shape, activation_dtype, input.device(),
+                                      std::move(value_cache));
+                cache->capacity = max_seq_len;
+            } else if (cache->capacity != max_seq_len ||
+                       cache->key.shape() != cache_shape ||
+                       cache->value.shape() != cache_shape ||
+                       cache->key.dtype() != activation_dtype ||
+                       cache->value.dtype() != activation_dtype ||
+                       cache->key.device() != input.device() ||
+                       cache->value.device() != input.device()) {
+                return Tensor();
+            }
+            Status append_status = backend->append_kv_cache(
+                cache->key.buffer().get(), cache->value.buffer().get(),
+                k_rot.buffer().get(), v.buffer().get(), activation_dtype,
+                seq_len, num_kv_heads, head_dim, cache->length,
+                cache->capacity, stream);
+            if (!append_status.ok()) return Tensor();
+            const int64_t new_cache_len = cache->length + seq_len;
+            attention_status = backend->cached_gqa(
+                attn_out_buf.get(), q_rot.buffer().get(),
+                cache->key.buffer().get(), cache->value.buffer().get(),
+                has_gate ? q_gate.buffer().get() : nullptr, activation_dtype,
+                seq_len, new_cache_len, num_q_heads, num_kv_heads, head_dim,
+                stream);
+            if (attention_status.ok()) cache->length = new_cache_len;
+        } else {
+            attention_status = backend->causal_gqa(
+                attn_out_buf.get(), q_rot.buffer().get(), k_rot.buffer().get(),
+                v.buffer().get(), has_gate ? q_gate.buffer().get() : nullptr,
+                activation_dtype, seq_len, num_q_heads, num_kv_heads, head_dim,
+                stream);
+        }
+        if (!attention_status.ok()) return Tensor();
+        Tensor attn_out_tensor(
+            Shape{seq_len, num_q_heads * head_dim}, activation_dtype,
+            input.device(), attn_out_buf);
+        return Linear::forward(attn_out_tensor, wo, true, nullptr, stream);
     }
     float* attn_out = static_cast<float*>(attn_out_buf->data());
     std::memset(attn_out, 0, attn_out_bytes);

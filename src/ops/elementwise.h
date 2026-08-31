@@ -23,6 +23,10 @@ public:
     static Tensor swish(const Tensor& input, float beta = 1.0f,
                         Stream* stream = nullptr);
 
+    // Fused SwiGLU hot path: silu(gate) * up.
+    static Tensor silu_mul(const Tensor& gate, const Tensor& up,
+                           Stream* stream = nullptr);
+
     enum class UnaryOp { ReLU, SiLU, GELU, Swish };
 
     static Tensor unary(const Tensor& input, UnaryOp op, float param,

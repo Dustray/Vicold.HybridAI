@@ -9,8 +9,8 @@
 // 用法：qwen_infer <model_dir> [backend=cpu|hip] [max_devices=8]
 //                  [--quiet-decode]
 // 运行示例（在项目根目录执行）：
-//   LD_LIBRARY_PATH="$PWD/build:${LD_LIBRARY_PATH:-}" \
-//       ./demo/build/qwen_infer /path/to/Qwen3.8-27B hip 8 --quiet-decode
+// LD_LIBRARY_PATH="$PWD/build:${LD_LIBRARY_PATH:-}" ./demo/build/qwen_infer /path/to/Qwen3.8-27B hip 8 --quiet-decode
+// HIP_ALLOC_INITIALIZE=0 HIP_VISIBLE_DEVICES=2 ./qwen_infer /public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master/ hip 1 --quiet-decode
 
 #include "backends/backend_registry.h"
 #include "core/device.h"
@@ -550,7 +550,8 @@ int main(int argc, char* argv[]) {
             }
             std::cout << "]" << std::endl;
         }
-        const std::string user_text = "Hello, how are you? And who are you?";
+        // const std::string user_text = "Please explain the principle of quantum entanglement in Chinese. Write at least 500 words.";
+        const std::string user_text = "Hello, how are you?";
         std::string prompt;
         if (tok_status.ok()) {
             prompt = tokenizer.build_chat_prompt(
@@ -640,7 +641,7 @@ int main(int argc, char* argv[]) {
                       << std::endl;
             return 1;
         }
-        constexpr int kMaxNewTokens = 100;
+        constexpr int kMaxNewTokens = 1024;
         std::vector<int64_t> generated_ids = input_ids;
         const size_t prompt_token_count = generated_ids.size();
         const int64_t max_cache_len =

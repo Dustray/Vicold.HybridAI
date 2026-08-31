@@ -380,6 +380,89 @@ __global__ void cached_gqa_kernel(T* dst, const T* query,
     }
 }
 
+// Decode-optimized GQA for Qwen's 256-wide heads. One block owns one query
+// head, computes each Q.K score cooperatively exactly once, and folds softmax
+// and P.V into a single online-softmax pass. The generic kernel above computes
+// the same Q.K once per output dimension, which is especially expensive for
+// single-token decode.
+template <typename T>
+__global__ void cached_gqa_head256_kernel(
+    T* dst, const T* query, const T* key_cache, const T* value_cache,
+    const T* gate, int64_t query_len, int64_t cache_len,
+    int64_t num_query_heads, int64_t num_kv_heads) {
+    constexpr int64_t kHeadDim = 256;
+    const int64_t dimension = threadIdx.x;
+    const int64_t query_head = blockIdx.x;
+    const int64_t query_sequence = blockIdx.y;
+    const int64_t kv_head =
+        query_head / (num_query_heads / num_kv_heads);
+    const int64_t query_base =
+        (query_sequence * num_query_heads + query_head) * kHeadDim;
+    const int64_t query_position =
+        cache_len - query_len + query_sequence;
+    const float scale = 1.0f / 16.0f;
+
+    const float query_value = load_value(query, query_base + dimension);
+    float output = 0.0f;
+
+    // gfx936 uses 64-lane wavefronts, so a 256-thread block produces four
+    // partial sums. Size eight also keeps this valid for 32-lane targets.
+    __shared__ float wave_sums[kHeadDim / 32];
+    __shared__ float online_max;
+    __shared__ float online_sum;
+    __shared__ float previous_scale;
+    __shared__ float current_scale;
+    if (dimension == 0) {
+        online_max = -INFINITY;
+        online_sum = 0.0f;
+    }
+    __syncthreads();
+
+    for (int64_t source_sequence = 0;
+         source_sequence <= query_position; ++source_sequence) {
+        const int64_t cache_base =
+            (source_sequence * num_kv_heads + kv_head) * kHeadDim;
+        float partial =
+            query_value * load_value(key_cache, cache_base + dimension);
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+            partial += __shfl_down(partial, offset);
+        }
+        const int lane = static_cast<int>(dimension) % warpSize;
+        const int wave = static_cast<int>(dimension) / warpSize;
+        if (lane == 0) wave_sums[wave] = partial;
+        __syncthreads();
+
+        if (dimension == 0) {
+            float dot = 0.0f;
+            for (int wave_index = 0;
+                 wave_index < kHeadDim / warpSize; ++wave_index) {
+                dot += wave_sums[wave_index];
+            }
+            const float score = dot * scale;
+            const float next_max = fmaxf(online_max, score);
+            previous_scale = expf(online_max - next_max);
+            current_scale = expf(score - next_max);
+            online_sum = online_sum * previous_scale + current_scale;
+            online_max = next_max;
+        }
+        __syncthreads();
+
+        output = output * previous_scale +
+                 current_scale *
+                     load_value(value_cache, cache_base + dimension);
+        // Prevent the next score from overwriting shared softmax state before
+        // every lane has consumed it.
+        __syncthreads();
+    }
+
+    output /= online_sum;
+    if (gate != nullptr) {
+        const float gate_value = load_value(gate, query_base + dimension);
+        output *= 1.0f / (1.0f + expf(-gate_value));
+    }
+    store_value(dst, query_base + dimension, output);
+}
+
 template <typename T>
 __global__ void causal_conv1d_silu_kernel(
     T* dst, T* conv_state, const T* src, const T* weight,
@@ -734,15 +817,26 @@ Status launch_cached_gqa(void* dst, const void* query, const void* key_cache,
                          int64_t query_len, int64_t cache_len,
                          int64_t num_query_heads, int64_t num_kv_heads,
                          int64_t head_dim, hipStream_t stream) {
-    hipLaunchKernelGGL(cached_gqa_kernel<T>,
-                       dim3(static_cast<unsigned int>(num_query_heads),
-                            static_cast<unsigned int>(query_len)),
-                       dim3(kBlockSize), 0, stream, static_cast<T*>(dst),
-                       static_cast<const T*>(query),
-                       static_cast<const T*>(key_cache),
-                       static_cast<const T*>(value_cache),
-                       static_cast<const T*>(gate), query_len, cache_len,
-                       num_query_heads, num_kv_heads, head_dim);
+    const dim3 grid(static_cast<unsigned int>(num_query_heads),
+                    static_cast<unsigned int>(query_len));
+    if (head_dim == 256) {
+        hipLaunchKernelGGL(cached_gqa_head256_kernel<T>, grid,
+                           dim3(kBlockSize), 0, stream,
+                           static_cast<T*>(dst),
+                           static_cast<const T*>(query),
+                           static_cast<const T*>(key_cache),
+                           static_cast<const T*>(value_cache),
+                           static_cast<const T*>(gate), query_len, cache_len,
+                           num_query_heads, num_kv_heads);
+    } else {
+        hipLaunchKernelGGL(cached_gqa_kernel<T>, grid, dim3(kBlockSize), 0,
+                           stream, static_cast<T*>(dst),
+                           static_cast<const T*>(query),
+                           static_cast<const T*>(key_cache),
+                           static_cast<const T*>(value_cache),
+                           static_cast<const T*>(gate), query_len, cache_len,
+                           num_query_heads, num_kv_heads, head_dim);
+    }
     return hip_status(hipGetLastError(), "launch cached GQA kernel");
 }
 

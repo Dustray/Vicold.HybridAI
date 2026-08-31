@@ -7,9 +7,10 @@
 // 编译：cmake --build .. --target qwen_infer --parallel
 //
 // 用法：qwen_infer <model_dir> [backend=cpu|hip] [max_devices=8]
+//                  [--quiet-decode]
 // 运行示例（在项目根目录执行）：
 //   LD_LIBRARY_PATH="$PWD/build:${LD_LIBRARY_PATH:-}" \
-//       ./demo/build/bin/qwen_infer /path/to/Qwen3.8-27B hip 8
+//       ./demo/build/qwen_infer /path/to/Qwen3.8-27B hip 8 --quiet-decode
 
 #include "backends/backend_registry.h"
 #include "core/device.h"
@@ -31,6 +32,7 @@
 #include "ops/softmax.h"
 
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -99,10 +101,11 @@ void print_tensor_stats(const char* label, const Tensor& tensor,
 
 void print_usage(const char* program) {
     std::cout << "Usage: " << program
-              << " <model_dir> [backend=cpu|hip] [max_devices=8]"
+                  << " <model_dir> [backend=cpu|hip] [max_devices=8] "
+                      "[--quiet-decode]"
               << std::endl;
     std::cout << "Example:\n  " << program
-              << " /path/to/Qwen3.8-27B hip 8" << std::endl;
+                  << " /path/to/Qwen3.8-27B hip 8 --quiet-decode" << std::endl;
 }
 
 // Tokenizer 实例，由 main 初始化后传入。
@@ -390,7 +393,22 @@ int main(int argc, char* argv[]) {
 
     fs::path model_dir = argv[1];
     std::string backend_name = (argc > 2) ? argv[2] : "cpu";
-    int max_devices = (argc > 3) ? std::atoi(argv[3]) : 8;
+    int max_devices = 8;
+    bool quiet_decode = false;
+    bool max_devices_set = false;
+    for (int argument = 3; argument < argc; ++argument) {
+        const std::string option = argv[argument];
+        if (option == "--quiet-decode") {
+            quiet_decode = true;
+        } else if (!max_devices_set && !option.empty() && option[0] != '-') {
+            max_devices = std::atoi(option.c_str());
+            max_devices_set = true;
+        } else {
+            std::cerr << "[ERROR] Unknown option: " << option << std::endl;
+            print_usage(argv[0]);
+            return 1;
+        }
+    }
     if (max_devices <= 0) max_devices = 1;
     if (max_devices > 8) max_devices = 8;
 
@@ -399,6 +417,8 @@ int main(int argc, char* argv[]) {
     std::cout << "Model dir: " << model_dir << std::endl;
     std::cout << "Backend:   " << backend_name << std::endl;
     std::cout << "Max devices: " << max_devices << std::endl;
+    std::cout << "Quiet decode: " << (quiet_decode ? "yes" : "no")
+              << std::endl;
     std::cout << "========================================" << std::endl;
 
     // 1. 验证目录存在
@@ -610,14 +630,22 @@ int main(int argc, char* argv[]) {
             static_cast<size_t>(config.num_hidden_layers));
         std::vector<DeltaNetCache> deltanet_caches(
             static_cast<size_t>(config.num_hidden_layers));
+        using SteadyClock = std::chrono::steady_clock;
+        SteadyClock::time_point decode_start;
+        int64_t decode_token_count = 0;
         for (int generation_step = 0; generation_step < kMaxNewTokens;
              ++generation_step) {
+            const bool is_prefill = generation_step == 0;
+            const bool verbose_step = is_prefill || !quiet_decode;
+            if (generation_step == 1) decode_start = SteadyClock::now();
             input_ids = generation_step == 0
                 ? generated_ids
                 : std::vector<int64_t>{generated_ids.back()};
-            std::cout << (generation_step == 0 ? "[Prefill] tokens="
-                                               : "[Decode] tokens=")
-                      << input_ids.size() << std::endl;
+            if (verbose_step) {
+                std::cout << (is_prefill ? "[Prefill] tokens="
+                                        : "[Decode] tokens=")
+                          << input_ids.size() << std::endl;
+            }
             Tensor embedded;
         status = lookup_embedding(
             weights.shared.embed_tokens, input_ids,
@@ -634,9 +662,11 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        std::cout << "Real BF16 embedding lookup ok: ["
-                  << embedded.shape().dim(0) << ","
-                  << embedded.shape().dim(1) << "]" << std::endl;
+        if (verbose_step) {
+            std::cout << "Real BF16 embedding lookup ok: ["
+                      << embedded.shape().dim(0) << ","
+                      << embedded.shape().dim(1) << "]" << std::endl;
+        }
 
         // 真实前向全程保持模型原生 BF16 tensor；kernel 内部可以使用
         // FP32 累加，但不创建 FP32 activation 或 weight staging tensor。
@@ -675,9 +705,11 @@ int main(int argc, char* argv[]) {
                       << status.message() << std::endl;
             return 1;
         }
-        std::cout << "Real layer 0 attention/DeltaNet path ok: output=["
-                  << layer0_output.shape().dim(0) << ","
-                  << layer0_output.shape().dim(1) << "]" << std::endl;
+        if (verbose_step) {
+            std::cout << "Real layer 0 attention/DeltaNet path ok: output=["
+                      << layer0_output.shape().dim(0) << ","
+                      << layer0_output.shape().dim(1) << "]" << std::endl;
+        }
 
         // 补齐第 0 层的 post-mixer RMSNorm、MLP 和第二个 residual。
         // Decoder layer 的两个子层都必须执行，不能只验证第一个 mixer。
@@ -806,8 +838,8 @@ int main(int argc, char* argv[]) {
                           << " residual failed" << std::endl;
                 return 1;
             }
-            if ((layer_index + 1) % 8 == 0 ||
-                layer_index + 1 == config.num_hidden_layers) {
+            if (verbose_step && ((layer_index + 1) % 8 == 0 ||
+                layer_index + 1 == config.num_hidden_layers)) {
                 std::cout << "  forward layers: "
                           << (layer_index + 1) << "/"
                           << config.num_hidden_layers << std::endl;
@@ -892,23 +924,44 @@ int main(int argc, char* argv[]) {
             }
         }
         generated_ids.push_back(next_id);
-        std::cout << "Full GPU forward + lm_head ok: logits=["
-                  << logits.shape().dim(0) << "," << logits.shape().dim(1)
-                  << "]" << std::endl;
-        std::cout << "[Greedy step " << (generation_step + 1)
-                  << "] id=" << next_id;
-        if (!device_argmax) std::cout << ", logit=" << best_logit;
-        std::cout << (device_argmax ? " (device argmax)" : "") << std::endl;
+        if (!is_prefill) ++decode_token_count;
+        if (verbose_step) {
+            std::cout << "Full GPU forward + lm_head ok: logits=["
+                      << logits.shape().dim(0) << "," << logits.shape().dim(1)
+                      << "]" << std::endl;
+            std::cout << "[Greedy step " << (generation_step + 1)
+                      << "] id=" << next_id;
+            if (!device_argmax) std::cout << ", logit=" << best_logit;
+            std::cout << (device_argmax ? " (device argmax)" : "")
+                      << std::endl;
+        }
         if (tok_status.ok() && tokenizer.is_eos_token(next_id)) {
-            std::cout << "[Stop] EOS token generated." << std::endl;
+            if (verbose_step) {
+                std::cout << "[Stop] EOS token generated." << std::endl;
+            }
             break;
         }
         }
+        const double decode_seconds = decode_token_count > 0
+            ? std::chrono::duration<double>(SteadyClock::now() - decode_start)
+                  .count()
+            : 0.0;
+        const double decode_tps = decode_seconds > 0.0
+            ? static_cast<double>(decode_token_count) / decode_seconds
+            : 0.0;
         const std::vector<int64_t> generated_suffix(
             generated_ids.begin() + static_cast<ptrdiff_t>(prompt_token_count),
             generated_ids.end());
         std::cout << "\n[Generated text]\n"
                   << decode_ids(generated_suffix, true) << std::endl;
+        if (decode_token_count > 0) {
+            std::cout << "[Performance] decode_tokens=" << decode_token_count
+                      << ", decode_seconds=" << decode_seconds
+                      << ", decode_tps=" << decode_tps << std::endl;
+        } else {
+            std::cout << "[Performance] decode_tokens=0, decode_tps=N/A"
+                      << std::endl;
+        }
         return 0;
     }
 

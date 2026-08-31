@@ -246,8 +246,6 @@ hipMemcpyKind copy_direction(MemoryType dst, MemoryType src) {
 struct HipBackend::Impl {
 #ifdef HYBRIDAI_HAS_HIP
     std::shared_ptr<void> rocblas;
-    std::mutex pool_mutex;
-    std::unordered_map<MemoryType, std::shared_ptr<memory::MemoryPool>> pools;
 #endif
 };
 
@@ -338,6 +336,35 @@ std::shared_ptr<void> shared_rocblas_handle(int device_id) {
     handles[device_id] = handle;
     return handle;
 }
+
+std::shared_ptr<memory::MemoryPool> shared_memory_pool(
+    HipBackend* backend, int device_id, MemoryType type) {
+    static std::mutex mutex;
+    static std::unordered_map<uint64_t,
+                              std::shared_ptr<memory::MemoryPool>> pools;
+
+    const uint64_t key =
+        (static_cast<uint64_t>(static_cast<uint32_t>(device_id)) << 32) |
+        static_cast<uint64_t>(type);
+    std::lock_guard<std::mutex> lock(mutex);
+    auto found = pools.find(key);
+    if (found != pools.end()) {
+        return found->second;
+    }
+
+    memory::MemoryPool::Options options;
+    // Decode activations are small and highly repetitive. Large persistent
+    // weights bypass the pool so bucket rounding cannot inflate model memory.
+    options.max_bucket_size = 8 * 1024 * 1024;
+    options.bucket_growth = 1.25;
+    // Retain the transient high-water mark. A fixed cap can keep cold prefill
+    // blocks while repeatedly freeing newly returned hot decode blocks.
+    options.max_pooled_bytes = 0;
+    auto pool =
+        std::make_shared<memory::MemoryPool>(backend, type, options);
+    pools.emplace(key, pool);
+    return pool;
+}
 #endif
 } // namespace
 
@@ -408,25 +435,7 @@ std::shared_ptr<Buffer> HipBackend::create_buffer(size_t size,
         return nullptr;
     }
 
-    std::shared_ptr<memory::MemoryPool> allocator;
-    {
-        std::lock_guard<std::mutex> lock(impl_->pool_mutex);
-        auto found = impl_->pools.find(type);
-        if (found == impl_->pools.end()) {
-            memory::MemoryPool::Options options;
-            // Decode activations are small and highly repetitive. Keep large
-            // persistent model weights on exact direct allocations so bucket
-            // rounding does not inflate the resident model footprint.
-            options.max_bucket_size = 8 * 1024 * 1024;
-            options.bucket_growth = 1.25;
-            options.max_pooled_bytes = 256 * 1024 * 1024;
-            allocator = std::make_shared<memory::MemoryPool>(this, type,
-                                                              options);
-            impl_->pools.emplace(type, allocator);
-        } else {
-            allocator = found->second;
-        }
-    }
+    auto allocator = shared_memory_pool(this, device_.id(), type);
 
     void* ptr = nullptr;
     Status status = allocator->allocate(size, &ptr);

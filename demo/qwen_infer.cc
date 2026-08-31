@@ -550,7 +550,7 @@ int main(int argc, char* argv[]) {
             }
             std::cout << "]" << std::endl;
         }
-        const std::string user_text = "Hello, how are you?";
+        const std::string user_text = "Hello, how are you? And who are you?";
         std::string prompt;
         if (tok_status.ok()) {
             prompt = tokenizer.build_chat_prompt(
@@ -586,7 +586,7 @@ int main(int argc, char* argv[]) {
         const int64_t projection_rows = projection->values.shape().dim(0);
         const int64_t projection_cols = projection->values.shape().dim(1);
         auto projection_backend =
-            BackendRegistry::instance().create_backend(devices.back());
+            BackendRegistry::instance().get_backend(devices.back());
         if (projection_backend == nullptr ||
             !projection_backend->is_available()) {
             std::cerr << "[ERROR] Failed to create backend for the last layer"
@@ -633,7 +633,7 @@ int main(int argc, char* argv[]) {
                   << "] -> [1," << projection_rows << "]" << std::endl;
 
         auto embedding_backend =
-            BackendRegistry::instance().create_backend(devices.front());
+            BackendRegistry::instance().get_backend(devices.front());
         if (embedding_backend == nullptr ||
             !embedding_backend->is_available()) {
             std::cerr << "[ERROR] Failed to create backend for embedding"
@@ -768,7 +768,7 @@ int main(int argc, char* argv[]) {
             const Device layer_device =
                 weights.layer_devices[static_cast<size_t>(layer_index)];
             auto layer_backend =
-                BackendRegistry::instance().create_backend(layer_device);
+                BackendRegistry::instance().get_backend(layer_device);
             if (layer_backend == nullptr || !layer_backend->is_available()) {
                 std::cerr << "[ERROR] Failed to create backend for layer "
                           << layer_index << std::endl;
@@ -872,7 +872,7 @@ int main(int argc, char* argv[]) {
 
         const Device final_device = devices.back();
         auto final_backend =
-            BackendRegistry::instance().create_backend(final_device);
+            BackendRegistry::instance().get_backend(final_device);
         if (final_backend == nullptr || !final_backend->is_available()) {
             std::cerr << "[ERROR] Failed to create final device backend"
                       << std::endl;
@@ -999,7 +999,7 @@ int main(int argc, char* argv[]) {
               << ", unified=" << device.unified_memory_supported()
               << std::endl;
 
-    auto backend = BackendRegistry::instance().create_backend(device);
+    auto backend = BackendRegistry::instance().get_backend(device);
     if (backend == nullptr || !backend->is_available()) {
         std::cerr << "[ERROR] Backend " << backend_name
                   << " is not available." << std::endl;
@@ -1100,10 +1100,10 @@ int main(int argc, char* argv[]) {
     std::string prompt;
     if (tok_status.ok()) {
         prompt = tokenizer.build_chat_prompt(
-            {{"user", "Hello, how are you?"}}, true, false);
+            {{"user", "Hello, how are you? And who are you?"}}, true, false);
     } else {
         prompt =
-            "<|im_start|>user\nHello, how are you?<|im_end|>\n"
+            "<|im_start|>user\nHello, how are you? And who are you?<|im_end|>\n"
             "<|im_start|>assistant\n<think>\n\n</think>\n\n";
     }
     std::vector<int64_t> input_ids = tokenize(prompt);

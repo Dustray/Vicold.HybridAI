@@ -90,6 +90,12 @@ public:
                       int64_t cache_len, int64_t num_query_heads,
                       int64_t num_kv_heads, int64_t head_dim,
                       Stream* stream = nullptr) override;
+    Status cached_gqa_with_current_token(
+        Buffer* dst, const Buffer* query, const Buffer* key_cache,
+        const Buffer* value_cache, const Buffer* current_key,
+        const Buffer* current_value, const Buffer* gate, DType dtype,
+        int64_t cache_len, int64_t num_query_heads, int64_t num_kv_heads,
+        int64_t head_dim, Stream* stream = nullptr) override;
     Status causal_conv1d_silu(Buffer* dst, Buffer* conv_state,
                               const Buffer* src, const Buffer* weight,
                               DType dtype, int64_t token_count,

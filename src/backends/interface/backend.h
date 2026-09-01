@@ -183,6 +183,13 @@ public:
         return Status(StatusCode::NotImplemented,
                       "Backend cached GQA unavailable");
     }
+    virtual Status cached_gqa_with_current_token(
+        Buffer*, const Buffer*, const Buffer*, const Buffer*, const Buffer*,
+        const Buffer*, const Buffer*, DType, int64_t, int64_t, int64_t,
+        int64_t, Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend fused cached GQA unavailable");
+    }
     virtual Status causal_conv1d_silu(Buffer*, Buffer*, const Buffer*,
                                       const Buffer*, DType, int64_t, int64_t,
                                       int64_t, Stream* = nullptr) {

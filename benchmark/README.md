@@ -7,7 +7,8 @@
 ```bash
 cmake -S . -B build-benchmark \
   -DHYBRIDAI_ENABLE_HIP=ON \
-  -DHYBRIDAI_BUILD_BENCHMARKS=ON
+  -DHYBRIDAI_BUILD_BENCHMARKS=ON \
+  -DHYBRIDAI_BUILD_OPERATOR_BENCHMARKS=ON
 cmake --build build-benchmark --parallel
 ```
 

@@ -308,6 +308,18 @@ __global__ void append_kv_cache_kernel(T* key_cache, T* value_cache,
 }
 
 template <typename T>
+__global__ void append_kv_cache_single_token_kernel(
+    T* key_cache, T* value_cache, const T* key, const T* value,
+    int64_t count, int64_t row_width, int64_t cache_offset) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x +
+                          threadIdx.x;
+    if (index >= count) return;
+    const int64_t cache_index = cache_offset * row_width + index;
+    key_cache[cache_index] = key[index];
+    value_cache[cache_index] = value[index];
+}
+
+template <typename T>
 __global__ void cached_gqa_kernel(T* dst, const T* query,
                                   const T* key_cache,
                                   const T* value_cache, const T* gate,
@@ -380,6 +392,288 @@ __global__ void cached_gqa_kernel(T* dst, const T* query,
     }
 }
 
+template <typename T>
+__global__ void cached_gqa_current_token_kernel(
+    T* dst, const T* query, T* key_cache, T* value_cache,
+    const T* current_key, const T* current_value, const T* gate,
+    int64_t cache_len, int64_t num_query_heads, int64_t num_kv_heads,
+    int64_t head_dim) {
+    const int64_t query_head = blockIdx.x;
+    const int64_t kv_head =
+        query_head / (num_query_heads / num_kv_heads);
+    const int64_t query_base = query_head * head_dim;
+    const float scale = rsqrtf(static_cast<float>(head_dim));
+
+    __shared__ float score_max;
+    __shared__ float score_sum;
+    if (threadIdx.x == 0) {
+        float maximum = -INFINITY;
+        for (int64_t source = 0; source < cache_len; ++source) {
+            const T* key_row = source + 1 == cache_len
+                                   ? current_key + kv_head * head_dim
+                                   : key_cache +
+                                         (source * num_kv_heads + kv_head) *
+                                             head_dim;
+            float score = 0.0f;
+            for (int64_t dimension = 0; dimension < head_dim; ++dimension)
+                score += load_value(query, query_base + dimension) *
+                         load_value(key_row, dimension);
+            maximum = fmaxf(maximum, score * scale);
+        }
+        float sum = 0.0f;
+        for (int64_t source = 0; source < cache_len; ++source) {
+            const T* key_row = source + 1 == cache_len
+                                   ? current_key + kv_head * head_dim
+                                   : key_cache +
+                                         (source * num_kv_heads + kv_head) *
+                                             head_dim;
+            float score = 0.0f;
+            for (int64_t dimension = 0; dimension < head_dim; ++dimension)
+                score += load_value(query, query_base + dimension) *
+                         load_value(key_row, dimension);
+            sum += expf(score * scale - maximum);
+        }
+        score_max = maximum;
+        score_sum = sum;
+    }
+    __syncthreads();
+
+    for (int64_t dimension = threadIdx.x; dimension < head_dim;
+         dimension += blockDim.x) {
+        float output = 0.0f;
+        for (int64_t source = 0; source < cache_len; ++source) {
+            const T* key_row = source + 1 == cache_len
+                                   ? current_key + kv_head * head_dim
+                                   : key_cache +
+                                         (source * num_kv_heads + kv_head) *
+                                             head_dim;
+            const T* value_row = source + 1 == cache_len
+                                     ? current_value + kv_head * head_dim
+                                     : value_cache +
+                                           (source * num_kv_heads + kv_head) *
+                                               head_dim;
+            float score = 0.0f;
+            for (int64_t inner = 0; inner < head_dim; ++inner)
+                score += load_value(query, query_base + inner) *
+                         load_value(key_row, inner);
+            output += expf(score * scale - score_max) / score_sum *
+                      load_value(value_row, dimension);
+        }
+        if (gate != nullptr) {
+            output *= 1.0f /
+                      (1.0f + expf(-load_value(gate, query_base + dimension)));
+        }
+        store_value(dst, query_base + dimension, output);
+        if (query_head % (num_query_heads / num_kv_heads) == 0) {
+            const int64_t cache_base =
+                ((cache_len - 1) * num_kv_heads + kv_head) * head_dim;
+            store_value(key_cache, cache_base + dimension,
+                        load_value(current_key,
+                                   kv_head * head_dim + dimension));
+            store_value(value_cache, cache_base + dimension,
+                        load_value(current_value,
+                                   kv_head * head_dim + dimension));
+        }
+    }
+}
+
+template <typename T, int64_t HeadDim>
+__global__ void cached_gqa_current_token_fixed_head_kernel(
+    T* dst, const T* query, T* key_cache, T* value_cache,
+    const T* current_key, const T* current_value, const T* gate,
+    int64_t cache_len, int64_t num_query_heads, int64_t num_kv_heads) {
+    const int64_t dimension = threadIdx.x;
+    const int64_t query_head = blockIdx.x;
+    const int64_t kv_head = query_head / (num_query_heads / num_kv_heads);
+    const int64_t query_base = query_head * HeadDim;
+    const float scale = rsqrtf(static_cast<float>(HeadDim));
+    const float query_value = load_value(query, query_base + dimension);
+    float output = 0.0f;
+    __shared__ float wave_sums[HeadDim / 32];
+    __shared__ float online_max;
+    __shared__ float online_sum;
+    __shared__ float previous_scale;
+    __shared__ float current_scale;
+    if (dimension == 0) {
+        online_max = -INFINITY;
+        online_sum = 0.0f;
+    }
+    __syncthreads();
+    const int64_t old_cache_len = cache_len - 1;
+    for (int64_t source = 0; source < old_cache_len; ++source) {
+        const int64_t base = (source * num_kv_heads + kv_head) * HeadDim;
+        const float key_value = load_value(key_cache, base + dimension);
+        float partial = query_value * key_value;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            partial += __shfl_down(partial, offset);
+        const int lane = static_cast<int>(dimension) % warpSize;
+        const int wave = static_cast<int>(dimension) / warpSize;
+        if (lane == 0) wave_sums[wave] = partial;
+        __syncthreads();
+        if (dimension == 0) {
+            float dot = 0.0f;
+            for (int wave_index = 0; wave_index < HeadDim / warpSize;
+                 ++wave_index) dot += wave_sums[wave_index];
+            const float score = dot * scale;
+            const float next_max = fmaxf(online_max, score);
+            previous_scale = expf(online_max - next_max);
+            current_scale = expf(score - next_max);
+            online_sum = online_sum * previous_scale + current_scale;
+            online_max = next_max;
+        }
+        __syncthreads();
+        const float value = load_value(value_cache, base + dimension);
+        output = output * previous_scale + current_scale * value;
+    }
+    {
+        const float key_value =
+            load_value(current_key, kv_head * HeadDim + dimension);
+        float partial = query_value * key_value;
+        for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+            partial += __shfl_down(partial, offset);
+        const int lane = static_cast<int>(dimension) % warpSize;
+        const int wave = static_cast<int>(dimension) / warpSize;
+        if (lane == 0) wave_sums[wave] = partial;
+        __syncthreads();
+        if (dimension == 0) {
+            float dot = 0.0f;
+            for (int wave_index = 0; wave_index < HeadDim / warpSize;
+                 ++wave_index) dot += wave_sums[wave_index];
+            const float score = dot * scale;
+            const float next_max = fmaxf(online_max, score);
+            previous_scale = expf(online_max - next_max);
+            current_scale = expf(score - next_max);
+            online_sum = online_sum * previous_scale + current_scale;
+            online_max = next_max;
+        }
+        __syncthreads();
+        output = output * previous_scale + current_scale *
+            load_value(current_value, kv_head * HeadDim + dimension);
+    }
+    output /= online_sum;
+    if (gate != nullptr)
+        output *= 1.0f / (1.0f + expf(-load_value(gate, query_base + dimension)));
+    store_value(dst, query_base + dimension, output);
+    if (query_head % (num_query_heads / num_kv_heads) == 0) {
+        const int64_t cache_base =
+            ((cache_len - 1) * num_kv_heads + kv_head) * HeadDim;
+        store_value(key_cache, cache_base + dimension,
+                    load_value(current_key, kv_head * HeadDim + dimension));
+        store_value(value_cache, cache_base + dimension,
+                    load_value(current_value, kv_head * HeadDim + dimension));
+    }
+}
+
+template <typename T>
+__global__ void cached_gqa_current_token_head256_wave64_kernel(
+    T* dst, const T* query, T* key_cache, T* value_cache,
+    const T* current_key, const T* current_value, const T* gate,
+    int64_t cache_len, int64_t num_query_heads, int64_t num_kv_heads) {
+    const int64_t lane = threadIdx.x;
+    const int64_t query_head = blockIdx.x;
+    const int64_t kv_head = query_head / (num_query_heads / num_kv_heads);
+    const int64_t query_base = query_head * 256;
+    const float q0 = load_value(query, query_base + lane);
+    const float q1 = load_value(query, query_base + lane + 64);
+    const float q2 = load_value(query, query_base + lane + 128);
+    const float q3 = load_value(query, query_base + lane + 192);
+    float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+    float online_max = -INFINITY, online_sum = 0.0f;
+    const int64_t old_cache_len = cache_len - 1;
+    for (int64_t source = 0; source < old_cache_len; ++source) {
+        const int64_t base = (source * num_kv_heads + kv_head) * 256;
+        const float k0 = load_value(key_cache, base + lane);
+        const float k1 = load_value(key_cache, base + lane + 64);
+        const float k2 = load_value(key_cache, base + lane + 128);
+        const float k3 = load_value(key_cache, base + lane + 192);
+        float dot = q0 * k0 + q1 * k1 + q2 * k2 + q3 * k3;
+        for (int offset = 32; offset > 0; offset >>= 1)
+            dot += __shfl_down(dot, offset);
+        float previous_scale = 0.0f, current_scale = 0.0f;
+        if (lane == 0) {
+            const float score = dot * (1.0f / 16.0f);
+            const float next_max = fmaxf(online_max, score);
+            previous_scale = expf(online_max - next_max);
+            current_scale = expf(score - next_max);
+            online_sum = online_sum * previous_scale + current_scale;
+            online_max = next_max;
+        }
+        previous_scale = __shfl(previous_scale, 0);
+        current_scale = __shfl(current_scale, 0);
+        const float v0 = load_value(value_cache, base + lane);
+        const float v1 = load_value(value_cache, base + lane + 64);
+        const float v2 = load_value(value_cache, base + lane + 128);
+        const float v3 = load_value(value_cache, base + lane + 192);
+        o0 = o0 * previous_scale + current_scale * v0;
+        o1 = o1 * previous_scale + current_scale * v1;
+        o2 = o2 * previous_scale + current_scale * v2;
+        o3 = o3 * previous_scale + current_scale * v3;
+    }
+    {
+        const float base = static_cast<float>(kv_head * 256);
+        float dot =
+            q0 * load_value(current_key, static_cast<int64_t>(base) + lane) +
+            q1 * load_value(current_key, static_cast<int64_t>(base) + lane + 64) +
+            q2 * load_value(current_key, static_cast<int64_t>(base) + lane + 128) +
+            q3 * load_value(current_key, static_cast<int64_t>(base) + lane + 192);
+        for (int offset = 32; offset > 0; offset >>= 1)
+            dot += __shfl_down(dot, offset);
+        float previous_scale = 0.0f, current_scale = 0.0f;
+        if (lane == 0) {
+            const float score = dot * (1.0f / 16.0f);
+            const float next_max = fmaxf(online_max, score);
+            previous_scale = expf(online_max - next_max);
+            current_scale = expf(score - next_max);
+            online_sum = online_sum * previous_scale + current_scale;
+            online_max = next_max;
+        }
+        previous_scale = __shfl(previous_scale, 0);
+        current_scale = __shfl(current_scale, 0);
+        const int64_t current_base = kv_head * 256;
+        o0 = o0 * previous_scale + current_scale *
+            load_value(current_value, current_base + lane);
+        o1 = o1 * previous_scale + current_scale *
+            load_value(current_value, current_base + lane + 64);
+        o2 = o2 * previous_scale + current_scale *
+            load_value(current_value, current_base + lane + 128);
+        o3 = o3 * previous_scale + current_scale *
+            load_value(current_value, current_base + lane + 192);
+    }
+    online_sum = __shfl(online_sum, 0);
+    o0 /= online_sum; o1 /= online_sum; o2 /= online_sum; o3 /= online_sum;
+    if (gate != nullptr) {
+        o0 *= 1.0f / (1.0f + expf(-load_value(gate, query_base + lane)));
+        o1 *= 1.0f / (1.0f + expf(-load_value(gate, query_base + lane + 64)));
+        o2 *= 1.0f / (1.0f + expf(-load_value(gate, query_base + lane + 128)));
+        o3 *= 1.0f / (1.0f + expf(-load_value(gate, query_base + lane + 192)));
+    }
+    store_value(dst, query_base + lane, o0);
+    store_value(dst, query_base + lane + 64, o1);
+    store_value(dst, query_base + lane + 128, o2);
+    store_value(dst, query_base + lane + 192, o3);
+    if (query_head % (num_query_heads / num_kv_heads) == 0) {
+        const int64_t cache_base =
+            ((cache_len - 1) * num_kv_heads + kv_head) * 256;
+        const int64_t current_base = kv_head * 256;
+        store_value(key_cache, cache_base + lane,
+                    load_value(current_key, current_base + lane));
+        store_value(key_cache, cache_base + lane + 64,
+                    load_value(current_key, current_base + lane + 64));
+        store_value(key_cache, cache_base + lane + 128,
+                    load_value(current_key, current_base + lane + 128));
+        store_value(key_cache, cache_base + lane + 192,
+                    load_value(current_key, current_base + lane + 192));
+        store_value(value_cache, cache_base + lane,
+                    load_value(current_value, current_base + lane));
+        store_value(value_cache, cache_base + lane + 64,
+                    load_value(current_value, current_base + lane + 64));
+        store_value(value_cache, cache_base + lane + 128,
+                    load_value(current_value, current_base + lane + 128));
+        store_value(value_cache, cache_base + lane + 192,
+                    load_value(current_value, current_base + lane + 192));
+    }
+}
+
 // Decode-optimized GQA for fixed-width heads. One block owns one query
 // head, computes each Q.K score cooperatively exactly once, and folds softmax
 // and P.V into a single online-softmax pass. The generic kernel above computes
@@ -449,9 +743,6 @@ __global__ void cached_gqa_fixed_head_kernel(
         output = output * previous_scale +
                  current_scale *
                      load_value(value_cache, cache_base + dimension);
-        // Prevent the next score from overwriting shared softmax state before
-        // every lane has consumed it.
-        __syncthreads();
     }
 
     output /= online_sum;
@@ -460,6 +751,96 @@ __global__ void cached_gqa_fixed_head_kernel(
         output *= 1.0f / (1.0f + expf(-gate_value));
     }
     store_value(dst, query_base + dimension, output);
+}
+
+// gfx936 decode specialization: one 64-lane wave owns a 256-wide query head.
+// Each lane processes four dimensions while preserving coalesced scalar loads.
+// Wave shuffles replace all cross-wave LDS communication and block barriers.
+template <typename T>
+__global__ void cached_gqa_head256_wave64_kernel(
+    T* dst, const T* query, const T* key_cache, const T* value_cache,
+    const T* gate, int64_t query_len, int64_t cache_len,
+    int64_t num_query_heads, int64_t num_kv_heads) {
+    const int64_t lane = threadIdx.x;
+    const int64_t query_head = blockIdx.x;
+    const int64_t query_sequence = blockIdx.y;
+    const int64_t kv_head =
+        query_head / (num_query_heads / num_kv_heads);
+    const int64_t query_base =
+        (query_sequence * num_query_heads + query_head) * 256;
+    const int64_t query_position =
+        cache_len - query_len + query_sequence;
+
+    const float query_0 = load_value(query, query_base + lane);
+    const float query_1 = load_value(query, query_base + lane + 64);
+    const float query_2 = load_value(query, query_base + lane + 128);
+    const float query_3 = load_value(query, query_base + lane + 192);
+    float output_0 = 0.0f;
+    float output_1 = 0.0f;
+    float output_2 = 0.0f;
+    float output_3 = 0.0f;
+    float online_max = -INFINITY;
+    float online_sum = 0.0f;
+
+    for (int64_t source_sequence = 0;
+         source_sequence <= query_position; ++source_sequence) {
+        const int64_t cache_base =
+            (source_sequence * num_kv_heads + kv_head) * 256;
+        float dot =
+            query_0 * load_value(key_cache, cache_base + lane) +
+            query_1 * load_value(key_cache, cache_base + lane + 64) +
+            query_2 * load_value(key_cache, cache_base + lane + 128) +
+            query_3 * load_value(key_cache, cache_base + lane + 192);
+        for (int offset = 32; offset > 0; offset >>= 1) {
+            dot += __shfl_down(dot, offset);
+        }
+
+        float previous_scale = 0.0f;
+        float current_scale = 0.0f;
+        if (lane == 0) {
+            const float score = dot * (1.0f / 16.0f);
+            const float next_max = fmaxf(online_max, score);
+            previous_scale = expf(online_max - next_max);
+            current_scale = expf(score - next_max);
+            online_sum = online_sum * previous_scale + current_scale;
+            online_max = next_max;
+        }
+        previous_scale = __shfl(previous_scale, 0);
+        current_scale = __shfl(current_scale, 0);
+
+        output_0 = output_0 * previous_scale +
+                   current_scale *
+                       load_value(value_cache, cache_base + lane);
+        output_1 = output_1 * previous_scale +
+                   current_scale *
+                       load_value(value_cache, cache_base + lane + 64);
+        output_2 = output_2 * previous_scale +
+                   current_scale *
+                       load_value(value_cache, cache_base + lane + 128);
+        output_3 = output_3 * previous_scale +
+                   current_scale *
+                       load_value(value_cache, cache_base + lane + 192);
+    }
+
+    online_sum = __shfl(online_sum, 0);
+    output_0 /= online_sum;
+    output_1 /= online_sum;
+    output_2 /= online_sum;
+    output_3 /= online_sum;
+    if (gate != nullptr) {
+        output_0 *= 1.0f /
+                    (1.0f + expf(-load_value(gate, query_base + lane)));
+        output_1 *= 1.0f /
+                    (1.0f + expf(-load_value(gate, query_base + lane + 64)));
+        output_2 *= 1.0f /
+                    (1.0f + expf(-load_value(gate, query_base + lane + 128)));
+        output_3 *= 1.0f /
+                    (1.0f + expf(-load_value(gate, query_base + lane + 192)));
+    }
+    store_value(dst, query_base + lane, output_0);
+    store_value(dst, query_base + lane + 64, output_1);
+    store_value(dst, query_base + lane + 128, output_2);
+    store_value(dst, query_base + lane + 192, output_3);
 }
 
 template <typename T>
@@ -907,8 +1288,8 @@ Status launch_causal_gqa(void* dst, const void* query, const void* key,
                           "launch causal GQA head-128 kernel");
     }
     if (head_dim == 256) {
-        hipLaunchKernelGGL((cached_gqa_fixed_head_kernel<T, 256>), grid,
-                           dim3(256), 0, stream, static_cast<T*>(dst),
+        hipLaunchKernelGGL((cached_gqa_head256_wave64_kernel<T>), grid,
+                           dim3(64), 0, stream, static_cast<T*>(dst),
                            static_cast<const T*>(query),
                            static_cast<const T*>(key),
                            static_cast<const T*>(value),
@@ -936,13 +1317,23 @@ Status launch_append_kv_cache(void* key_cache, void* value_cache,
                               hipStream_t stream) {
     const int64_t row_width = num_kv_heads * head_dim;
     const int64_t count = token_count * row_width;
-    hipLaunchKernelGGL(append_kv_cache_kernel<T>, grid_for(count),
-                       dim3(kBlockSize), 0, stream,
-                       static_cast<T*>(key_cache),
-                       static_cast<T*>(value_cache),
-                       static_cast<const T*>(key),
-                       static_cast<const T*>(value), count, row_width,
-                       cache_offset);
+    if (token_count == 1) {
+        hipLaunchKernelGGL(append_kv_cache_single_token_kernel<T>,
+                           grid_for(count), dim3(kBlockSize), 0, stream,
+                           static_cast<T*>(key_cache),
+                           static_cast<T*>(value_cache),
+                           static_cast<const T*>(key),
+                           static_cast<const T*>(value), count, row_width,
+                           cache_offset);
+    } else {
+        hipLaunchKernelGGL(append_kv_cache_kernel<T>, grid_for(count),
+                           dim3(kBlockSize), 0, stream,
+                           static_cast<T*>(key_cache),
+                           static_cast<T*>(value_cache),
+                           static_cast<const T*>(key),
+                           static_cast<const T*>(value), count, row_width,
+                           cache_offset);
+    }
     return hip_status(hipGetLastError(), "launch KV cache append kernel");
 }
 
@@ -964,8 +1355,8 @@ Status launch_cached_gqa(void* dst, const void* query, const void* key_cache,
                            static_cast<const T*>(gate), query_len, cache_len,
                            num_query_heads, num_kv_heads);
     } else if (head_dim == 256) {
-        hipLaunchKernelGGL((cached_gqa_fixed_head_kernel<T, 256>), grid,
-                           dim3(256), 0, stream,
+        hipLaunchKernelGGL((cached_gqa_head256_wave64_kernel<T>), grid,
+                           dim3(64), 0, stream,
                            static_cast<T*>(dst),
                            static_cast<const T*>(query),
                            static_cast<const T*>(key_cache),
@@ -982,6 +1373,49 @@ Status launch_cached_gqa(void* dst, const void* query, const void* key_cache,
                            num_query_heads, num_kv_heads, head_dim);
     }
     return hip_status(hipGetLastError(), "launch cached GQA kernel");
+}
+
+template <typename T>
+Status launch_cached_gqa_with_current_token(
+    void* dst, const void* query, const void* key_cache,
+    const void* value_cache, const void* current_key,
+    const void* current_value, const void* gate, int64_t cache_len,
+    int64_t num_query_heads, int64_t num_kv_heads, int64_t head_dim,
+    hipStream_t stream) {
+    const dim3 grid(static_cast<unsigned int>(num_query_heads));
+    if (head_dim == 128) {
+        hipLaunchKernelGGL((cached_gqa_current_token_fixed_head_kernel<T, 128>),
+                           grid, dim3(128), 0, stream, static_cast<T*>(dst),
+                           static_cast<const T*>(query),
+                           static_cast<T*>(const_cast<void*>(key_cache)),
+                           static_cast<T*>(const_cast<void*>(value_cache)),
+                           static_cast<const T*>(current_key),
+                           static_cast<const T*>(current_value),
+                           static_cast<const T*>(gate), cache_len,
+                           num_query_heads, num_kv_heads);
+    } else if (head_dim == 256) {
+        hipLaunchKernelGGL(cached_gqa_current_token_head256_wave64_kernel<T>,
+                           grid, dim3(64), 0, stream, static_cast<T*>(dst),
+                           static_cast<const T*>(query),
+                           static_cast<T*>(const_cast<void*>(key_cache)),
+                           static_cast<T*>(const_cast<void*>(value_cache)),
+                           static_cast<const T*>(current_key),
+                           static_cast<const T*>(current_value),
+                           static_cast<const T*>(gate), cache_len,
+                           num_query_heads, num_kv_heads);
+    } else {
+        hipLaunchKernelGGL(cached_gqa_current_token_kernel<T>, grid,
+                           dim3(kBlockSize), 0, stream, static_cast<T*>(dst),
+                           static_cast<const T*>(query),
+                           static_cast<T*>(const_cast<void*>(key_cache)),
+                           static_cast<T*>(const_cast<void*>(value_cache)),
+                           static_cast<const T*>(current_key),
+                           static_cast<const T*>(current_value),
+                           static_cast<const T*>(gate), cache_len,
+                           num_query_heads, num_kv_heads, head_dim);
+    }
+    return hip_status(hipGetLastError(),
+                      "launch fused cached GQA current-token kernel");
 }
 
 template <typename T>
@@ -1322,6 +1756,34 @@ Status cached_gqa(void* dst, const void* query, const void* key_cache,
             num_query_heads, num_kv_heads, head_dim, as_stream(stream_handle));
     return Status(StatusCode::UnsupportedDType,
                   "Unsupported HIP cached GQA dtype");
+}
+
+Status cached_gqa_with_current_token(
+    void* dst, const void* query, const void* key_cache,
+    const void* value_cache, const void* current_key,
+    const void* current_value, const void* gate, DType dtype,
+    int64_t cache_len, int64_t num_query_heads, int64_t num_kv_heads,
+    int64_t head_dim, void* stream_handle) {
+    if (dst == nullptr || query == nullptr || key_cache == nullptr ||
+        value_cache == nullptr || current_key == nullptr ||
+        current_value == nullptr || cache_len <= 0 || num_query_heads <= 0 ||
+        num_kv_heads <= 0 || head_dim <= 0 ||
+        num_query_heads % num_kv_heads != 0) {
+        return Status(StatusCode::InvalidArgument,
+                      "Invalid HIP fused cached GQA arguments");
+    }
+    if (dtype == DType::FP32)
+        return launch_cached_gqa_with_current_token<float>(
+            dst, query, key_cache, value_cache, current_key, current_value,
+            gate, cache_len, num_query_heads, num_kv_heads, head_dim,
+            as_stream(stream_handle));
+    if (dtype == DType::BF16)
+        return launch_cached_gqa_with_current_token<hip_bfloat16>(
+            dst, query, key_cache, value_cache, current_key, current_value,
+            gate, cache_len, num_query_heads, num_kv_heads, head_dim,
+            as_stream(stream_handle));
+    return Status(StatusCode::UnsupportedDType,
+                  "Unsupported HIP fused cached GQA dtype");
 }
 
 Status causal_conv1d_silu(void* dst, void* conv_state, const void* src,

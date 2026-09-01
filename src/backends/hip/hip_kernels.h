@@ -50,6 +50,12 @@ Status cached_gqa(void* dst, const void* query, const void* key_cache,
                   int64_t query_len, int64_t cache_len,
                   int64_t num_query_heads, int64_t num_kv_heads,
                   int64_t head_dim, void* stream_handle);
+Status cached_gqa_with_current_token(
+    void* dst, const void* query, const void* key_cache,
+    const void* value_cache, const void* current_key,
+    const void* current_value, const void* gate, DType dtype,
+    int64_t cache_len, int64_t num_query_heads, int64_t num_kv_heads,
+    int64_t head_dim, void* stream_handle);
 Status causal_conv1d_silu(void* dst, void* conv_state, const void* src,
                           const void* weight, DType dtype,
                           int64_t token_count, int64_t channels,

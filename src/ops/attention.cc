@@ -436,19 +436,32 @@ Tensor GatedGQAAttention::forward_impl(
                        cache->value.device() != input.device()) {
                 return Tensor();
             }
-            Status append_status = backend->append_kv_cache(
-                cache->key.buffer().get(), cache->value.buffer().get(),
-                k_rot.buffer().get(), v.buffer().get(), activation_dtype,
-                seq_len, num_kv_heads, head_dim, cache->length,
-                cache->capacity, stream);
-            if (!append_status.ok()) return Tensor();
             const int64_t new_cache_len = cache->length + seq_len;
-            attention_status = backend->cached_gqa(
-                attn_out_buf.get(), q_rot.buffer().get(),
-                cache->key.buffer().get(), cache->value.buffer().get(),
-                has_gate ? q_gate.buffer().get() : nullptr, activation_dtype,
-                seq_len, new_cache_len, num_q_heads, num_kv_heads, head_dim,
-                stream);
+            if (seq_len == 1) {
+                // Decode reads the current token exactly once. Keep it out of
+                // the cache write/read round trip. Append it after attention
+                // succeeds so the next decode step sees the new row.
+                attention_status = backend->cached_gqa_with_current_token(
+                    attn_out_buf.get(), q_rot.buffer().get(),
+                    cache->key.buffer().get(), cache->value.buffer().get(),
+                    k_rot.buffer().get(), v.buffer().get(),
+                    has_gate ? q_gate.buffer().get() : nullptr,
+                    activation_dtype, new_cache_len, num_q_heads, num_kv_heads,
+                    head_dim, stream);
+            } else {
+                Status append_status = backend->append_kv_cache(
+                    cache->key.buffer().get(), cache->value.buffer().get(),
+                    k_rot.buffer().get(), v.buffer().get(), activation_dtype,
+                    seq_len, num_kv_heads, head_dim, cache->length,
+                    cache->capacity, stream);
+                if (!append_status.ok()) return Tensor();
+                attention_status = backend->cached_gqa(
+                    attn_out_buf.get(), q_rot.buffer().get(),
+                    cache->key.buffer().get(), cache->value.buffer().get(),
+                    has_gate ? q_gate.buffer().get() : nullptr, activation_dtype,
+                    seq_len, new_cache_len, num_q_heads, num_kv_heads, head_dim,
+                    stream);
+            }
             if (attention_status.ok()) cache->length = new_cache_len;
         } else {
             attention_status = backend->causal_gqa(

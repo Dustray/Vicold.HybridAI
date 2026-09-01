@@ -359,6 +359,23 @@ std::shared_ptr<void> shared_rocblas_handle(int device_id) {
     return handle;
 }
 
+Status set_rocblas_stream_if_changed(rocblas_handle handle,
+                                     hipStream_t stream) {
+    // A device-shared rocBLAS handle is normally used by one inference thread,
+    // but keep the cache thread-local so different callers never reuse stream
+    // state from another host thread. The rocBLAS handle itself remains
+    // serialized by the existing backend usage contract.
+    static thread_local std::unordered_map<rocblas_handle, hipStream_t>
+        last_streams;
+    auto found = last_streams.find(handle);
+    if (found != last_streams.end() && found->second == stream) {
+        return Status::OK();
+    }
+    Status status = rocblas_error_to_status(rocblas_set_stream(handle, stream));
+    if (status.ok()) last_streams[handle] = stream;
+    return status;
+}
+
 std::shared_ptr<memory::MemoryPool> shared_memory_pool(
     HipBackend* backend, int device_id, MemoryType type) {
     static std::mutex mutex;
@@ -694,8 +711,8 @@ Status HipBackend::gemm(Buffer* c, const Buffer* a, const Buffer* b,
         return Status(StatusCode::InvalidArgument,
                       "HipBackend::gemm requires a HIP stream");
     }
-    Status status = rocblas_error_to_status(rocblas_set_stream(
-        rocblas, hip_stream == nullptr ? nullptr : hip_stream->handle()));
+    Status status = set_rocblas_stream_if_changed(
+        rocblas, hip_stream == nullptr ? nullptr : hip_stream->handle());
     if (!status.ok()) return status;
 
     // The public Backend contract uses row-major matrices. rocBLAS is
@@ -1135,6 +1152,58 @@ Status HipBackend::cached_gqa(Buffer* dst, const Buffer* query,
     (void)dst; (void)query; (void)key_cache; (void)value_cache; (void)gate;
     (void)dtype; (void)query_len; (void)cache_len; (void)num_query_heads;
     (void)num_kv_heads; (void)head_dim; (void)stream;
+    return Status(StatusCode::NotImplemented, "HIP kernels are unavailable");
+#endif
+}
+
+Status HipBackend::cached_gqa_with_current_token(
+    Buffer* dst, const Buffer* query, const Buffer* key_cache,
+    const Buffer* value_cache, const Buffer* current_key,
+    const Buffer* current_value, const Buffer* gate, DType dtype,
+    int64_t cache_len, int64_t num_query_heads, int64_t num_kv_heads,
+    int64_t head_dim, Stream* stream) {
+#if defined(HYBRIDAI_HAS_HIP) && defined(HYBRIDAI_HAS_HIP_KERNELS)
+    const size_t element_size = SizeOfDType(dtype);
+    const size_t query_bytes = static_cast<size_t>(
+        num_query_heads * head_dim) * element_size;
+    const size_t cache_bytes = static_cast<size_t>(
+        (cache_len - 1) * num_kv_heads * head_dim) * element_size;
+    Status status = validate_kernel_buffer(dst, device_, query_bytes, "dst");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(query, device_, query_bytes, "query");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(key_cache, device_, cache_bytes,
+                                    "key_cache");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(value_cache, device_, cache_bytes,
+                                    "value_cache");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(current_key, device_,
+                                    static_cast<size_t>(num_kv_heads * head_dim) *
+                                        element_size,
+                                    "current_key");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(current_value, device_,
+                                    static_cast<size_t>(num_kv_heads * head_dim) *
+                                        element_size,
+                                    "current_value");
+    if (!status.ok()) return status;
+    if (gate != nullptr) {
+        status = validate_kernel_buffer(gate, device_, query_bytes, "gate");
+        if (!status.ok()) return status;
+    }
+    if (hipSetDevice(device_.id()) != hipSuccess)
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    return hip_kernels::cached_gqa_with_current_token(
+        dst->data(), query->data(), key_cache->data(), value_cache->data(),
+        current_key->data(), current_value->data(),
+        gate == nullptr ? nullptr : gate->data(), dtype, cache_len,
+        num_query_heads, num_kv_heads, head_dim, native_stream(stream));
+#else
+    (void)dst; (void)query; (void)key_cache; (void)value_cache;
+    (void)current_key; (void)current_value; (void)gate; (void)dtype;
+    (void)cache_len; (void)num_query_heads; (void)num_kv_heads;
+    (void)head_dim; (void)stream;
     return Status(StatusCode::NotImplemented, "HIP kernels are unavailable");
 #endif
 }

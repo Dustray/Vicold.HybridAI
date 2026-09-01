@@ -368,6 +368,78 @@ TEST_F(HipKernelTest, CausalGqaWithGateMatchesReference) {
     }
 }
 
+TEST_F(HipKernelTest, CausalGqaHead256MatchesReference) {
+    constexpr int64_t seq_len = 3;
+    constexpr int64_t query_heads = 4;
+    constexpr int64_t kv_heads = 2;
+    constexpr int64_t head_dim = 256;
+    const int64_t query_count = seq_len * query_heads * head_dim;
+    const int64_t kv_count = seq_len * kv_heads * head_dim;
+    std::vector<float> query(static_cast<size_t>(query_count));
+    std::vector<float> key(static_cast<size_t>(kv_count));
+    std::vector<float> value(static_cast<size_t>(kv_count));
+    std::vector<float> gate(static_cast<size_t>(query_count));
+    for (int64_t index = 0; index < query_count; ++index) {
+        query[index] = static_cast<float>((index * 17) % 29 - 14) / 19.0f;
+        gate[index] = static_cast<float>((index * 7) % 13 - 6) / 5.0f;
+    }
+    for (int64_t index = 0; index < kv_count; ++index) {
+        key[index] = static_cast<float>((index * 11) % 31 - 15) / 23.0f;
+        value[index] = static_cast<float>((index * 5) % 37 - 18) / 17.0f;
+    }
+    auto query_buffer = upload(query);
+    auto key_buffer = upload(key);
+    auto value_buffer = upload(value);
+    auto gate_buffer = upload(gate);
+    auto output = backend_->create_buffer(query.size() * sizeof(float),
+                                           MemoryType::Device);
+    ASSERT_NE(output, nullptr);
+    ASSERT_TRUE(backend_->causal_gqa(
+        output.get(), query_buffer.get(), key_buffer.get(), value_buffer.get(),
+        gate_buffer.get(), DType::FP32, seq_len, query_heads, kv_heads,
+        head_dim).ok());
+    const auto actual = download<float>(output, query.size());
+
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    const int64_t heads_per_kv = query_heads / kv_heads;
+    for (int64_t sequence = 0; sequence < seq_len; ++sequence) {
+        for (int64_t head = 0; head < query_heads; ++head) {
+            const int64_t kv_head = head / heads_per_kv;
+            const int64_t query_base =
+                (sequence * query_heads + head) * head_dim;
+            std::vector<float> scores(static_cast<size_t>(sequence + 1));
+            float maximum = -INFINITY;
+            for (int64_t source = 0; source <= sequence; ++source) {
+                const int64_t key_base =
+                    (source * kv_heads + kv_head) * head_dim;
+                float score = 0.0f;
+                for (int64_t dimension = 0; dimension < head_dim; ++dimension) {
+                    score += query[query_base + dimension] *
+                             key[key_base + dimension];
+                }
+                scores[source] = score * scale;
+                maximum = std::max(maximum, scores[source]);
+            }
+            float denominator = 0.0f;
+            for (float score : scores) denominator += std::exp(score - maximum);
+            for (int64_t dimension = 0; dimension < head_dim; ++dimension) {
+                float expected = 0.0f;
+                for (int64_t source = 0; source <= sequence; ++source) {
+                    const int64_t value_base =
+                        (source * kv_heads + kv_head) * head_dim;
+                    expected += std::exp(scores[source] - maximum) /
+                                denominator * value[value_base + dimension];
+                }
+                expected *= 1.0f /
+                            (1.0f + std::exp(-gate[query_base + dimension]));
+                EXPECT_NEAR(actual[query_base + dimension], expected, 2e-5f)
+                    << "sequence=" << sequence << " head=" << head
+                    << " dimension=" << dimension;
+            }
+        }
+    }
+}
+
 TEST_F(HipKernelTest, KvCacheAppendAndDecodeMatchReference) {
     constexpr int64_t capacity = 4;
     constexpr int64_t query_heads = 2;
@@ -457,6 +529,42 @@ TEST_F(HipKernelTest, KvCacheAppendAtNonzeroOffsetPreservesRows) {
     EXPECT_EQ(actual_value, expected_value);
 }
 
+TEST_F(HipKernelTest, KvCacheSingleTokenAtCapacityBoundaryPreservesRows) {
+    constexpr int64_t capacity = 3;
+    constexpr int64_t kv_heads = 2;
+    constexpr int64_t head_dim = 256;
+    constexpr int64_t row_width = kv_heads * head_dim;
+    auto key_cache = upload(std::vector<float>(capacity * row_width, -1.0f));
+    auto value_cache = upload(std::vector<float>(capacity * row_width, -2.0f));
+
+    std::vector<float> key(row_width);
+    std::vector<float> value(row_width);
+    for (int64_t index = 0; index < row_width; ++index) {
+        key[index] = 0.25f * static_cast<float>(index) - 17.0f;
+        value[index] = -0.5f * static_cast<float>(index) + 31.0f;
+    }
+    auto key_buffer = upload(key);
+    auto value_buffer = upload(value);
+    ASSERT_TRUE(backend_->append_kv_cache(
+        key_cache.get(), value_cache.get(), key_buffer.get(),
+        value_buffer.get(), DType::FP32, 1, kv_heads, head_dim, capacity - 1,
+        capacity).ok());
+
+    const auto actual_key = download<float>(key_cache, capacity * row_width);
+    const auto actual_value = download<float>(value_cache,
+                                               capacity * row_width);
+    for (int64_t index = 0; index < row_width; ++index) {
+        EXPECT_FLOAT_EQ(actual_key[(capacity - 1) * row_width + index],
+                        key[index]);
+        EXPECT_FLOAT_EQ(actual_value[(capacity - 1) * row_width + index],
+                        value[index]);
+    }
+    for (int64_t index = 0; index < (capacity - 1) * row_width; ++index) {
+        EXPECT_FLOAT_EQ(actual_key[index], -1.0f);
+        EXPECT_FLOAT_EQ(actual_value[index], -2.0f);
+    }
+}
+
 TEST_F(HipKernelTest, KvCacheAppendRejectsCapacityOverflow) {
     constexpr int64_t capacity = 3;
     constexpr int64_t kv_heads = 1;
@@ -471,6 +579,87 @@ TEST_F(HipKernelTest, KvCacheAppendRejectsCapacityOverflow) {
         key_cache.get(), value_cache.get(), key.get(), value.get(),
         DType::FP32, 2, kv_heads, head_dim, 2, capacity);
     EXPECT_EQ(status.code(), StatusCode::InvalidArgument);
+}
+
+TEST_F(HipKernelTest, CachedGqaWithCurrentTokenMatchesReference) {
+    constexpr int64_t cache_len = 3;
+    constexpr int64_t query_heads = 4;
+    constexpr int64_t kv_heads = 2;
+    constexpr int64_t head_dim = 4;
+    const int64_t row_width = kv_heads * head_dim;
+    auto key_cache = upload(std::vector<float>{
+        1, 0, 0, 1, 2, 0, 0, 2,
+        0, 1, 1, 0, 0, 2, 2, 0,
+    });
+    auto value_cache = upload(std::vector<float>{
+        1, 2, 3, 4, 5, 6, 7, 8,
+        9, 10, 11, 12, 13, 14, 15, 16,
+    });
+    auto current_key = upload(std::vector<float>{
+        -1, 0.5f, 2, -0.25f, 0.75f, -2, 0.5f, 1.5f,
+    });
+    auto current_value = upload(std::vector<float>{
+        -3, 1, 5, 2, 4, -2, 6, 0.5f,
+    });
+    const std::vector<float> query = {
+        0.5f, 1, -0.25f, 2,
+        -1, 0.25f, 0.75f, 1.5f,
+        2, -0.5f, 1, 0.25f,
+        -0.75f, 1.25f, -1, 0.5f,
+    };
+    const std::vector<float> gate(query.size(), 0.0f);
+    auto query_buffer = upload(query);
+    auto gate_buffer = upload(gate);
+    auto output = backend_->create_buffer(query.size() * sizeof(float),
+                                           MemoryType::Device);
+    ASSERT_NE(output, nullptr);
+    ASSERT_TRUE(backend_->cached_gqa_with_current_token(
+        output.get(), query_buffer.get(), key_cache.get(), value_cache.get(),
+        current_key.get(), current_value.get(), gate_buffer.get(),
+        DType::FP32, cache_len, query_heads, kv_heads, head_dim).ok());
+    const auto actual = download<float>(output, query.size());
+
+    const std::vector<float> keys = {
+        1, 0, 0, 1, 2, 0, 0, 2,
+        0, 1, 1, 0, 0, 2, 2, 0,
+        -1, 0.5f, 2, -0.25f, 0.75f, -2, 0.5f, 1.5f,
+    };
+    const std::vector<float> values = {
+        1, 2, 3, 4, 5, 6, 7, 8,
+        9, 10, 11, 12, 13, 14, 15, 16,
+        -3, 1, 5, 2, 4, -2, 6, 0.5f,
+    };
+    const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+    for (int64_t head = 0; head < query_heads; ++head) {
+        const int64_t kv_head = head / (query_heads / kv_heads);
+        const int64_t query_base = head * head_dim;
+        float scores[cache_len];
+        float maximum = -INFINITY;
+        for (int64_t token = 0; token < cache_len; ++token) {
+            const int64_t key_base = (token * kv_heads + kv_head) * head_dim;
+            scores[token] = 0.0f;
+            for (int64_t dimension = 0; dimension < head_dim; ++dimension)
+                scores[token] += query[query_base + dimension] *
+                                 keys[key_base + dimension];
+            scores[token] *= scale;
+            maximum = std::max(maximum, scores[token]);
+        }
+        float denominator = 0.0f;
+        for (float score : scores) denominator += std::exp(score - maximum);
+        for (int64_t dimension = 0; dimension < head_dim; ++dimension) {
+            float expected = 0.0f;
+            for (int64_t token = 0; token < cache_len; ++token) {
+                const int64_t value_base =
+                    (token * kv_heads + kv_head) * head_dim;
+                expected += std::exp(scores[token] - maximum) / denominator *
+                            values[value_base + dimension];
+            }
+            expected *= 0.5f;  // sigmoid(0) from the supplied gate tensor.
+            EXPECT_NEAR(actual[query_base + dimension], expected, 1e-5f)
+                << "head=" << head << " dimension=" << dimension;
+        }
+    }
+    (void)row_width;
 }
 
 TEST_F(HipKernelTest, Bf16CachedGqaMatchesFp32Reference) {

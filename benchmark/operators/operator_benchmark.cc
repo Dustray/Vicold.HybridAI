@@ -42,6 +42,7 @@ struct Options {
     int64_t key_head_dim = 128;
     int64_t value_head_dim = 128;
     int64_t conv_kernel_size = 4;
+    bool trans_b = false;
     int warmup = 10;
     int runs = 100;
 };
@@ -211,6 +212,16 @@ bool parse_options(int argc, char** argv, Options* options) {
             if (!next_int(&options->value_head_dim)) return false;
         } else if (arg == "--conv-kernel-size") {
             if (!next_int(&options->conv_kernel_size)) return false;
+        } else if (arg == "--trans-b") {
+            if (++index >= argc) return false;
+            const std::string value = argv[index];
+            if (value == "true" || value == "1") {
+                options->trans_b = true;
+            } else if (value == "false" || value == "0") {
+                options->trans_b = false;
+            } else {
+                return false;
+            }
         } else if (arg == "--warmup") {
             int64_t value = 0;
             if (!next_int(&value)) return false;
@@ -236,7 +247,7 @@ void print_usage(const char* program) {
     std::cout << "Usage: " << program
                                 << " [--op gemm|rmsnorm|add|silu|causal_conv1d_silu|"
                                     "causal_gqa|append_kv_cache|"
-                            "cached_gqa|"
+                                    "cached_gqa|fused_cached_gqa|"
                             "deltanet_recurrent|deltanet_grouped_conv]"
                             " [--backend hip|cpu]"
                                 " [--dtype fp32|bf16]"
@@ -247,6 +258,7 @@ void print_usage(const char* program) {
                              " [--token-count 1] [--num-qk-heads 16]"
                              " [--num-value-heads 16] [--key-head-dim 128]"
                              " [--value-head-dim 128] [--conv-kernel-size 4]"
+                 " [--trans-b true|false]"
                  " [--warmup 10] [--runs 100]\n";
 }
 
@@ -507,6 +519,87 @@ int run_cached_gqa(const Options& options,
               << device.backend() << ":" << device.id()
               << "\",\"query_len\":" << options.query_len
               << ",\"cache_len\":" << options.cache_len
+              << ",\"num_query_heads\":" << options.num_query_heads
+              << ",\"num_kv_heads\":" << options.num_kv_heads
+              << ",\"head_dim\":" << options.head_dim
+              << ",\"warmup\":" << options.warmup
+              << ",\"runs\":" << options.runs
+              << ",\"gpu_ms_median\":" << median(samples);
+    print_stats(samples);
+    std::cout << ",\"correctness\":\"checked\"}\n";
+    return 0;
+}
+
+int run_fused_cached_gqa(const Options& options,
+                         const std::shared_ptr<Backend>& backend,
+                         const Device& device) {
+    if (options.num_query_heads <= 0 || options.num_kv_heads <= 0 ||
+        options.num_query_heads % options.num_kv_heads != 0 ||
+        options.query_len != 1 || options.cache_len <= 0) {
+        std::cerr << "fused cached GQA requires query-len=1 and valid heads/cache-len\n";
+        return 1;
+    }
+    const size_t query_count = static_cast<size_t>(
+        options.num_query_heads * options.head_dim);
+    const size_t cache_count = static_cast<size_t>(
+        options.cache_len * options.num_kv_heads * options.head_dim);
+    const size_t current_count = static_cast<size_t>(
+        options.num_kv_heads * options.head_dim);
+    const size_t query_bytes = query_count * SizeOfDType(options.dtype);
+    const size_t cache_bytes = cache_count * SizeOfDType(options.dtype);
+    const size_t current_bytes = current_count * SizeOfDType(options.dtype);
+    auto query = backend->create_buffer(query_bytes, MemoryType::Device);
+    auto key_cache = backend->create_buffer(cache_bytes, MemoryType::Device);
+    auto value_cache = backend->create_buffer(cache_bytes, MemoryType::Device);
+    auto current_key = backend->create_buffer(current_bytes, MemoryType::Device);
+    auto current_value = backend->create_buffer(current_bytes, MemoryType::Device);
+    auto output = backend->create_buffer(query_bytes, MemoryType::Device);
+    if (query == nullptr || key_cache == nullptr || value_cache == nullptr ||
+        current_key == nullptr || current_value == nullptr || output == nullptr) {
+        std::cerr << "Failed to allocate fused cached GQA buffers\n";
+        return 1;
+    }
+    const auto host_query = make_host_values(query_count, 0.1f, options.dtype);
+    const auto host_cache = make_host_values(cache_count, 0.1f, options.dtype);
+    const auto host_current = make_host_values(current_count, 0.1f, options.dtype);
+    if (!check_status(backend->memcpy_h2d(query.get(), host_query.data(),
+                                          query_bytes), "copy query") ||
+        !check_status(backend->memcpy_h2d(key_cache.get(), host_cache.data(),
+                                          cache_bytes), "copy key cache") ||
+        !check_status(backend->memcpy_h2d(value_cache.get(), host_cache.data(),
+                                          cache_bytes), "copy value cache") ||
+        !check_status(backend->memcpy_h2d(current_key.get(), host_current.data(),
+                                          current_bytes), "copy current key") ||
+        !check_status(backend->memcpy_h2d(current_value.get(), host_current.data(),
+                                          current_bytes), "copy current value") ||
+        !check_status(backend->synchronize(), "initial synchronize")) {
+        return 1;
+    }
+    auto stream = backend->create_stream();
+    auto start = backend->create_event();
+    auto end = backend->create_event();
+    if (stream == nullptr || start == nullptr || end == nullptr) return 1;
+    auto operation = [&]() {
+        return backend->cached_gqa_with_current_token(
+            output.get(), query.get(), key_cache.get(), value_cache.get(),
+            current_key.get(), current_value.get(), nullptr, options.dtype,
+            options.cache_len, options.num_query_heads, options.num_kv_heads,
+            options.head_dim, stream.get());
+    };
+    std::vector<double> samples;
+    if (!measure(operation, backend.get(), stream.get(), start.get(), end.get(),
+                 options.warmup, options.runs, &samples)) return 1;
+    if (!check_typed_result(backend, output.get(), query_count, options.dtype,
+                            0.1f,
+                            options.dtype == DType::BF16 ? 2e-3f : 1e-4f,
+                            "fused cached GQA")) {
+        return 1;
+    }
+    std::cout << std::fixed << std::setprecision(6)
+              << "{\"logical_op\":\"fused_cached_gqa\",\"variant\":\""
+              << DTypeToString(options.dtype) << "\",\"device\":\""
+              << device.backend() << ":" << device.id()
+              << "\",\"query_len\":1,\"cache_len\":" << options.cache_len
               << ",\"num_query_heads\":" << options.num_query_heads
               << ",\"num_kv_heads\":" << options.num_kv_heads
               << ",\"head_dim\":" << options.head_dim
@@ -1002,6 +1095,9 @@ int main(int argc, char** argv) {
     if (options.op == "cached_gqa") {
         return run_cached_gqa(options, backend, device);
     }
+    if (options.op == "fused_cached_gqa") {
+        return run_fused_cached_gqa(options, backend, device);
+    }
     if (options.op == "append_kv_cache") {
         return run_append_kv_cache(options, backend, device);
     }
@@ -1054,7 +1150,7 @@ int main(int argc, char** argv) {
     auto run_once = [&]() {
         return backend->gemm(c.get(), a.get(), b.get(), options.dtype,
                              options.dtype, options.dtype, DType::FP32, false,
-                             false, options.m, options.n, options.k, 1.0f,
+                             options.trans_b, options.m, options.n, options.k, 1.0f,
                              0.0f, stream.get());
     };
     for (int index = 0; index < options.warmup; ++index) {
@@ -1102,6 +1198,7 @@ int main(int argc, char** argv) {
               << "\",\"m\":" << options.m << ",\"n\":" << options.n
               << ",\"k\":" << options.k << ",\"warmup\":"
               << options.warmup << ",\"runs\":" << options.runs
+              << ",\"trans_b\":" << (options.trans_b ? "true" : "false")
               << ",\"gpu_ms_median\":" << elapsed_ms;
     print_stats(samples);
     std::cout << ",\"effective_tflops\":" << tflops

@@ -29,6 +29,45 @@
 			"isBackground": false,
 			"problemMatcher": ["$gcc"],
 			"group": "build"
+		},
+		{
+			"label": "Build HybridAI Tests",
+			"type": "process",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"build",
+				"--parallel"
+			],
+			"isBackground": false,
+			"problemMatcher": ["$gcc"],
+			"group": "build"
+		},
+		{
+			"label": "Test DeltaNet Decode128",
+			"type": "process",
+			"command": "build/tests/hybridai_test",
+			"args": [
+				"--gtest_filter=HipKernelTest.DeltaNetDecode128*"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "test"
+		},
+		{
+			"label": "Build Qwen Infer Demo",
+			"type": "process",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"demo/build",
+				"--target",
+				"qwen_infer",
+				"--parallel"
+			],
+			"isBackground": false,
+			"problemMatcher": ["$gcc"],
+			"group": "build"
 		}
 	]
 }

@@ -285,16 +285,19 @@ cmake --build build-linux-hip --parallel
 final norm 和 LM head 放在末卡；BF16 权重保持原始精度并使用设备显存。
 
 ```bash
-./build-linux-hip/bin/qwen_infer \
+HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./demo/build/qwen_infer \
   /public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master \
-  hip 8
+  hip 8 --quiet-decode
 ```
 
 在当前 8 × 64 GiB `gfx936` 环境实测加载成功：文本模型权重约
 `50.10 GiB`，首末卡各约 `8.04 GiB`，其余卡各约 `5.67 GiB`。
 该命令可以继续执行 BF16 投影、真实 DeltaNet/reference forward、完整
-64 层前向、LM head 与 greedy decode。当前待改进项主要是 tokenizer
-字节级解码质量，以及将 host-reference DeltaNet 替换为优化 HIP kernel。
+64 层前向、LM head 与 greedy decode。2026-09-01 的八卡完整运行生成
+`1023` 个 decode token，用时 `40.4498 s`，吞吐为 `25.2906 token/s`。
+当前 DeltaNet、cached GQA 和 causal GQA 已走 HIP 优化 kernel；相同模型、
+prompt 和解码配置下的生成结果已经与 vLLM 对齐，因此八卡加载、完整执行链
+及端到端生成结果均已通过验证。
 
 `HYBRIDAI_ROCM_ROOT` 支持标准 ROCm 与 DTK 这类派生 SDK；构建逻辑会在
 SDK 根目录下查找 `hip`、`rocblas`、`dcc` 和 `dcc/comgr` 的 CMake 包。

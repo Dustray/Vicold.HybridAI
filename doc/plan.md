@@ -145,7 +145,7 @@ Vicold.HybridAI/
 
 ### 最新构建与 GPU 验证结论
 
-- **Linux HIP 当前实测**：在 `HIP_VISIBLE_DEVICES=0` 下，`build-linux-hip/bin/qwen_infer` 已成功加载约 50.10 GiB 的 BF16 文本权重，并完成 64 层混合 Attention/DeltaNet、MLP、final norm、lm_head 和多步 full-recompute greedy decode。推理路径当前是 reference 实现，性能尚未优化。
+- **Linux HIP 当前实测**：2026-09-01 在 8 张 `gfx936` 上通过 `demo/build/qwen_infer` 成功加载约 50.10 GiB 的 BF16 文本权重，并完成 64 层混合 Attention/DeltaNet、MLP、final norm、lm_head 和增量 greedy decode。生成 1023 个 decode token 用时 40.4498 s，吞吐 25.2906 token/s。DeltaNet、cached GQA 和 causal GQA 已使用 HIP 优化 kernel；相同模型、prompt 和解码配置下的生成结果已与 vLLM 对齐，下一阶段继续进行算子和端到端性能优化。
 - **Qwen3.5 语义修复**：主 RMSNorm 使用官方的 `(1 + weight)` 参数化；DeltaNet 的 `RMSNormGated` 保持普通乘权重并在归一化后施加 `SiLU(z)`；标准 Attention 使用 q/k per-head norm、half-split RoPE、sigmoid gate，且 q/gate 按 `[head, 2*head_dim]` 交错布局拆分。
 - **Tokenizer 模板**：C++ tokenizer 已支持 `<|im_end|>`、assistant generation prompt 和 `enable_thinking=false` 的空 thinking 段。当前 demo 使用关闭 thinking 的对话模板，以便先验证正常文本输出。
 - **当前数值状态**：模型可以稳定运行，但尚未达到 Hugging Face 参考输出；后续仍需做逐层/逐 token 数值对齐，重点是 BF16 staging、DeltaNet conv/state、attention 和 MLP 的算子精度。

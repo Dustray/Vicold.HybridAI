@@ -1,0 +1,36 @@
+HIP_ALLOC_INITIALIZE=0 HIP_VISIBLE_DEVICES=1 python3 benchmark/python/benchmark_latency.py   --runner build-benchmark/bin/hybridai_benchmark_runner   --model /public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master   --backend hip   --max-new-tokens 160   --warmup 1   --runs 5   --output results/latency.jsonl
+2026.08.31
+HybridAI Latency Benchmark
+  module: latency
+  records [count]: 5
+  max_new_tokens [token]: 160
++--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+| Metric                   | samples |      mean |       min |       max |       p50 |       p90 |       p95 |       p99 |
++--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+| prompt_tokens [token]    |       5 |        23 |        23 |        23 |        23 |        23 |        23 |        23 |
+| generated_tokens [token] |       5 |        40 |        40 |        40 |        40 |        40 |        40 |        40 |
+| e2e_seconds [ms]         |       5 |  3174.824 |  3172.683 |  3177.175 |  3174.841 |  3176.651 |  3176.913 |  3177.123 |
+| ttft_seconds [ms]        |       5 |   193.376 |   193.231 |   193.649 |   193.325 |   193.557 |   193.603 |   193.640 |
+| prefill_seconds [ms]     |       5 |   193.376 |   193.231 |   193.649 |   193.325 |   193.557 |   193.603 |   193.640 |
+| decode_seconds [ms]      |       5 |  2981.312 |  2979.225 |  2983.813 |  2981.053 |  2983.273 |  2983.543 |  2983.759 |
++--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+
+
+
+HIP_ALLOC_INITIALIZE=0 HIP_VISIBLE_DEVICES=1 python3 benchmark/python/benchmark_latency.py   --runner build-benchmark/bin/hybridai_benchmark_runner   --model /public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master   --backend hip   --max-new-tokens 160   --warmup 1   --runs 5   --output results/latency.jsonl
+
+2026.09.01
+HybridAI Latency Benchmark
+ module: latency
+  records [count]: 5
+  max_new_tokens [token]: 160
++--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+| Metric                   | samples |      mean |       min |       max |       p50 |       p90 |       p95 |       p99 |
++--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+| prompt_tokens [token]    |       5 |        23 |        23 |        23 |        23 |        23 |        23 |        23 |
+| generated_tokens [token] |       5 |        40 |        40 |        40 |        40 |        40 |        40 |        40 |
+| e2e_seconds [ms]         |       5 |  3071.800 |  3058.248 |  3077.695 |  3074.495 |  3077.102 |  3077.398 |  3077.635 |
+| ttft_seconds [ms]        |       5 |   184.355 |   184.134 |   184.632 |   184.307 |   184.564 |   184.598 |   184.625 |
+| prefill_seconds [ms]     |       5 |   184.355 |   184.134 |   184.632 |   184.307 |   184.564 |   184.598 |   184.625 |
+| decode_seconds [ms]      |       5 |  2887.292 |  2873.851 |  2893.236 |  2889.885 |  2892.713 |  2892.974 |  2893.184 |
++--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+

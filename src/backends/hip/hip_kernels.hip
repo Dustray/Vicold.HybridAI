@@ -493,11 +493,12 @@ __global__ void deltanet_grouped_conv_kernel(
     const T* weight, int64_t token_count, int64_t num_qk_heads,
     int64_t num_value_heads, int64_t key_head_dim,
     int64_t value_head_dim, int64_t kernel_size) {
-    const int64_t flat_channel = blockIdx.x;
+    const int64_t flat_channel =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t key_width = num_qk_heads * key_head_dim;
     const int64_t value_width = num_value_heads * value_head_dim;
     const int64_t qkv_width = key_width * 2 + value_width;
-    if (flat_channel >= qkv_width || threadIdx.x != 0) return;
+    if (flat_channel >= qkv_width) return;
     // Qwen3.5 stores both in_proj_qkv output and depthwise Conv1D weights in
     // flat [all Q][all K][all V] channel order. No per-QK-head regrouping is
     // applied here; older Qwen3-Next checkpoints require a separate layout
@@ -671,6 +672,8 @@ __global__ void deltanet_recurrent_decode128_kernel(
     __shared__ float k_scale_shared;
     __shared__ float decay_shared;
     __shared__ float beta_shared;
+    __shared__ float q_normalized[kKeyDim];
+    __shared__ float k_normalized[kKeyDim];
 
     float q_partial = 0.0f;
     float k_partial = 0.0f;
@@ -712,21 +715,23 @@ __global__ void deltanet_recurrent_decode128_kernel(
     __syncthreads();
 
     const int64_t j = lane;
+    q_normalized[j] = load_value(q, j) * q_scale_shared;
+    k_normalized[j] = load_value(k, j) * k_scale_shared;
+    __syncthreads();
+
     float retrieved = 0.0f;
     for (int64_t i = 0; i < kKeyDim; ++i) {
         float& state_value = state[i * kValueDim + j];
         state_value *= decay_shared;
-        retrieved += load_value(k, i) * k_scale_shared * state_value;
+        retrieved += k_normalized[i] * state_value;
     }
     const float corrected = load_value(v, j) - retrieved;
-    for (int64_t i = 0; i < kKeyDim; ++i) {
-        state[i * kValueDim + j] +=
-            beta_shared * load_value(k, i) * k_scale_shared * corrected;
-    }
-    const float q_scale = q_scale_shared;
     float output = 0.0f;
-    for (int64_t i = 0; i < kKeyDim; ++i)
-        output += load_value(q, i) * q_scale * state[i * kValueDim + j];
+    for (int64_t i = 0; i < kKeyDim; ++i) {
+        float& state_value = state[i * kValueDim + j];
+        state_value += beta_shared * k_normalized[i] * corrected;
+        output += q_normalized[i] * state_value;
+    }
     store_value(out, j, output);
 
     float rms_partial = output * output;
@@ -888,9 +893,32 @@ Status launch_causal_gqa(void* dst, const void* query, const void* key,
                          int64_t seq_len, int64_t num_query_heads,
                          int64_t num_kv_heads, int64_t head_dim,
                          hipStream_t stream) {
+    const dim3 grid(static_cast<unsigned int>(num_query_heads),
+                    static_cast<unsigned int>(seq_len));
+    if (head_dim == 128) {
+        hipLaunchKernelGGL((cached_gqa_fixed_head_kernel<T, 128>), grid,
+                           dim3(128), 0, stream, static_cast<T*>(dst),
+                           static_cast<const T*>(query),
+                           static_cast<const T*>(key),
+                           static_cast<const T*>(value),
+                           static_cast<const T*>(gate), seq_len, seq_len,
+                           num_query_heads, num_kv_heads);
+        return hip_status(hipGetLastError(),
+                          "launch causal GQA head-128 kernel");
+    }
+    if (head_dim == 256) {
+        hipLaunchKernelGGL((cached_gqa_fixed_head_kernel<T, 256>), grid,
+                           dim3(256), 0, stream, static_cast<T*>(dst),
+                           static_cast<const T*>(query),
+                           static_cast<const T*>(key),
+                           static_cast<const T*>(value),
+                           static_cast<const T*>(gate), seq_len, seq_len,
+                           num_query_heads, num_kv_heads);
+        return hip_status(hipGetLastError(),
+                          "launch causal GQA head-256 kernel");
+    }
     hipLaunchKernelGGL(causal_gqa_kernel<T>,
-                       dim3(static_cast<unsigned int>(num_query_heads),
-                            static_cast<unsigned int>(seq_len)),
+                       grid,
                        dim3(kBlockSize), 0, stream, static_cast<T*>(dst),
                        static_cast<const T*>(query),
                        static_cast<const T*>(key),
@@ -979,7 +1007,7 @@ Status launch_deltanet_grouped_conv(
     const int64_t channels = num_qk_heads * key_head_dim * 2 +
                              num_value_heads * value_head_dim;
     hipLaunchKernelGGL(deltanet_grouped_conv_kernel<T>,
-                       dim3(static_cast<unsigned int>(channels)), dim3(1), 0,
+                       grid_for(channels), dim3(kBlockSize), 0,
                        stream, static_cast<T*>(query), static_cast<T*>(key),
                        static_cast<T*>(value), static_cast<T*>(conv_state),
                        static_cast<const T*>(grouped_qkv),

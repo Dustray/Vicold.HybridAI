@@ -107,6 +107,10 @@ if(HYBRIDAI_ENABLE_HIP)
                 "${CMAKE_CURRENT_SOURCE_DIR}/hip_kernels.hip")
             set(HYBRIDAI_HIP_KERNEL_OBJECT
                 "${CMAKE_CURRENT_BINARY_DIR}/hip_kernels.hip.o")
+            set(HYBRIDAI_HIP_FUSED_KERNEL_SOURCE
+                "${CMAKE_CURRENT_SOURCE_DIR}/hip_fused_kernels.hip")
+            set(HYBRIDAI_HIP_FUSED_KERNEL_OBJECT
+                "${CMAKE_CURRENT_BINARY_DIR}/hip_fused_kernels.hip.o")
             set(HYBRIDAI_HIP_KERNEL_ARCH_FLAGS)
             set(HYBRIDAI_EFFECTIVE_HIP_ARCHITECTURES
                 "${HYBRIDAI_HIP_ARCHITECTURES}")
@@ -135,8 +139,23 @@ if(HYBRIDAI_ENABLE_HIP)
                 COMMAND_EXPAND_LISTS
                 COMMENT "Compiling HybridAI HIP kernels"
             )
+            add_custom_command(
+                OUTPUT "${HYBRIDAI_HIP_FUSED_KERNEL_OBJECT}"
+                COMMAND "${HYBRIDAI_HIPCC}" -std=c++20 -fPIC
+                    ${HYBRIDAI_HIP_KERNEL_ARCH_FLAGS}
+                    "-I${PROJECT_SOURCE_DIR}/src"
+                    -c "${HYBRIDAI_HIP_FUSED_KERNEL_SOURCE}"
+                    -o "${HYBRIDAI_HIP_FUSED_KERNEL_OBJECT}"
+                DEPENDS
+                    "${HYBRIDAI_HIP_FUSED_KERNEL_SOURCE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/hip_fused_kernels.h"
+                VERBATIM
+                COMMAND_EXPAND_LISTS
+                COMMENT "Compiling HybridAI fused HIP kernels"
+            )
             add_custom_target(hybridai_hip_kernels
-                DEPENDS "${HYBRIDAI_HIP_KERNEL_OBJECT}")
+                DEPENDS "${HYBRIDAI_HIP_KERNEL_OBJECT}"
+                        "${HYBRIDAI_HIP_FUSED_KERNEL_OBJECT}")
             add_dependencies(hybridai hybridai_hip_kernels)
             set_source_files_properties(
                 "${HYBRIDAI_HIP_KERNEL_OBJECT}"
@@ -147,7 +166,9 @@ if(HYBRIDAI_ENABLE_HIP)
             target_sources(hybridai PRIVATE
                 hip_backend.cc
                 hip_kernels.h
+                hip_fused_kernels.h
                 "${HYBRIDAI_HIP_KERNEL_OBJECT}"
+                "${HYBRIDAI_HIP_FUSED_KERNEL_OBJECT}"
             )
             target_compile_definitions(hybridai PRIVATE HYBRIDAI_HAS_HIP_KERNELS)
         endif()

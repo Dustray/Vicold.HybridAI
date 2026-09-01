@@ -315,6 +315,209 @@ TEST_F(HipKernelTest, SplitAndPartialRopeMatchReference) {
     }
 }
 
+TEST_F(HipKernelTest, FusedQkRmsNormRopeMatchesReference) {
+    constexpr int64_t seq_len = 2;
+    constexpr int64_t query_heads = 2;
+    constexpr int64_t kv_heads = 1;
+    constexpr int64_t head_dim = 4;
+    constexpr int64_t rope_dim = 4;
+    constexpr int64_t position_offset = 3;
+    constexpr float base = 10000.0f;
+    constexpr float eps = 1e-6f;
+    const std::vector<float> query = {
+        1.0f, 2.0f, 3.0f, 4.0f,
+        -2.0f, 1.0f, 0.5f, 3.0f,
+        4.0f, -1.0f, 2.0f, 0.25f,
+        0.5f, 3.0f, -2.0f, 1.5f};
+    const std::vector<float> key = {
+        2.0f, -1.0f, 0.25f, 3.0f,
+        -1.5f, 2.0f, 4.0f, -0.5f};
+    const std::vector<float> query_weight = {0.0f, 0.25f, -0.5f, 1.0f};
+    const std::vector<float> key_weight = {0.5f, -0.25f, 0.0f, 0.75f};
+    auto query_buffer = upload(query);
+    auto key_buffer = upload(key);
+    auto query_weight_buffer = upload(query_weight);
+    auto key_weight_buffer = upload(key_weight);
+    auto query_output = backend_->create_buffer(
+        query.size() * sizeof(float), MemoryType::Device);
+    auto key_output = backend_->create_buffer(
+        key.size() * sizeof(float), MemoryType::Device);
+    ASSERT_NE(query_output, nullptr);
+    ASSERT_NE(key_output, nullptr);
+
+    const Status fused_status = backend_->qk_rmsnorm_rope(
+        query_output.get(), query_buffer.get(), query_weight_buffer.get(),
+        key_output.get(), key_buffer.get(), key_weight_buffer.get(),
+        DType::FP32, seq_len, query_heads, kv_heads, head_dim, rope_dim,
+        position_offset, base, eps, true);
+    ASSERT_TRUE(fused_status.ok()) << fused_status.message();
+    const auto actual_query = download<float>(query_output, query.size());
+    const auto actual_key = download<float>(key_output, key.size());
+
+    auto check = [&](const std::vector<float>& source,
+                     const std::vector<float>& weight,
+                     const std::vector<float>& actual, int64_t heads) {
+        for (int64_t token = 0; token < seq_len; ++token) {
+            for (int64_t head = 0; head < heads; ++head) {
+                const int64_t offset = (token * heads + head) * head_dim;
+                float sum = 0.0f;
+                for (int64_t d = 0; d < head_dim; ++d)
+                    sum += source[offset + d] * source[offset + d];
+                const float inv_rms =
+                    1.0f / std::sqrt(sum / head_dim + eps);
+                const float theta = static_cast<float>(position_offset + token);
+                const float c0 = std::cos(theta);
+                const float s0 = std::sin(theta);
+                const float c1 = std::cos(theta / std::sqrt(base));
+                const float s1 = std::sin(theta / std::sqrt(base));
+                std::vector<float> normalized(head_dim);
+                for (int64_t d = 0; d < head_dim; ++d)
+                    normalized[d] = source[offset + d] * inv_rms *
+                                    (weight[d] + 1.0f);
+                EXPECT_NEAR(actual[offset], normalized[0] * c0 -
+                                           normalized[2] * s0, 1e-5f);
+                EXPECT_NEAR(actual[offset + 1], normalized[1] * c1 -
+                                               normalized[3] * s1, 1e-5f);
+                EXPECT_NEAR(actual[offset + 2], normalized[2] * c0 +
+                                               normalized[0] * s0, 1e-5f);
+                EXPECT_NEAR(actual[offset + 3], normalized[3] * c1 +
+                                               normalized[1] * s1, 1e-5f);
+            }
+        }
+    };
+    check(query, query_weight, actual_query, query_heads);
+    check(key, key_weight, actual_key, kv_heads);
+}
+
+TEST_F(HipKernelTest, FusedQGateRmsNormRopeMatchesReference) {
+    constexpr int64_t seq_len = 2;
+    constexpr int64_t query_heads = 2;
+    constexpr int64_t head_dim = 4;
+    constexpr int64_t rope_dim = 4;
+    constexpr int64_t position_offset = 5;
+    constexpr float base = 10000.0f;
+    constexpr float eps = 1e-6f;
+    const std::vector<float> source = {
+        1.0f, 2.0f, 3.0f, 4.0f,  -4.0f, 0.5f, 2.0f, -1.0f,
+        -2.0f, 1.0f, 0.5f, 3.0f, 1.5f, -2.0f, 0.25f, 4.0f,
+        4.0f, -1.0f, 2.0f, 0.25f, 0.25f, 3.0f, -2.0f, 1.5f,
+        0.5f, 3.0f, -2.0f, 1.5f, -1.0f, 2.0f, 0.75f, -3.0f};
+    const std::vector<float> weight = {0.0f, 0.25f, -0.5f, 1.0f};
+    auto source_buffer = upload(source);
+    auto weight_buffer = upload(weight);
+    auto query_output = backend_->create_buffer(
+        seq_len * query_heads * head_dim * sizeof(float), MemoryType::Device);
+    auto gate_output = backend_->create_buffer(
+        seq_len * query_heads * head_dim * sizeof(float), MemoryType::Device);
+    ASSERT_NE(query_output, nullptr);
+    ASSERT_NE(gate_output, nullptr);
+    ASSERT_TRUE(backend_->q_gate_rmsnorm_rope(
+        query_output.get(), gate_output.get(), source_buffer.get(),
+        weight_buffer.get(), DType::FP32, seq_len, query_heads, head_dim,
+        rope_dim, position_offset, base, eps, true).ok());
+
+    const auto actual_query = download<float>(query_output,
+                                               seq_len * query_heads * head_dim);
+    const auto actual_gate = download<float>(gate_output,
+                                              seq_len * query_heads * head_dim);
+    for (int64_t token = 0; token < seq_len; ++token) {
+        for (int64_t head = 0; head < query_heads; ++head) {
+            const int64_t source_base =
+                (token * query_heads + head) * 2 * head_dim;
+            const int64_t output_base =
+                (token * query_heads + head) * head_dim;
+            float sum = 0.0f;
+            for (int64_t d = 0; d < head_dim; ++d) {
+                sum += source[source_base + d] * source[source_base + d];
+                EXPECT_FLOAT_EQ(actual_gate[output_base + d],
+                                source[source_base + head_dim + d]);
+            }
+            const float inv_rms =
+                1.0f / std::sqrt(sum / head_dim + eps);
+            const float theta = static_cast<float>(position_offset + token);
+            const float c0 = std::cos(theta);
+            const float s0 = std::sin(theta);
+            const float c1 = std::cos(theta / std::sqrt(base));
+            const float s1 = std::sin(theta / std::sqrt(base));
+            float normalized[4];
+            for (int64_t d = 0; d < head_dim; ++d)
+                normalized[d] = source[source_base + d] * inv_rms *
+                                (weight[d] + 1.0f);
+            EXPECT_NEAR(actual_query[output_base],
+                        normalized[0] * c0 - normalized[2] * s0, 1e-5f);
+            EXPECT_NEAR(actual_query[output_base + 1],
+                        normalized[1] * c1 - normalized[3] * s1, 1e-5f);
+            EXPECT_NEAR(actual_query[output_base + 2],
+                        normalized[2] * c0 + normalized[0] * s0, 1e-5f);
+            EXPECT_NEAR(actual_query[output_base + 3],
+                        normalized[3] * c1 + normalized[1] * s1, 1e-5f);
+        }
+    }
+}
+
+TEST_F(HipKernelTest, FusedQGateRmsNormRopeBf16MatchesReference) {
+    constexpr int64_t seq_len = 1;
+    constexpr int64_t query_heads = 2;
+    constexpr int64_t head_dim = 4;
+    constexpr int64_t rope_dim = 4;
+    const std::vector<float> source_fp32 = {
+        1.0f, -2.0f, 0.5f, 3.0f, 4.0f, -1.0f, 2.0f, 0.25f,
+        -0.5f, 3.0f, -2.0f, 1.5f, -3.0f, 0.75f, 1.0f, 2.0f};
+    const std::vector<float> weight_fp32 = {0.0f, 0.25f, -0.5f, 1.0f};
+    std::vector<uint16_t> source(source_fp32.size());
+    std::vector<uint16_t> weight(weight_fp32.size());
+    for (size_t i = 0; i < source.size(); ++i)
+        source[i] = fp32_to_bf16(source_fp32[i]);
+    for (size_t i = 0; i < weight.size(); ++i)
+        weight[i] = fp32_to_bf16(weight_fp32[i]);
+    auto source_buffer = upload(source);
+    auto weight_buffer = upload(weight);
+    auto query_output = backend_->create_buffer(
+        query_heads * head_dim * sizeof(uint16_t), MemoryType::Device);
+    auto gate_output = backend_->create_buffer(
+        query_heads * head_dim * sizeof(uint16_t), MemoryType::Device);
+    ASSERT_NE(query_output, nullptr);
+    ASSERT_NE(gate_output, nullptr);
+    ASSERT_TRUE(backend_->q_gate_rmsnorm_rope(
+        query_output.get(), gate_output.get(), source_buffer.get(),
+        weight_buffer.get(), DType::BF16, seq_len, query_heads, head_dim,
+        rope_dim, 2, 10000.0f, 1e-6f, true).ok());
+    const auto actual_query = download<uint16_t>(query_output,
+                                                  query_heads * head_dim);
+    const auto actual_gate = download<uint16_t>(gate_output,
+                                                 query_heads * head_dim);
+    for (int64_t head = 0; head < query_heads; ++head) {
+        const int64_t source_base = head * 2 * head_dim;
+        const int64_t output_base = head * head_dim;
+        float sum = 0.0f;
+        for (int64_t d = 0; d < head_dim; ++d) {
+            const float value = bf16_to_fp32(source[source_base + d]);
+            sum += value * value;
+            EXPECT_FLOAT_EQ(bf16_to_fp32(actual_gate[output_base + d]),
+                            bf16_to_fp32(source[source_base + head_dim + d]));
+        }
+        const float inv_rms =
+            1.0f / std::sqrt(sum / head_dim + 1e-6f);
+        const float theta = 2.0f;
+        const float c0 = std::cos(theta);
+        const float s0 = std::sin(theta);
+        const float c1 = std::cos(theta / 100.0f);
+        const float s1 = std::sin(theta / 100.0f);
+        float normalized[4];
+        for (int64_t d = 0; d < head_dim; ++d)
+            normalized[d] = bf16_to_fp32(source[source_base + d]) * inv_rms *
+                            (bf16_to_fp32(weight[d]) + 1.0f);
+        const float expected[4] = {
+            normalized[0] * c0 - normalized[2] * s0,
+            normalized[1] * c1 - normalized[3] * s1,
+            normalized[2] * c0 + normalized[0] * s0,
+            normalized[3] * c1 + normalized[1] * s1};
+        for (int64_t d = 0; d < head_dim; ++d)
+            EXPECT_NEAR(bf16_to_fp32(actual_query[output_base + d]),
+                        bf16_to_fp32(fp32_to_bf16(expected[d])), 1e-3f);
+    }
+}
+
 TEST_F(HipKernelTest, CausalGqaWithGateMatchesReference) {
     constexpr int64_t seq_len = 2;
     constexpr int64_t query_heads = 2;

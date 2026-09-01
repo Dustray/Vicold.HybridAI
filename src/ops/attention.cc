@@ -280,6 +280,7 @@ Tensor GatedGQAAttention::forward_impl(
 
     // Reshape to [seq_len, num_heads, head_dim] and apply RoPE.
     const bool has_gate = wq.shape().dim(0) == 2 * num_q_heads * head_dim;
+    const int64_t position_offset = use_cache ? cache->length : 0;
     Tensor q_query = q;
     Tensor q_gate;
     if (has_gate) {
@@ -291,56 +292,102 @@ Tensor GatedGQAAttention::forward_impl(
             static_cast<size_t>(query_numel) * SizeOfDType(activation_dtype),
             input.buffer()->memory_type());
         if (query_buf == nullptr || gate_buf == nullptr) return Tensor();
-        if (input.device().type() != DeviceType::CPU) {
-            if (!backend->split_q_gate(
+        if (input.device().type() != DeviceType::CPU &&
+            q_norm_weight.buffer() != nullptr &&
+            k_norm_weight.buffer() != nullptr &&
+            q_norm_weight.dtype() == activation_dtype &&
+            k_norm_weight.dtype() == activation_dtype) {
+            if (!backend->q_gate_rmsnorm_rope(
+                    query_buf.get(), gate_buf.get(), q.buffer().get(),
+                    q_norm_weight.buffer().get(), activation_dtype, seq_len,
+                    num_q_heads, head_dim, rope_head_dim, position_offset,
+                    rope_base, rms_norm_eps, true, stream).ok()) {
+                return Tensor();
+            }
+            q_query = Tensor(Shape{seq_len, num_q_heads * head_dim},
+                             activation_dtype, input.device(),
+                             std::move(query_buf));
+            q_gate = Tensor(Shape{seq_len, num_q_heads * head_dim},
+                            activation_dtype, input.device(),
+                            std::move(gate_buf));
+        } else {
+            if (input.device().type() != DeviceType::CPU &&
+                !backend->split_q_gate(
                     query_buf.get(), gate_buf.get(), q.buffer().get(),
                     activation_dtype, seq_len, num_q_heads, head_dim,
                     stream).ok()) {
                 return Tensor();
             }
-        } else {
-            const float* q_all = static_cast<const float*>(q.data());
-            float* query_ptr = static_cast<float*>(query_buf->data());
-            float* gate_ptr = static_cast<float*>(gate_buf->data());
-            for (int64_t t = 0; t < seq_len; ++t) {
-                for (int64_t h = 0; h < num_q_heads; ++h) {
-                    const float* head = q_all +
-                        (t * num_q_heads + h) * (2 * head_dim);
-                    float* query_head = query_ptr +
-                        (t * num_q_heads + h) * head_dim;
-                    float* gate_head = gate_ptr +
-                        (t * num_q_heads + h) * head_dim;
-                    std::memcpy(query_head, head,
-                                static_cast<size_t>(head_dim) * sizeof(float));
-                    std::memcpy(gate_head, head + head_dim,
-                                static_cast<size_t>(head_dim) * sizeof(float));
+            if (input.device().type() == DeviceType::CPU) {
+                const float* q_all = static_cast<const float*>(q.data());
+                float* query_ptr = static_cast<float*>(query_buf->data());
+                float* gate_ptr = static_cast<float*>(gate_buf->data());
+                for (int64_t t = 0; t < seq_len; ++t) {
+                    for (int64_t h = 0; h < num_q_heads; ++h) {
+                        const float* head = q_all +
+                            (t * num_q_heads + h) * (2 * head_dim);
+                        float* query_head = query_ptr +
+                            (t * num_q_heads + h) * head_dim;
+                        float* gate_head = gate_ptr +
+                            (t * num_q_heads + h) * head_dim;
+                        std::memcpy(query_head, head,
+                                    static_cast<size_t>(head_dim) * sizeof(float));
+                        std::memcpy(gate_head, head + head_dim,
+                                    static_cast<size_t>(head_dim) * sizeof(float));
+                    }
                 }
             }
+            q_query = Tensor(Shape{seq_len, num_q_heads * head_dim},
+                             activation_dtype, input.device(),
+                             std::move(query_buf));
+            q_gate = Tensor(Shape{seq_len, num_q_heads * head_dim},
+                            activation_dtype, input.device(),
+                            std::move(gate_buf));
         }
-        q_query = Tensor(Shape{seq_len, num_q_heads * head_dim},
-                 activation_dtype, input.device(),
-                 std::move(query_buf));
-        q_gate = Tensor(Shape{seq_len, num_q_heads * head_dim},
-                activation_dtype, input.device(),
-                std::move(gate_buf));
     }
     Tensor q_3d(q_query.reshape(Shape{seq_len, num_q_heads, head_dim}));
     Tensor k_3d(k.reshape(Shape{seq_len, num_kv_heads, head_dim}));
 
+    Tensor q_rot;
+    Tensor k_rot;
+
     // Qwen3.5 applies a per-head RMSNorm to Q and K before RoPE. GPU tensors
-    // keep their native dtype; the RMSNorm kernel performs FP32 accumulation
+    // keep their native dtype; the fused kernel performs FP32 accumulation
     // internally and writes the result back in the original dtype.
-    if (input.device().type() != DeviceType::CPU &&
+    if (!has_gate && input.device().type() != DeviceType::CPU &&
         q_norm_weight.buffer() != nullptr &&
         k_norm_weight.buffer() != nullptr) {
         if (q_norm_weight.dtype() != activation_dtype ||
             k_norm_weight.dtype() != activation_dtype)
             return Tensor();
-        q_3d = RMSNorm::forward(
-            q_3d, q_norm_weight, rms_norm_eps, stream, true);
-        k_3d = RMSNorm::forward(
+        auto q_rot_buf = backend->create_buffer(
+            q_3d.nbytes(), input.buffer()->memory_type());
+        auto k_rot_buf = backend->create_buffer(
+            k_3d.nbytes(), input.buffer()->memory_type());
+        if (q_rot_buf == nullptr || k_rot_buf == nullptr) return Tensor();
+        Status fused_status = backend->qk_rmsnorm_rope(
+            q_rot_buf.get(), q_3d.buffer().get(), q_norm_weight.buffer().get(),
+            k_rot_buf.get(), k_3d.buffer().get(), k_norm_weight.buffer().get(),
+            activation_dtype, seq_len, num_q_heads, num_kv_heads, head_dim,
+            rope_head_dim, position_offset, rope_base, rms_norm_eps, true,
+            stream);
+        if (!fused_status.ok()) return Tensor();
+        q_rot = Tensor(q_3d.shape(), activation_dtype, input.device(),
+                       std::move(q_rot_buf));
+        k_rot = Tensor(k_3d.shape(), activation_dtype, input.device(),
+                       std::move(k_rot_buf));
+    } else if (has_gate && input.device().type() != DeviceType::CPU &&
+               q_norm_weight.buffer() != nullptr &&
+               k_norm_weight.buffer() != nullptr &&
+               q_norm_weight.dtype() == activation_dtype &&
+               k_norm_weight.dtype() == activation_dtype) {
+        Tensor k_normed = RMSNorm::forward(
             k_3d, k_norm_weight, rms_norm_eps, stream, true);
-        if (q_3d.buffer() == nullptr || k_3d.buffer() == nullptr) return Tensor();
+        if (k_normed.buffer() == nullptr) return Tensor();
+        k_rot = RoPE::partial(k_normed, rope_head_dim, position_offset,
+                              rope_base);
+        if (k_rot.buffer() == nullptr) return Tensor();
+        q_rot = q_3d;
     } else {
     std::vector<float> q_norm_host(static_cast<size_t>(head_dim), 1.0f);
     std::vector<float> k_norm_host(static_cast<size_t>(head_dim), 1.0f);
@@ -383,13 +430,12 @@ Tensor GatedGQAAttention::forward_impl(
         !apply_head_rms(&k_3d, num_kv_heads, k_norm_host)) return Tensor();
     }
 
-    const int64_t position_offset = use_cache ? cache->length : 0;
-    Tensor q_rot = apply_partial_rope(q_3d, rope_head_dim, position_offset,
-                                      rope_base,
-                                      backend.get());
-    Tensor k_rot = apply_partial_rope(k_3d, rope_head_dim, position_offset,
-                                      rope_base,
-                                      backend.get());
+    if (q_rot.buffer() == nullptr || k_rot.buffer() == nullptr) {
+        q_rot = apply_partial_rope(q_3d, rope_head_dim, position_offset,
+                                   rope_base, backend.get());
+        k_rot = apply_partial_rope(k_3d, rope_head_dim, position_offset,
+                                   rope_base, backend.get());
+    }
     if (q_rot.data() == nullptr || k_rot.data() == nullptr) {
         return Tensor();
     }

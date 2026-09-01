@@ -46,8 +46,9 @@ def main() -> None:
         "max_new_tokens": args.max_new_tokens,
         "e2e_seconds": summarize(records, "elapsed_seconds"),
         "ttft_seconds": summarize(records, "ttft_seconds"),
-        "prefill_seconds": summarize(records, "prefill_seconds"),
         "decode_seconds": summarize(records, "decode_seconds"),
+        "output_tokens_per_second": summarize(records, "output_tokens_per_second"),
+        "decode_tokens_per_second": summarize(records, "decode_tokens_per_second"),
     }
     summary_path = args.output.with_suffix(".summary.json")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n")

@@ -283,6 +283,27 @@ std::vector<Device> select_gpu_devices(const std::string& backend_name,
     return devices;
 }
 
+bool validate_model_devices(const std::vector<Device>& devices,
+                            int requested_devices) {
+    if (devices.empty()) return false;
+    if (requested_devices > static_cast<int>(devices.size())) {
+        std::cerr << "[ERROR] Requested " << requested_devices
+                  << " GPU(s), but only " << devices.size()
+                  << " GPU(s) are visible to HIP" << std::endl;
+        return false;
+    }
+    const DeviceType type = devices.front().type();
+    const std::string backend = devices.front().backend();
+    for (const Device& device : devices) {
+        if (device.backend() != backend || device.type() != type) {
+            std::cerr << "[ERROR] Multi-GPU loading requires homogeneous GPU "
+                         "backend and device type" << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
 void print_device_memory(const std::vector<Device>& devices) {
 #ifdef HYBRIDAI_HAS_HIP
     constexpr double gib = 1024.0 * 1024.0 * 1024.0;
@@ -356,11 +377,11 @@ void inspect_tensor(const std::string& name, const Tensor& tensor) {
 
 Tensor qwen_rmsnorm_reference(const Tensor& input, const Tensor& weight,
                               Backend* backend, const Device& device,
-                              float eps = 1e-6f);
+                        float eps = 1e-6f);
 Tensor make_residual(const Tensor& lhs, const Tensor& rhs, Backend* backend,
-                     const Device& device);
+                 const Device& device);
 Tensor qwen_mlp_reference(const Tensor& input, const Qwen3LayerWeights& layer,
-                          Backend* backend, const Device& device);
+                     Backend* backend, const Device& device);
 Tensor qwen_attention_reference(const Tensor& input,
                                 const Qwen3LayerWeights& layer,
                                 Backend* backend, const Device& device,
@@ -469,6 +490,9 @@ int main(int argc, char* argv[]) {
                       << backend_name << std::endl;
             return 1;
         }
+        if (max_devices > 1 && !validate_model_devices(devices, max_devices)) {
+            return 1;
+        }
         std::cout << "\n[Devices] selected " << devices.size() << " GPU(s)"
                   << std::endl;
         print_device_memory(devices);
@@ -481,6 +505,24 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        std::vector<Qwen3DevicePartition> planned_partitions;
+        status = distributed_loader.plan_distributed(devices,
+                                                     &planned_partitions);
+        if (!status.ok()) {
+            std::cerr << "[ERROR] Failed to plan distributed weights: "
+                      << status.message() << std::endl;
+            return 1;
+        }
+        constexpr double gib = 1024.0 * 1024.0 * 1024.0;
+        std::cout << "\n[Distributed Plan]" << std::endl;
+        for (const auto& partition : planned_partitions) {
+            std::cout << "  " << partition.device.backend() << ":"
+                      << partition.device.id() << " layers "
+                      << partition.first_layer << "-" << partition.last_layer
+                      << ", planned_weights=" << partition.weight_bytes / gib
+                      << " GiB" << std::endl;
+        }
+
         Qwen3DistributedWeights weights;
         status = distributed_loader.load_distributed(devices, &weights);
         if (!status.ok()) {
@@ -489,7 +531,6 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        constexpr double gib = 1024.0 * 1024.0 * 1024.0;
         std::cout << "\n[Distributed Weights] total="
                   << weights.total_weight_bytes / gib << " GiB" << std::endl;
         for (const auto& partition : weights.partitions) {
@@ -1282,7 +1323,25 @@ Tensor qwen_mlp_reference(const Tensor& input, const Qwen3LayerWeights& layer,
                   << std::endl;
         return Tensor();
     }
-    Tensor activated = Elementwise::silu_mul(gate, up);
+    Tensor activated;
+    if (input.device().is_gpu()) {
+        // gate/up are temporary projection results and gate is no longer
+        // needed after this point. Reuse its storage for the fused output to
+        // avoid one device allocation per MLP invocation. The HIP elementwise
+        // kernel reads gate[i] before writing gate[i], so in-place operation is
+        // safe for this elementwise transform.
+        Status silu_status = backend->silu_mul(
+            gate.buffer().get(), gate.buffer().get(), up.buffer().get(),
+            gate.dtype(), gate.numel());
+        if (!silu_status.ok()) {
+            std::cerr << "[MLP] in-place SiLU multiply failed: "
+                      << silu_status.message() << std::endl;
+            return Tensor();
+        }
+        activated = std::move(gate);
+    } else {
+        activated = Elementwise::silu_mul(gate, up);
+    }
     if (activated.buffer() == nullptr) return Tensor();
     validation = Linear::validate(activated, layer.mlp_down_proj.values, true,
                                   nullptr);

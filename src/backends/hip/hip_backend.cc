@@ -8,6 +8,7 @@
 
 #ifdef HYBRIDAI_HAS_HIP_KERNELS
 #include "backends/hip/hip_kernels.h"
+#include "backends/hip/hip_fused_kernels.h"
 #endif
 
 #include "ops/registry.h"
@@ -1036,6 +1037,91 @@ Status HipBackend::partial_rope(Buffer* dst, const Buffer* src, DType dtype,
     (void)dst; (void)src; (void)dtype; (void)seq_len; (void)num_heads;
     (void)head_dim; (void)rope_head_dim; (void)position_offset; (void)base;
     (void)stream;
+    return Status(StatusCode::NotImplemented, "HIP kernels are unavailable");
+#endif
+}
+
+Status HipBackend::qk_rmsnorm_rope(
+    Buffer* query_dst, const Buffer* query_src, const Buffer* query_weight,
+    Buffer* key_dst, const Buffer* key_src, const Buffer* key_weight,
+    DType dtype, int64_t seq_len, int64_t num_query_heads,
+    int64_t num_kv_heads, int64_t head_dim, int64_t rope_head_dim,
+    int64_t position_offset, float rope_base, float eps,
+    bool add_unit_offset, Stream* stream) {
+#if defined(HYBRIDAI_HAS_HIP) && defined(HYBRIDAI_HAS_HIP_KERNELS)
+    const size_t query_bytes = static_cast<size_t>(
+        seq_len * num_query_heads * head_dim) * SizeOfDType(dtype);
+    const size_t key_bytes = static_cast<size_t>(
+        seq_len * num_kv_heads * head_dim) * SizeOfDType(dtype);
+    Status status = validate_kernel_buffer(query_dst, device_, query_bytes,
+                                           "query_dst");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(query_src, device_, query_bytes,
+                                    "query_src");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(query_weight, device_,
+                                    static_cast<size_t>(head_dim) *
+                                        SizeOfDType(dtype), "query_weight");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(key_dst, device_, key_bytes, "key_dst");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(key_src, device_, key_bytes, "key_src");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(key_weight, device_,
+                                    static_cast<size_t>(head_dim) *
+                                        SizeOfDType(dtype), "key_weight");
+    if (!status.ok()) return status;
+    if (hipSetDevice(device_.id()) != hipSuccess)
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    return hip_fused::qk_rmsnorm_rope(
+        query_dst->data(), query_src->data(), query_weight->data(),
+        key_dst->data(), key_src->data(), key_weight->data(), dtype, seq_len,
+        num_query_heads, num_kv_heads, head_dim, rope_head_dim,
+        position_offset, rope_base, eps, add_unit_offset, native_stream(stream));
+#else
+    (void)query_dst; (void)query_src; (void)query_weight; (void)key_dst;
+    (void)key_src; (void)key_weight; (void)dtype; (void)seq_len;
+    (void)num_query_heads; (void)num_kv_heads; (void)head_dim;
+    (void)rope_head_dim; (void)position_offset; (void)rope_base; (void)eps;
+    (void)add_unit_offset; (void)stream;
+    return Status(StatusCode::NotImplemented, "HIP kernels are unavailable");
+#endif
+}
+
+Status HipBackend::q_gate_rmsnorm_rope(
+    Buffer* query_dst, Buffer* gate_dst, const Buffer* source,
+    const Buffer* query_weight, DType dtype, int64_t seq_len,
+    int64_t num_query_heads, int64_t head_dim, int64_t rope_head_dim,
+    int64_t position_offset, float rope_base, float eps,
+    bool add_unit_offset, Stream* stream) {
+#if defined(HYBRIDAI_HAS_HIP) && defined(HYBRIDAI_HAS_HIP_KERNELS)
+    const size_t output_bytes = static_cast<size_t>(
+        seq_len * num_query_heads * head_dim) * SizeOfDType(dtype);
+    Status status = validate_kernel_buffer(query_dst, device_, output_bytes,
+                                           "query_dst");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(gate_dst, device_, output_bytes,
+                                    "gate_dst");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(source, device_, 2 * output_bytes,
+                                    "source");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(query_weight, device_,
+                                    static_cast<size_t>(head_dim) *
+                                        SizeOfDType(dtype), "query_weight");
+    if (!status.ok()) return status;
+    if (hipSetDevice(device_.id()) != hipSuccess)
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    return hip_fused::q_gate_rmsnorm_rope(
+        query_dst->data(), gate_dst->data(), source->data(),
+        query_weight->data(), dtype, seq_len, num_query_heads, head_dim,
+        rope_head_dim, position_offset, rope_base, eps, add_unit_offset,
+        native_stream(stream));
+#else
+    (void)query_dst; (void)gate_dst; (void)source; (void)query_weight;
+    (void)dtype; (void)seq_len; (void)num_query_heads; (void)head_dim;
+    (void)rope_head_dim; (void)position_offset; (void)rope_base; (void)eps;
+    (void)add_unit_offset; (void)stream;
     return Status(StatusCode::NotImplemented, "HIP kernels are unavailable");
 #endif
 }

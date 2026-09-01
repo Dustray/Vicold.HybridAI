@@ -276,6 +276,51 @@ Status Qwen3WeightLoader::load_shared(Device device,
     return Status::OK();
 }
 
+Status Qwen3WeightLoader::plan_distributed(
+    const std::vector<Device>& devices,
+    std::vector<Qwen3DevicePartition>* partitions) const {
+    if (!loader_) {
+        return Status(StatusCode::InvalidArgument, "Qwen loader is not open");
+    }
+    if (partitions == nullptr || devices.empty()) {
+        return Status(StatusCode::InvalidArgument,
+                      "Distributed plan requires output and at least one device");
+    }
+    for (const Device& device : devices) {
+        if (!device.is_gpu()) {
+            return Status(StatusCode::InvalidDevice,
+                          "Distributed Qwen plan requires GPU devices");
+        }
+    }
+
+    const int64_t layer_count = config_.num_hidden_layers;
+    const int64_t device_count = static_cast<int64_t>(devices.size());
+    if (layer_count <= 0 || device_count > layer_count) {
+        return Status(StatusCode::InvalidArgument,
+                      "Qwen device count must not exceed layer count");
+    }
+
+    std::vector<Qwen3DevicePartition> result(devices.size());
+    for (size_t i = 0; i < devices.size(); ++i) {
+        result[i].device = devices[i];
+        result[i].first_layer = layer_count * static_cast<int64_t>(i) /
+                                device_count;
+        result[i].last_layer = layer_count * static_cast<int64_t>(i + 1) /
+                                   device_count - 1;
+        for (int64_t layer = result[i].first_layer;
+             layer <= result[i].last_layer; ++layer) {
+            result[i].weight_bytes += layer_bytes(layer);
+        }
+    }
+    result.front().weight_bytes +=
+        tensor_bytes("model.language_model.embed_tokens.weight");
+    result.back().weight_bytes +=
+        tensor_bytes("model.language_model.norm.weight");
+    result.back().weight_bytes += tensor_bytes("lm_head.weight");
+    *partitions = std::move(result);
+    return Status::OK();
+}
+
 uint64_t Qwen3WeightLoader::tensor_bytes(const std::string& name) const {
     if (!loader_) return 0;
     const auto* info = loader_->tensor_info(name);
@@ -304,66 +349,34 @@ Status Qwen3WeightLoader::load_distributed(
         return Status(StatusCode::InvalidArgument,
                       "Distributed load requires output and at least one device");
     }
-    for (const Device& device : devices) {
-        if (!device.is_gpu()) {
-            return Status(StatusCode::InvalidDevice,
-                          "Distributed Qwen load requires GPU devices");
-        }
-    }
 
     Qwen3DistributedWeights result;
     result.layers.resize(static_cast<size_t>(config_.num_hidden_layers));
     result.layer_devices.resize(static_cast<size_t>(config_.num_hidden_layers));
-    result.partitions.resize(devices.size());
-    for (size_t i = 0; i < devices.size(); ++i) {
-        result.partitions[i].device = devices[i];
-    }
+    Status status = plan_distributed(devices, &result.partitions);
+    if (!status.ok()) return status;
 
-    // Keep layer ranges contiguous so inference only transfers activations at
-    // partition boundaries. The configured schedule is regular for Qwen3.5,
-    // so an even layer split is also close to an even byte split.
-    const int64_t layer_count = config_.num_hidden_layers;
-    const int64_t device_count = static_cast<int64_t>(devices.size());
-    for (int64_t device_index = 0; device_index < device_count; ++device_index) {
-        const int64_t first = layer_count * device_index / device_count;
-        const int64_t last = layer_count * (device_index + 1) / device_count - 1;
-        auto& partition = result.partitions[static_cast<size_t>(device_index)];
-        partition.first_layer = first;
-        partition.last_layer = last;
-        for (int64_t layer_index = first; layer_index <= last; ++layer_index) {
-            Status status = load_layer(
-                layer_index, devices[static_cast<size_t>(device_index)],
-                &result.layers[static_cast<size_t>(layer_index)]);
+    for (const auto& partition : result.partitions) {
+        for (int64_t layer_index = partition.first_layer;
+             layer_index <= partition.last_layer; ++layer_index) {
+            status = load_layer(layer_index, partition.device,
+                                &result.layers[static_cast<size_t>(layer_index)]);
             if (!status.ok()) return status;
             result.layer_devices[static_cast<size_t>(layer_index)] =
-                devices[static_cast<size_t>(device_index)];
-            const uint64_t bytes = layer_bytes(layer_index);
-            partition.weight_bytes += bytes;
-            result.total_weight_bytes += bytes;
+                partition.device;
         }
+        result.total_weight_bytes += partition.weight_bytes;
     }
 
-    Status status = load_tensor("model.language_model.embed_tokens.weight",
-                                devices.front(), &result.shared.embed_tokens);
+    status = load_tensor("model.language_model.embed_tokens.weight",
+                         devices.front(), &result.shared.embed_tokens);
     if (!status.ok()) return status;
-    const uint64_t embed_bytes =
-        tensor_bytes("model.language_model.embed_tokens.weight");
-    result.partitions.front().weight_bytes += embed_bytes;
-    result.total_weight_bytes += embed_bytes;
-
     status = load_tensor("model.language_model.norm.weight", devices.back(),
                          &result.shared.final_norm);
     if (!status.ok()) return status;
-    const uint64_t norm_bytes = tensor_bytes("model.language_model.norm.weight");
-    result.partitions.back().weight_bytes += norm_bytes;
-    result.total_weight_bytes += norm_bytes;
-
     status = load_tensor("lm_head.weight", devices.back(),
                          &result.shared.lm_head);
     if (!status.ok()) return status;
-    const uint64_t head_bytes = tensor_bytes("lm_head.weight");
-    result.partitions.back().weight_bytes += head_bytes;
-    result.total_weight_bytes += head_bytes;
 
     *output = std::move(result);
     return Status::OK();

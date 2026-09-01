@@ -16,9 +16,6 @@ HybridAI Latency Benchmark
 +--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
 
 
-
-HIP_ALLOC_INITIALIZE=0 HIP_VISIBLE_DEVICES=1 python3 benchmark/python/benchmark_latency.py   --runner build-benchmark/bin/hybridai_benchmark_runner   --model /public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master   --backend hip   --max-new-tokens 160   --warmup 1   --runs 5   --output results/latency.jsonl
-
 2026.09.01
 HybridAI Latency Benchmark
  module: latency
@@ -33,4 +30,21 @@ HybridAI Latency Benchmark
 | ttft_seconds [ms]        |       5 |   184.355 |   184.134 |   184.632 |   184.307 |   184.564 |   184.598 |   184.625 |
 | prefill_seconds [ms]     |       5 |   184.355 |   184.134 |   184.632 |   184.307 |   184.564 |   184.598 |   184.625 |
 | decode_seconds [ms]      |       5 |  2887.292 |  2873.851 |  2893.236 |  2889.885 |  2892.713 |  2892.974 |  2893.184 |
++--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+
+
+2026.09.01  融合op
+HybridAI Latency Benchmark
+  module: latency
+  records [count]: 5
+  max_new_tokens [token]: 160
++--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+| Metric                   | samples |      mean |       min |       max |       p50 |       p90 |       p95 |       p99 |
++--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+| prompt_tokens [token]    |       5 |        23 |        23 |        23 |        23 |        23 |        23 |        23 |
+| generated_tokens [token] |       5 |        40 |        40 |        40 |        40 |        40 |        40 |        40 |
+| e2e_seconds [ms]         |       5 |  3061.025 |  3045.978 |  3066.063 |  3064.588 |  3065.573 |  3065.818 |  3066.014 |
+| ttft_seconds [ms]        |       5 |   183.998 |   183.717 |   184.267 |   183.916 |   184.234 |   184.250 |   184.263 |
+| prefill_seconds [ms]     |       5 |   183.998 |   183.717 |   184.267 |   183.916 |   184.234 |   184.250 |   184.263 |
+| decode_seconds [ms]      |       5 |  2876.890 |  2861.923 |  2881.744 |  2880.545 |  2881.439 |  2881.591 |  2881.713 |
 +--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+

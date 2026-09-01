@@ -912,6 +912,77 @@ __global__ void deltanet_grouped_conv_kernel(
 }
 
 template <typename T>
+__global__ void deltanet_grouped_conv_decode_kernel(
+    T* query, T* key, T* value, T* conv_state, const T* qkv,
+    const T* weight, int64_t num_qk_heads, int64_t num_value_heads,
+    int64_t key_head_dim, int64_t value_head_dim, int64_t kernel_size) {
+    const int64_t flat_channel =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t key_width = num_qk_heads * key_head_dim;
+    const int64_t value_width = num_value_heads * value_head_dim;
+    const int64_t qkv_width = key_width * 2 + value_width;
+    if (flat_channel >= qkv_width) return;
+
+    const int64_t history = kernel_size - 1;
+    T* channel_state = conv_state + flat_channel * history;
+    const T* channel_weight = weight + flat_channel * kernel_size;
+    float sum = 0.0f;
+    for (int64_t index = 0; index < history; ++index) {
+        sum += load_value(channel_state, index) *
+               load_value(channel_weight, index);
+    }
+    const float current = load_value(qkv, flat_channel);
+    sum += current * load_value(channel_weight, history);
+    const float activated = sum / (1.0f + expf(-sum));
+    if (flat_channel < key_width) {
+        store_value(query, flat_channel, activated);
+    } else if (flat_channel < key_width * 2) {
+        store_value(key, flat_channel - key_width, activated);
+    } else {
+        store_value(value, flat_channel - key_width * 2, activated);
+    }
+    for (int64_t index = 0; index + 1 < history; ++index) {
+        channel_state[index] = channel_state[index + 1];
+    }
+    if (history > 0) store_value(channel_state, history - 1, current);
+}
+
+template <typename T>
+__global__ void deltanet_grouped_conv_decode_kernel_k4(
+    T* query, T* key, T* value, T* conv_state, const T* qkv,
+    const T* weight, int64_t num_qk_heads, int64_t num_value_heads,
+    int64_t key_head_dim, int64_t value_head_dim) {
+    const int64_t flat_channel =
+        static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t key_width = num_qk_heads * key_head_dim;
+    const int64_t qkv_width = key_width * 2 +
+                              num_value_heads * value_head_dim;
+    if (flat_channel >= qkv_width) return;
+
+    T* channel_state = conv_state + flat_channel * 3;
+    const T* channel_weight = weight + flat_channel * 4;
+    const float state0 = load_value(channel_state, 0);
+    const float state1 = load_value(channel_state, 1);
+    const float state2 = load_value(channel_state, 2);
+    const float current = load_value(qkv, flat_channel);
+    const float sum = state0 * load_value(channel_weight, 0) +
+                      state1 * load_value(channel_weight, 1) +
+                      state2 * load_value(channel_weight, 2) +
+                      current * load_value(channel_weight, 3);
+    const float activated = sum / (1.0f + expf(-sum));
+    if (flat_channel < key_width) {
+        store_value(query, flat_channel, activated);
+    } else if (flat_channel < key_width * 2) {
+        store_value(key, flat_channel - key_width, activated);
+    } else {
+        store_value(value, flat_channel - key_width * 2, activated);
+    }
+    channel_state[0] = channel_state[1];
+    channel_state[1] = channel_state[2];
+    store_value(channel_state, 2, current);
+}
+
+template <typename T>
 __global__ void deltanet_recurrent_kernel(
     T* dst, float* recurrent_state, const T* query, const T* key,
     const T* value, const T* a, const T* beta, const T* a_log,
@@ -1029,9 +1100,12 @@ __global__ void deltanet_recurrent_kernel(
 // keeps 128 active lanes and uses wavefront shuffles only for reductions.
 template <typename T>
 __global__ void deltanet_recurrent_decode128_kernel(
-    T* dst, float* recurrent_state, const T* query, const T* key,
-    const T* value, const T* a, const T* beta, const T* a_log,
-    const T* dt_bias, const T* norm_weight, const T* z,
+    T* __restrict__ dst, float* __restrict__ recurrent_state,
+    const T* __restrict__ query, const T* __restrict__ key,
+    const T* __restrict__ value, const T* __restrict__ a,
+    const T* __restrict__ beta, const T* __restrict__ a_log,
+    const T* __restrict__ dt_bias, const T* __restrict__ norm_weight,
+    const T* __restrict__ z,
     int64_t num_qk_heads, int64_t num_value_heads, float eps) {
     constexpr int64_t kKeyDim = 128;
     constexpr int64_t kValueDim = 128;
@@ -1440,6 +1514,29 @@ Status launch_deltanet_grouped_conv(
     int64_t value_head_dim, int64_t kernel_size, hipStream_t stream) {
     const int64_t channels = num_qk_heads * key_head_dim * 2 +
                              num_value_heads * value_head_dim;
+    if (token_count == 1) {
+        if (kernel_size == 4) {
+            hipLaunchKernelGGL(
+                deltanet_grouped_conv_decode_kernel_k4<T>, grid_for(channels),
+                dim3(kBlockSize), 0, stream, static_cast<T*>(query),
+                static_cast<T*>(key), static_cast<T*>(value),
+                static_cast<T*>(conv_state),
+                static_cast<const T*>(grouped_qkv),
+                static_cast<const T*>(weight), num_qk_heads,
+                num_value_heads, key_head_dim, value_head_dim);
+        } else {
+            hipLaunchKernelGGL(
+                deltanet_grouped_conv_decode_kernel<T>, grid_for(channels),
+                dim3(kBlockSize), 0, stream, static_cast<T*>(query),
+                static_cast<T*>(key), static_cast<T*>(value),
+                static_cast<T*>(conv_state),
+                static_cast<const T*>(grouped_qkv),
+                static_cast<const T*>(weight), num_qk_heads,
+                num_value_heads, key_head_dim, value_head_dim, kernel_size);
+        }
+        return hip_status(hipGetLastError(),
+                          "launch DeltaNet grouped conv decode kernel");
+    }
     hipLaunchKernelGGL(deltanet_grouped_conv_kernel<T>,
                        grid_for(channels), dim3(kBlockSize), 0,
                        stream, static_cast<T*>(query), static_cast<T*>(key),

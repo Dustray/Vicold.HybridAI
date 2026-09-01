@@ -7,10 +7,74 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
+#include <iostream>
+#include <chrono>
 #include <vector>
 
 namespace hybridai {
 namespace ops {
+
+namespace {
+
+bool deltanet_profile_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("HYBRIDAI_DELTANET_PROFILE");
+        return value != nullptr && value[0] == '1';
+    }();
+    return enabled;
+}
+
+struct DeltaNetProfile {
+    double grouped_conv_ms = 0.0;
+    double recurrent_ms = 0.0;
+    int64_t grouped_conv_calls = 0;
+    int64_t recurrent_calls = 0;
+
+    ~DeltaNetProfile() {
+        if (!deltanet_profile_enabled()) return;
+        std::cerr << "[DeltaNet profile] grouped_conv calls="
+                  << grouped_conv_calls << " total_ms=" << grouped_conv_ms
+                  << " avg_ms="
+                  << (grouped_conv_calls == 0 ? 0.0
+                      : grouped_conv_ms / grouped_conv_calls)
+                  << ", recurrent calls=" << recurrent_calls
+                  << " total_ms=" << recurrent_ms << " avg_ms="
+                  << (recurrent_calls == 0 ? 0.0
+                      : recurrent_ms / recurrent_calls) << std::endl;
+    }
+};
+
+DeltaNetProfile& deltanet_profile() {
+    static DeltaNetProfile profile;
+    return profile;
+}
+
+class ScopedDeltaNetTimer {
+public:
+    explicit ScopedDeltaNetTimer(double* total_ms, int64_t* calls)
+        : total_ms_(total_ms), calls_(calls), enabled_(deltanet_profile_enabled()),
+          start_(std::chrono::steady_clock::now()) {}
+
+    void set_backend(Backend* backend) noexcept { backend_ = backend; }
+
+    ~ScopedDeltaNetTimer() {
+        if (!enabled_) return;
+        if (backend_ != nullptr) (void)backend_->synchronize();
+        *total_ms_ += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start_).count();
+        ++*calls_;
+    }
+
+private:
+    double* total_ms_;
+    int64_t* calls_;
+    bool enabled_;
+    Backend* backend_ = nullptr;
+    std::chrono::steady_clock::time_point start_;
+};
+
+} // namespace
 
 Status GatedDeltaNet::validate(const Tensor& input,
                               const Tensor& wq, const Tensor& wk,
@@ -213,6 +277,9 @@ DeltaNetQKV GatedDeltaNet::grouped_causal_conv(
     int64_t num_qk_heads, int64_t num_value_heads,
     int64_t key_head_dim, int64_t value_head_dim, int64_t kernel_size,
     DeltaNetCache* cache, Stream* stream) {
+    auto& profile = deltanet_profile();
+    ScopedDeltaNetTimer timer(&profile.grouped_conv_ms,
+                              &profile.grouped_conv_calls);
     DeltaNetQKV output;
     const int64_t key_width = num_qk_heads * key_head_dim;
     const int64_t value_width = num_value_heads * value_head_dim;
@@ -227,6 +294,7 @@ DeltaNetQKV GatedDeltaNet::grouped_causal_conv(
     auto backend = BackendRegistry::instance().get_backend(
         qkv.device());
     if (backend == nullptr) return output;
+    timer.set_backend(backend.get());
     const int64_t token_count = qkv.shape().dim(0);
     const Shape state_shape{channels, kernel_size - 1};
     if (cache->conv_state.buffer() == nullptr) {
@@ -280,6 +348,9 @@ Tensor GatedDeltaNet::recurrent(
     const Tensor& dt_bias, const Tensor& norm_weight, int64_t num_qk_heads,
     int64_t num_value_heads, int64_t key_head_dim, int64_t value_head_dim,
     float eps, DeltaNetCache* cache, Stream* stream) {
+    auto& profile = deltanet_profile();
+    ScopedDeltaNetTimer timer(&profile.recurrent_ms,
+                              &profile.recurrent_calls);
     if (cache == nullptr || query.buffer() == nullptr || key.buffer() == nullptr ||
         value.buffer() == nullptr || a.buffer() == nullptr || b.buffer() == nullptr ||
         z.buffer() == nullptr || a_log.buffer() == nullptr ||
@@ -302,6 +373,7 @@ Tensor GatedDeltaNet::recurrent(
         num_value_heads % num_qk_heads != 0 || eps <= 0.0f) return Tensor();
     auto backend = BackendRegistry::instance().get_backend(query.device());
     if (backend == nullptr) return Tensor();
+    timer.set_backend(backend.get());
     const Shape state_shape{num_value_heads, key_head_dim, value_head_dim};
     if (cache->recurrent_state.buffer() == nullptr) {
         auto state_buffer = backend->create_buffer(

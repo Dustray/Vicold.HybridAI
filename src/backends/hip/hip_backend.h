@@ -73,6 +73,19 @@ public:
                         int64_t head_dim, int64_t rope_head_dim,
                         int64_t position_offset, float base,
                         Stream* stream) override;
+    Status qk_rmsnorm_rope(
+        Buffer* query_dst, const Buffer* query_src,
+        const Buffer* query_weight, Buffer* key_dst, const Buffer* key_src,
+        const Buffer* key_weight, DType dtype, int64_t seq_len,
+        int64_t num_query_heads, int64_t num_kv_heads, int64_t head_dim,
+        int64_t rope_head_dim, int64_t position_offset, float rope_base,
+        float eps, bool add_unit_offset, Stream* stream = nullptr) override;
+    Status q_gate_rmsnorm_rope(
+        Buffer* query_dst, Buffer* gate_dst, const Buffer* source,
+        const Buffer* query_weight, DType dtype, int64_t seq_len,
+        int64_t num_query_heads, int64_t head_dim, int64_t rope_head_dim,
+        int64_t position_offset, float rope_base, float eps,
+        bool add_unit_offset, Stream* stream = nullptr) override;
     Status causal_gqa(Buffer* dst, const Buffer* query, const Buffer* key,
                       const Buffer* value, const Buffer* gate, DType dtype,
                       int64_t seq_len, int64_t num_query_heads,

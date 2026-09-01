@@ -93,6 +93,8 @@ public:
     Status load_layer(int64_t layer_index, Device device,
                       Qwen3LayerWeights* output) const;
     Status load_shared(Device device, Qwen3SharedWeights* output) const;
+    Status plan_distributed(const std::vector<Device>& devices,
+                            std::vector<Qwen3DevicePartition>* partitions) const;
     Status load_distributed(const std::vector<Device>& devices,
                             Qwen3DistributedWeights* output) const;
 

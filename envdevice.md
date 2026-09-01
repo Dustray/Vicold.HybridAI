@@ -1,3 +1,14 @@
+# Linux/HIP 容器说明
+
+本文档中的 `hipinfo` 输出来自 Windows 主机，不能用于判断 Linux 容器中的
+HIP 可见设备数量。容器内请以 `qwen_infer` 启动时的 `[HIP probe]` 输出为准，
+并同时记录 `HIP_VISIBLE_DEVICES`。该变量会将物理设备重新编号为进程内的
+local device id。
+
+当前验证环境示例：`HIP_VISIBLE_DEVICES=7` 时，HIP 返回 1 张可见设备，程序
+内显示为 `hip:0`，其架构为 `gfx936`。因此该环境不能验证 `qwen_infer ... hip 8`
+的八卡加载；八卡验证必须在进程实际可见 8 张同类 GPU 的环境中进行。
+
 PS C:\Users\yinxi> .\.venv\Scripts\activate
 (.venv) PS C:\Users\yinxi> hipinfo
 

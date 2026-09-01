@@ -28,7 +28,7 @@ python3 benchmark/python/benchmark_latency.py \
 输出包含原始 JSONL 和对应的 `.summary.json`。终端汇总会显示 prompt token
 数、实际生成 token 数和 `max_new_tokens`；其中 `generated_tokens` 是模型
 实际生成的数量，遇到 EOS 时可能小于 `max_new_tokens`。同时包括 E2E、
-prefill、TTFT、decode 的均值及 P50/P90/P95/P99。终端表格中的时间单位为
+TTFT、decode 和 TPS 的均值及 P50/P90/P95/P99。终端表格中的时间单位为
 毫秒（`ms`）；JSONL 和 summary JSON 保留 runner 的秒（`s`）原始值。
 
 ## 吞吐

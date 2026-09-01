@@ -290,6 +290,23 @@ HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 ./demo/build/qwen_infer \
   hip 8 --quiet-decode
 ```
 
+当前多卡实现采用 **连续 layer-wise model parallel**：每层完整驻留在一张
+GPU 上，embedding 放在首卡，final norm 和 lm_head 放在末卡，层边界之间传输
+activation。它不是 tensor parallel，不使用 RCCL/NCCL collective，也不切分单层
+权重。加载前会检查请求的 GPU 数量；如果 HIP 实际可见设备少于请求数量，程序会
+直接报错而不会把模型加载到一半。
+
+运行时需注意：
+
+- `HIP_VISIBLE_DEVICES` 会重映射 HIP local device id。例如设置
+  `HIP_VISIBLE_DEVICES=7` 后，程序内只会看到 `hip:0`，它代表物理设备 7。
+- 八卡验证要求当前进程实际可见 8 张同类 HIP GPU；`envdevice.md` 中的 Windows
+  设备记录不能证明 Linux 容器具备八卡环境。
+- Qwen3.8 27B BF16 权重约 52 GiB（18 个 SafeTensor shard），还需要为 activation、
+  KV cache、DeltaNet cache、allocator 和运行时临时 workspace 预留额外显存。
+- 当前实现保持连续分区以减少跨卡 activation transfer；尚未实现 tensor parallel、
+  RCCL/NCCL 通信、拓扑感知选卡或自动显存感知 placement。
+
 在当前 8 × 64 GiB `gfx936` 环境实测加载成功：文本模型权重约
 `50.10 GiB`，首末卡各约 `8.04 GiB`，其余卡各约 `5.67 GiB`。
 该命令可以继续执行 BF16 投影、真实 DeltaNet/reference forward、完整

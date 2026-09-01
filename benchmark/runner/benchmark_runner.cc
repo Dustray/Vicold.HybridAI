@@ -109,7 +109,6 @@ int main(int argc, char** argv) {
                   << ",\"max_new_tokens\":" << request.max_new_tokens
                   << ",\"load_seconds\":" << load_seconds
                   << ",\"elapsed_seconds\":" << result.elapsed_seconds
-                  << ",\"prefill_seconds\":" << result.prefill_seconds
                   << ",\"ttft_seconds\":"
                   << result.time_to_first_token_seconds
                   << ",\"decode_seconds\":" << result.decode_seconds

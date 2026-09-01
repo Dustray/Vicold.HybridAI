@@ -162,6 +162,13 @@ public:
         return Status(StatusCode::NotImplemented,
                       "Backend partial RoPE unavailable");
     }
+    virtual Status qk_rmsnorm_rope(
+        Buffer*, const Buffer*, const Buffer*, Buffer*, const Buffer*,
+        const Buffer*, DType, int64_t, int64_t, int64_t, int64_t, int64_t,
+        int64_t, float, float, bool, Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend fused QK RMSNorm/RoPE unavailable");
+    }
     virtual Status causal_gqa(Buffer*, const Buffer*, const Buffer*,
                               const Buffer*, const Buffer*, DType, int64_t,
                               int64_t, int64_t, int64_t,
@@ -235,6 +242,13 @@ public:
                                 Stream* = nullptr) {
         return Status(StatusCode::NotImplemented,
                       "Backend strided copy unavailable");
+    }
+    virtual Status q_gate_rmsnorm_rope(
+        Buffer*, Buffer*, const Buffer*, const Buffer*, DType, int64_t,
+        int64_t, int64_t, int64_t, int64_t, float, float, bool,
+        Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend fused Q/gate RMSNorm/RoPE unavailable");
     }
 };
 

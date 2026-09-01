@@ -4,7 +4,9 @@
 #include "hybrid.h"
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
+#include <iostream>
 #include <utility>
 
 namespace hybridai {
@@ -122,6 +124,23 @@ ApiStatus Generator::generate(const GenerationOptions& options,
     double prefill_seconds = 0.0;
     double first_token_seconds = 0.0;
     Clock::time_point previous_token = start;
+    const Device final_device = impl_->devices_.back();
+    auto final_backend = BackendRegistry::instance().get_backend(final_device);
+    if (final_backend == nullptr) {
+        return {ApiStatusCode::BackendError,
+                "failed to create final-device backend"};
+    }
+    std::shared_ptr<Buffer> argmax_buffer;
+    if (final_device.is_gpu()) {
+        argmax_buffer = final_backend->create_buffer(
+            sizeof(int64_t), MemoryType::Device);
+    }
+    const bool profile_decode = [] {
+        const char* value = std::getenv("HYBRIDAI_DECODE_PROFILE");
+        return value != nullptr && value[0] == '1';
+    }();
+    std::vector<double> layer_profile_ms(
+        profile_decode ? impl_->weights_.layers.size() : 0, 0.0);
     for (int32_t step = 0; step < options.max_new_tokens; ++step) {
         const std::vector<int64_t> ids =
             step == 0 ? generated : std::vector<int64_t>{generated.back()};
@@ -136,6 +155,7 @@ ApiStatus Generator::generate(const GenerationOptions& options,
         }
         Tensor hidden = std::move(embedded);
         for (size_t li = 0; li < impl_->weights_.layers.size(); ++li) {
+            const auto layer_start = Clock::now();
             const auto& layer = impl_->weights_.layers[li];
             const Device device = impl_->weights_.layer_devices[li];
             auto backend = BackendRegistry::instance().get_backend(device);
@@ -165,9 +185,19 @@ ApiStatus Generator::generate(const GenerationOptions& options,
             if (hidden.buffer() == nullptr) {
                 return {ApiStatusCode::BackendError, "layer forward failed"};
             }
+            if (profile_decode) {
+                internal_status = backend->synchronize();
+                if (!internal_status.ok()) {
+                    return {ApiStatusCode::BackendError,
+                            "profile synchronization failed at layer " +
+                                std::to_string(li)};
+                }
+                if (step > 0) {
+                    layer_profile_ms[li] += std::chrono::duration<double,
+                        std::milli>(Clock::now() - layer_start).count();
+                }
+            }
         }
-        const Device final_device = impl_->devices_.back();
-        auto final_backend = BackendRegistry::instance().get_backend(final_device);
         if (hidden.device() != final_device) hidden = hidden.to(final_device);
         Tensor final_hidden = qwen_rmsnorm_reference(
             hidden, impl_->weights_.shared.final_norm, final_backend.get(),
@@ -177,22 +207,22 @@ ApiStatus Generator::generate(const GenerationOptions& options,
         if (logits.buffer() == nullptr) {
             return {ApiStatusCode::BackendError, "lm_head forward failed"};
         }
-        internal_status = final_backend->synchronize();
-        if (!internal_status.ok()) {
-            return {ApiStatusCode::BackendError, internal_status.message()};
-        }
         int64_t next = 0;
         bool used_device_argmax = false;
-        if (logits.device().is_gpu()) {
-            auto result_buffer = final_backend->create_buffer(
-                sizeof(int64_t), MemoryType::Device);
-            if (result_buffer != nullptr) {
-                internal_status = final_backend->argmax_last_row(
-                    result_buffer.get(), logits.buffer().get(), logits.dtype(),
-                    logits.shape().dim(0), logits.shape().dim(1));
+        if (logits.device().is_gpu() && argmax_buffer != nullptr) {
+            internal_status = final_backend->argmax_last_row(
+                argmax_buffer.get(), logits.buffer().get(), logits.dtype(),
+                logits.shape().dim(0), logits.shape().dim(1));
+            if (internal_status.ok()) {
+                internal_status = final_backend->memcpy_d2h(
+                    &next, argmax_buffer.get(), sizeof(next));
                 if (internal_status.ok()) {
-                    internal_status = final_backend->memcpy_d2h(
-                        &next, result_buffer.get(), sizeof(next));
+                    // The D2H copy is enqueued after the GEMM, bias and
+                    // argmax kernels on the same default stream. Synchronize
+                    // only after the copy, immediately before consuming the
+                    // host value, instead of synchronizing once before
+                    // argmax and again implicitly at the host boundary.
+                    internal_status = final_backend->synchronize();
                     used_device_argmax = internal_status.ok();
                 }
             }
@@ -206,6 +236,11 @@ ApiStatus Generator::generate(const GenerationOptions& options,
                 std::vector<float> host(count);
                 internal_status = final_backend->memcpy_d2h(
                     host.data(), logits.buffer().get(), logits.nbytes());
+                if (!internal_status.ok()) {
+                    return {ApiStatusCode::BackendError,
+                            internal_status.message()};
+                }
+                internal_status = final_backend->synchronize();
                 if (!internal_status.ok()) {
                     return {ApiStatusCode::BackendError,
                             internal_status.message()};
@@ -264,6 +299,18 @@ ApiStatus Generator::generate(const GenerationOptions& options,
     }
     result->decode_tokens_per_second = result->decode_seconds > 0.0
         ? static_cast<double>(decode_count) / result->decode_seconds : 0.0;
+    if (profile_decode && decode_count > 0) {
+        std::cout << "[Decode profile] average layer wall time over "
+                  << decode_count << " decode tokens (ms):" << std::endl;
+        for (size_t li = 0; li < layer_profile_ms.size(); ++li) {
+            const auto& layer = impl_->weights_.layers[li];
+            std::cout << "  layer " << li << " "
+                      << (layer.is_attention_layer ? "attention" : "deltanet")
+                      << ": " << (layer_profile_ms[li] /
+                                     static_cast<double>(decode_count))
+                      << std::endl;
+        }
+    }
     return {};
 }
 

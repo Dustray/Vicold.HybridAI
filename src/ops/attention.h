@@ -3,6 +3,8 @@
 #include "core/status.h"
 #include "core/tensor.h"
 
+#include <utility>
+
 namespace hybridai {
 namespace ops {
 
@@ -17,6 +19,26 @@ struct AttentionKVCache {
     }
 
     void reset() noexcept { length = 0; }
+
+    // Rewind only the logical KV prefix. Existing storage is retained and
+    // subsequent append operations overwrite rows at the truncated length.
+    // Callers must use this only when no attention output can still reference
+    // the discarded suffix.
+    Status truncate(int64_t new_length) noexcept;
+
+    // Create an independent cache copy for speculative verification. The
+    // destination owns separate K/V storage and can therefore be discarded
+    // without mutating this cache.
+    Status clone(AttentionKVCache* destination) const;
+
+    // Commit a previously verified scratch cache in one operation.
+    void swap(AttentionKVCache* other) noexcept {
+        if (other == nullptr) return;
+        key.swap(other->key);
+        value.swap(other->value);
+        std::swap(length, other->length);
+        std::swap(capacity, other->capacity);
+    }
 };
 
 // Gated GQA Attention for Qwen3.8 (standard attention layer).

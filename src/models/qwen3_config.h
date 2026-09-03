@@ -40,6 +40,8 @@ struct Qwen3Config {
     std::vector<int64_t> eos_token_ids;
     int64_t pad_token_id = -1;
     bool tie_word_embeddings = false;
+    int32_t mtp_num_hidden_layers = 0;
+    bool mtp_use_dedicated_embeddings = false;
 
     Status load_json(const std::string& path);
 };

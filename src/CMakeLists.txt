@@ -23,6 +23,8 @@ target_sources(hybridai
         models/model_weight_schema.cc
         models/qwen3_weights.h
         models/qwen3_weights.cc
+        models/qwen_reference.h
+        models/qwen_reference.cc
         backends/interface/backend.h
         backends/backend_registry.h
         backends/backend_registry.cc

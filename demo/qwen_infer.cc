@@ -30,6 +30,7 @@
 #include "ops/linear.h"
 #include "ops/rmsnorm.h"
 #include "ops/softmax.h"
+#include "models/qwen_reference.h"
 
 #include <cstddef>
 #include <chrono>
@@ -179,68 +180,6 @@ std::string decode_ids(const std::vector<int64_t>& ids,
     return out;
 }
 
-Status lookup_embedding(const Tensor& embedding, const std::vector<int64_t>& ids,
-                        Backend* backend, const Device& device,
-                        Tensor* output) {
-    if (output == nullptr || backend == nullptr ||
-        embedding.buffer() == nullptr ||
-        embedding.dtype() != DType::BF16 ||
-        embedding.shape().ndim() != 2) {
-        return Status(StatusCode::InvalidArgument,
-                      "Invalid BF16 embedding lookup arguments");
-    }
-
-    const int64_t vocab_size = embedding.shape().dim(0);
-    const int64_t hidden_size = embedding.shape().dim(1);
-    for (int64_t id : ids) {
-        if (id < 0 || id >= vocab_size) {
-            return Status(StatusCode::InvalidArgument,
-                          "Token id is outside embedding vocabulary");
-        }
-    }
-
-    const size_t row_bytes =
-        static_cast<size_t>(hidden_size) * SizeOfDType(DType::BF16);
-    const size_t output_bytes = ids.size() * row_bytes;
-    auto buffer =
-        backend->create_buffer(output_bytes, MemoryType::Device);
-    if (buffer == nullptr) {
-        return Status(StatusCode::OutOfMemory,
-                      "Failed to allocate embedding output");
-    }
-
-    Status status;
-    if (device.is_gpu()) {
-        auto ids_buffer = backend->create_buffer(
-            ids.size() * sizeof(int64_t), MemoryType::Device);
-        if (ids_buffer == nullptr) {
-            return Status(StatusCode::OutOfMemory,
-                          "Failed to allocate embedding ids");
-        }
-        status = backend->memcpy_h2d(ids_buffer.get(), ids.data(),
-                                     ids.size() * sizeof(int64_t));
-        if (!status.ok()) return status;
-        status = backend->embedding_gather(
-            buffer.get(), embedding.buffer().get(), ids_buffer.get(),
-            DType::BF16, static_cast<int64_t>(ids.size()), vocab_size,
-            hidden_size);
-        if (!status.ok()) return status;
-    } else {
-        const auto* source = static_cast<const uint16_t*>(embedding.data());
-        auto* destination = static_cast<uint16_t*>(buffer->data());
-        for (size_t row = 0; row < ids.size(); ++row) {
-            std::memcpy(destination + row * static_cast<size_t>(hidden_size),
-                        source + static_cast<size_t>(ids[row]) * hidden_size,
-                        row_bytes);
-        }
-    }
-
-    *output = Tensor(
-        Shape{static_cast<int64_t>(ids.size()), hidden_size}, DType::BF16,
-        device, std::move(buffer));
-    return Status::OK();
-}
-
 // 选择可用设备
 // "gpu" 是通用别名，映射到已注册的 GPU 后端（当前为 hip）。
 Device select_device(const std::string& backend_name) {
@@ -265,22 +204,6 @@ Device select_device(const std::string& backend_name) {
         }
     }
     return chosen;
-}
-
-std::vector<Device> select_gpu_devices(const std::string& backend_name,
-                                       int max_devices) {
-    DeviceManager::instance().initialize();
-    std::vector<Device> devices;
-    for (const Device& device : DeviceManager::instance().devices()) {
-        const bool matches = backend_name == "gpu"
-                                 ? device.is_gpu()
-                                 : device.backend() == backend_name;
-        if (device.is_gpu() && matches) {
-            devices.push_back(device);
-            if (static_cast<int>(devices.size()) >= max_devices) break;
-        }
-    }
-    return devices;
 }
 
 bool validate_model_devices(const std::vector<Device>& devices,
@@ -375,24 +298,6 @@ void inspect_tensor(const std::string& name, const Tensor& tensor) {
     std::cout << "] dtype=" << static_cast<int>(tensor.dtype()) << std::endl;
 }
 
-Tensor qwen_rmsnorm_reference(const Tensor& input, const Tensor& weight,
-                              Backend* backend, const Device& device,
-                        float eps = 1e-6f);
-Tensor make_residual(const Tensor& lhs, const Tensor& rhs, Backend* backend,
-                 const Device& device);
-Tensor qwen_mlp_reference(const Tensor& input, const Qwen3LayerWeights& layer,
-                     Backend* backend, const Device& device);
-Tensor qwen_attention_reference(const Tensor& input,
-                                const Qwen3LayerWeights& layer,
-                                Backend* backend, const Device& device,
-                                const Qwen3Config& config,
-                                AttentionKVCache* cache = nullptr,
-                                int64_t max_cache_len = 0);
-Tensor qwen_deltanet_reference(const Tensor& input,
-                               const Qwen3LayerWeights& layer,
-                               Backend* backend, const Device& device,
-                               const Qwen3Config& config,
-                               DeltaNetCache* cache = nullptr);
 } // namespace
 
 #ifndef HYBRIDAI_EMBEDDED_QWEN_INFER
@@ -477,6 +382,11 @@ int main(int argc, char* argv[]) {
               << std::endl;
     std::cout << "  rope_theta: " << config.rope_theta << std::endl;
     std::cout << "  rms_norm_eps: 1e-6, Qwen RMSNorm weight mode: (1 + w)"
+              << std::endl;
+    std::cout << "  mtp_num_hidden_layers: " << config.mtp_num_hidden_layers
+              << std::endl;
+    std::cout << "  mtp_use_dedicated_embeddings: "
+              << (config.mtp_use_dedicated_embeddings ? "true" : "false")
               << std::endl;
 
     // 当前非统一内存环境先执行模型常驻加载。按连续层切分到最多八张卡，
@@ -1251,6 +1161,7 @@ int main(int argc, char* argv[]) {
 
 namespace {
 
+#if 0  // Implementations moved to src/models/qwen_reference.cc.
 Tensor qwen_rmsnorm_reference(const Tensor& input, const Tensor& weight,
                               Backend* backend, const Device& device,
                               float eps) {
@@ -1411,6 +1322,29 @@ Tensor qwen_deltanet_reference(const Tensor& input,
                                Backend* backend, const Device& device,
                                const Qwen3Config& config,
                                DeltaNetCache* cache) {
+    static const bool profile = [] {
+        const char* value = std::getenv("HYBRIDAI_DELTANET_PROFILE");
+        return value != nullptr && value[0] == '1';
+    }();
+    static double qkv_ms = 0.0;
+    static double z_ms = 0.0;
+    static double a_ms = 0.0;
+    static double b_ms = 0.0;
+    static double out_ms = 0.0;
+    static int64_t calls = 0;
+    struct ProfileReporter {
+        ~ProfileReporter() {
+            if (!profile || calls == 0) return;
+            std::cerr << "[DeltaNet projection profile] calls=" << calls
+                      << " qkv_ms=" << qkv_ms
+                      << " z_ms=" << z_ms
+                      << " a_ms=" << a_ms
+                      << " b_ms=" << b_ms
+                      << " out_ms=" << out_ms << std::endl;
+        }
+    };
+    static ProfileReporter reporter;
+    (void)reporter;
     DeltaNetCache local_cache;
     DeltaNetCache* active_cache = cache == nullptr ? &local_cache : cache;
     if (backend == nullptr || input.buffer() == nullptr ||
@@ -1424,11 +1358,44 @@ Tensor qwen_deltanet_reference(const Tensor& input,
     const int64_t key_dim = config.linear_key_head_dim;
     const int64_t value_dim = config.linear_value_head_dim;
     const int64_t tokens = input.shape().dim(0);
-    Tensor qkv_projection = Linear::forward(
-        input, layer.in_proj_qkv.values, true);
-    Tensor z = Linear::forward(input, layer.in_proj_z.values, true);
-    Tensor a = Linear::forward(input, layer.in_proj_a, true);
-    Tensor b = Linear::forward(input, layer.in_proj_b, true);
+    static std::shared_ptr<Buffer> qkv_workspace;
+    static std::shared_ptr<Buffer> z_workspace;
+    static std::shared_ptr<Buffer> a_workspace;
+    static std::shared_ptr<Buffer> b_workspace;
+    const auto workspace_for = [&](std::shared_ptr<Buffer>* workspace,
+                                   const Tensor& weight) {
+        const size_t bytes = static_cast<size_t>(tokens) *
+                             static_cast<size_t>(weight.shape().dim(0)) *
+                             SizeOfDType(input.dtype());
+        if (*workspace == nullptr || (*workspace)->device() != input.device() ||
+            (*workspace)->memory_type() != input.buffer()->memory_type() ||
+            (*workspace)->size() < bytes) {
+            *workspace = backend->create_buffer(bytes,
+                                                 input.buffer()->memory_type());
+        }
+        return *workspace;
+    };
+    const auto timed_projection = [&](const Tensor& weight,
+                                      std::shared_ptr<Buffer>* workspace,
+                                      double* elapsed) {
+        const auto start = std::chrono::steady_clock::now();
+        Tensor result;
+        std::shared_ptr<Buffer> buffer = workspace_for(workspace, weight);
+        if (buffer != nullptr) {
+            result = Linear::forward_into(input, weight, buffer, true);
+        }
+        if (profile && result.buffer() != nullptr) {
+            (void)backend->synchronize();
+            *elapsed += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - start).count();
+        }
+        return result;
+    };
+    Tensor qkv_projection = timed_projection(
+        layer.in_proj_qkv.values, &qkv_workspace, &qkv_ms);
+    Tensor z = timed_projection(layer.in_proj_z.values, &z_workspace, &z_ms);
+    Tensor a = timed_projection(layer.in_proj_a, &a_workspace, &a_ms);
+    Tensor b = timed_projection(layer.in_proj_b, &b_workspace, &b_ms);
     if (qkv_projection.buffer() == nullptr || z.buffer() == nullptr ||
         a.buffer() == nullptr || b.buffer() == nullptr) return Tensor();
     DeltaNetQKV qkv = GatedDeltaNet::grouped_causal_conv(
@@ -1443,10 +1410,18 @@ Tensor qwen_deltanet_reference(const Tensor& input,
         layer.dt_bias, layer.linear_attn_norm, qk_heads, value_heads, key_dim,
         value_dim, config.rms_norm_eps, active_cache);
     if (recurrent.buffer() == nullptr) return Tensor();
+    const auto output_start = std::chrono::steady_clock::now();
     Tensor projected = Linear::forward(
         recurrent.reshape(Shape{tokens, value_heads * value_dim}),
         layer.linear_out_proj.values, true);
+    if (profile && projected.buffer() != nullptr) {
+        (void)backend->synchronize();
+        out_ms += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - output_start).count();
+        ++calls;
+    }
     return projected;
 }
+#endif
 
 } // namespace

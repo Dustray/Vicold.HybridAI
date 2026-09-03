@@ -107,5 +107,30 @@ TEST(Qwen3WeightLoaderTest, LoadsRealAttentionLayerWhenAvailable) {
     EXPECT_TRUE(weights.mlp_down_proj.validate().ok());
 }
 
+TEST(Qwen3WeightLoaderTest, LoadsRealMtpWeightsWhenAvailable) {
+    const std::filesystem::path path = real_qwen_model_path();
+    if (!std::filesystem::exists(path / "config.json")) {
+        GTEST_SKIP() << "Qwen model is not available at " << path;
+    }
+
+    Qwen3Config config;
+    ASSERT_TRUE(config.load_json((path / "config.json").string()).ok());
+    ASSERT_GT(config.mtp_num_hidden_layers, 0);
+
+    Qwen3WeightLoader loader;
+    ASSERT_TRUE(loader.open(path.string(), config).ok());
+    Qwen3MTPWeights weights;
+    const Status status = loader.load_mtp(Device::Cpu(), &weights);
+    ASSERT_TRUE(status.ok()) << status.message();
+    EXPECT_EQ(weights.fc.dtype(), DType::BF16);
+    EXPECT_EQ(weights.fc.shape(), Shape({5120, 10240}));
+    EXPECT_EQ(weights.norm.shape(), Shape({5120}));
+    EXPECT_EQ(weights.pre_fc_norm_embedding.shape(), Shape({5120}));
+    EXPECT_EQ(weights.pre_fc_norm_hidden.shape(), Shape({5120}));
+    ASSERT_EQ(weights.layers.size(), 1u);
+    EXPECT_TRUE(weights.layers[0].is_attention_layer);
+    EXPECT_TRUE(weights.validate().ok());
+}
+
 } // namespace
 } // namespace hybridai::models

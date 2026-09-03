@@ -3,6 +3,7 @@
 #include "core/platform.h"
 
 #include <fstream>
+#include <limits>
 #include <nlohmann/json.hpp>
 #include <sstream>
 
@@ -85,6 +86,18 @@ Status Qwen3Config::load_json(const std::string& path) {
     read_i64("bos_token_id", &bos_token_id);
     read_i64("pad_token_id", &pad_token_id);
     read_bool("tie_word_embeddings", &tie_word_embeddings);
+    int64_t mtp_num_hidden_layers_value = 0;
+    read_i64("mtp_num_hidden_layers", &mtp_num_hidden_layers_value);
+    if (mtp_num_hidden_layers_value < 0 ||
+        mtp_num_hidden_layers_value >
+            std::numeric_limits<int32_t>::max()) {
+        return Status(StatusCode::InvalidModel,
+                      "mtp_num_hidden_layers must be non-negative");
+    }
+    mtp_num_hidden_layers =
+        static_cast<int32_t>(mtp_num_hidden_layers_value);
+    read_bool("mtp_use_dedicated_embeddings",
+              &mtp_use_dedicated_embeddings);
 
     eos_token_ids.clear();
     if (const auto* eos = field("eos_token_id"); eos != nullptr) {

@@ -52,6 +52,16 @@ struct Qwen3SharedWeights {
     Tensor lm_head;
 };
 
+struct Qwen3MTPWeights {
+    Tensor fc;
+    Tensor norm;
+    Tensor pre_fc_norm_embedding;
+    Tensor pre_fc_norm_hidden;
+    std::vector<Qwen3LayerWeights> layers;
+
+    Status validate() const;
+};
+
 struct Qwen3DevicePartition {
     Device device;
     int64_t first_layer = 0;
@@ -64,6 +74,7 @@ struct Qwen3DevicePartition {
 // the first device; final norm and LM head live on the last device.
 struct Qwen3DistributedWeights {
     Qwen3SharedWeights shared;
+    Qwen3MTPWeights mtp;
     std::vector<Qwen3LayerWeights> layers;
     std::vector<Device> layer_devices;
     std::vector<Qwen3DevicePartition> partitions;
@@ -93,6 +104,7 @@ public:
     Status load_layer(int64_t layer_index, Device device,
                       Qwen3LayerWeights* output) const;
     Status load_shared(Device device, Qwen3SharedWeights* output) const;
+    Status load_mtp(Device device, Qwen3MTPWeights* output) const;
     Status plan_distributed(const std::vector<Device>& devices,
                             std::vector<Qwen3DevicePartition>* partitions) const;
     Status load_distributed(const std::vector<Device>& devices,
@@ -108,6 +120,7 @@ private:
     std::string layer_name(int64_t layer_index, const std::string& suffix) const;
     uint64_t tensor_bytes(const std::string& name) const;
     uint64_t layer_bytes(int64_t layer_index) const;
+    uint64_t mtp_bytes() const;
 
     std::shared_ptr<io::SafeTensorLoader> loader_;
     Qwen3Config config_;

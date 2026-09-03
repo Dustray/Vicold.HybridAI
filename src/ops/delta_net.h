@@ -3,6 +3,8 @@
 #include "core/status.h"
 #include "core/tensor.h"
 
+#include <utility>
+
 namespace hybridai {
 namespace ops {
 
@@ -24,6 +26,32 @@ struct DeltaNetCache {
         recurrent_state = Tensor();
         length = 0;
     }
+
+    // Clone both convolution history and recurrent state. Rewinding only
+    // length is not sufficient for DeltaNet, so speculative paths must use an
+    // independent state or rebuild from accepted tokens.
+    Status clone(DeltaNetCache* destination) const;
+
+    // Create a complete rollback checkpoint. The checkpoint owns independent
+    // copies of both state buffers and can be restored after speculative work.
+    Status checkpoint(DeltaNetCache* destination) const {
+        return clone(destination);
+    }
+
+    // Commit a previously verified scratch state atomically at cache-object
+    // granularity. This swaps both convolution and recurrent state together.
+    void swap(DeltaNetCache* other) noexcept {
+        if (other == nullptr) return;
+        conv_state.swap(other->conv_state);
+        recurrent_state.swap(other->recurrent_state);
+        std::swap(length, other->length);
+    }
+
+    // Restore a checkpoint by swapping the complete state, including length.
+    // The previous state is returned to the checkpoint object, allowing the
+    // caller to retain it or swap back without another device copy. The
+    // operation rejects an incomplete checkpoint or incompatible state.
+    Status restore(DeltaNetCache* checkpoint) noexcept;
 };
 
 struct DeltaNetQKV {

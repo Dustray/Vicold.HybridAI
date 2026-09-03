@@ -33,6 +33,9 @@ public:
                       Stream* stream) override;
     Status copy(Buffer* dst, const Buffer* src, size_t size,
                 Stream* stream) override;
+    Status copy_to_offset(Buffer* dst, size_t dst_offset, const Buffer* src,
+                          size_t src_offset, size_t size,
+                          Stream* stream = nullptr) override;
     Status memset(Buffer* dst, int value, size_t size,
                   Stream* stream) override;
 
@@ -133,6 +136,9 @@ public:
     Status argmax_last_row(Buffer* dst, const Buffer* src, DType dtype,
                            int64_t rows, int64_t columns,
                            Stream* stream) override;
+    Status argmax_rows(Buffer* dst, const Buffer* src, DType dtype,
+                       int64_t rows, int64_t columns,
+                       Stream* stream = nullptr) override;
 
     void register_kernels() override;
 

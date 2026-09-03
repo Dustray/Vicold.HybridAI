@@ -10,10 +10,94 @@
 #include <cstdlib>
 #include <iostream>
 #include <chrono>
+#include <memory>
 #include <vector>
 
 namespace hybridai {
 namespace ops {
+
+Status DeltaNetCache::clone(DeltaNetCache* destination) const {
+    if (destination == nullptr) {
+        return Status(StatusCode::InvalidArgument,
+                      "DeltaNet cache clone destination is null");
+    }
+    if (!initialized() || conv_state.device() != recurrent_state.device() ||
+        length < 0) {
+        return Status(StatusCode::InvalidArgument,
+                      "DeltaNet cache is invalid or uninitialized");
+    }
+    auto backend = BackendRegistry::instance().get_backend(conv_state.device());
+    if (backend == nullptr) {
+        return Status(StatusCode::InvalidDevice,
+                      "DeltaNet cache backend is unavailable");
+    }
+    const bool reusable = destination->initialized() &&
+        destination->conv_state.shape() == conv_state.shape() &&
+        destination->recurrent_state.shape() == recurrent_state.shape() &&
+        destination->conv_state.dtype() == conv_state.dtype() &&
+        destination->recurrent_state.dtype() == recurrent_state.dtype() &&
+        destination->conv_state.device() == conv_state.device() &&
+        destination->recurrent_state.device() == recurrent_state.device() &&
+        destination->conv_state.buffer()->memory_type() ==
+            conv_state.buffer()->memory_type() &&
+        destination->recurrent_state.buffer()->memory_type() ==
+            recurrent_state.buffer()->memory_type() &&
+        destination->conv_state.buffer()->size() >= conv_state.nbytes() &&
+        destination->recurrent_state.buffer()->size() >= recurrent_state.nbytes();
+    std::shared_ptr<Buffer> conv_buffer = reusable
+        ? destination->conv_state.buffer()
+        : backend->create_buffer(conv_state.nbytes(),
+                                 conv_state.buffer()->memory_type());
+    std::shared_ptr<Buffer> recurrent_buffer = reusable
+        ? destination->recurrent_state.buffer()
+        : backend->create_buffer(recurrent_state.nbytes(),
+                                 recurrent_state.buffer()->memory_type());
+    if (conv_buffer == nullptr || recurrent_buffer == nullptr) {
+        return Status(StatusCode::OutOfMemory,
+                      "failed to allocate DeltaNet cache clone");
+    }
+    Status status = backend->memcpy_d2d(
+        conv_buffer.get(), conv_state.buffer().get(), conv_state.nbytes());
+    if (!status.ok()) return status;
+    status = backend->memcpy_d2d(recurrent_buffer.get(),
+                                 recurrent_state.buffer().get(),
+                                 recurrent_state.nbytes());
+    if (!status.ok()) return status;
+    status = backend->synchronize();
+    if (!status.ok()) return status;
+    destination->conv_state = Tensor(conv_state.shape(), conv_state.dtype(),
+                                     conv_state.device(), std::move(conv_buffer));
+    destination->recurrent_state = Tensor(
+        recurrent_state.shape(), recurrent_state.dtype(), recurrent_state.device(),
+        std::move(recurrent_buffer));
+    destination->length = length;
+    return {};
+}
+
+Status DeltaNetCache::restore(DeltaNetCache* checkpoint) noexcept {
+    if (checkpoint == nullptr) {
+        return Status(StatusCode::InvalidArgument,
+                      "DeltaNet cache restore checkpoint is null");
+    }
+    const bool has_conv_state = conv_state.buffer() != nullptr;
+    const bool has_recurrent_state = recurrent_state.buffer() != nullptr;
+    if ((has_conv_state != has_recurrent_state) ||
+        !checkpoint->initialized() || checkpoint->length < 0 ||
+        checkpoint->conv_state.device() != checkpoint->recurrent_state.device() ||
+        checkpoint->conv_state.dtype() != checkpoint->recurrent_state.dtype() ||
+        (initialized() &&
+         (conv_state.shape() != checkpoint->conv_state.shape() ||
+          recurrent_state.shape() != checkpoint->recurrent_state.shape() ||
+          conv_state.device() != checkpoint->conv_state.device() ||
+          recurrent_state.device() != checkpoint->recurrent_state.device() ||
+          conv_state.dtype() != checkpoint->conv_state.dtype() ||
+          recurrent_state.dtype() != checkpoint->recurrent_state.dtype()))) {
+        return Status(StatusCode::InvalidArgument,
+                      "DeltaNet cache restore state is incompatible");
+    }
+    swap(checkpoint);
+    return Status::OK();
+}
 
 namespace {
 
@@ -73,6 +157,39 @@ private:
     Backend* backend_ = nullptr;
     std::chrono::steady_clock::time_point start_;
 };
+
+struct DeltaNetWorkspace {
+    std::shared_ptr<Buffer> buffer;
+    Device device;
+    MemoryType memory_type = MemoryType::Device;
+};
+
+std::shared_ptr<Buffer> acquire_deltanet_workspace(
+    Backend* backend, size_t bytes, MemoryType memory_type,
+    std::vector<DeltaNetWorkspace>* pool) {
+    if (backend == nullptr || pool == nullptr) return nullptr;
+    for (auto& entry : *pool) {
+        if (entry.buffer != nullptr && entry.buffer.use_count() == 1 &&
+            entry.device == backend->device() &&
+            entry.memory_type == memory_type && entry.buffer->size() >= bytes) {
+            return entry.buffer;
+        }
+    }
+    auto buffer = backend->create_buffer(bytes, memory_type);
+    if (buffer == nullptr) return nullptr;
+    pool->push_back(DeltaNetWorkspace{buffer, backend->device(), memory_type});
+    return buffer;
+}
+
+std::vector<DeltaNetWorkspace>& grouped_conv_workspaces() {
+    static std::vector<DeltaNetWorkspace> pool;
+    return pool;
+}
+
+std::vector<DeltaNetWorkspace>& recurrent_workspaces() {
+    static std::vector<DeltaNetWorkspace> pool;
+    return pool;
+}
 
 } // namespace
 
@@ -311,18 +428,17 @@ DeltaNetQKV GatedDeltaNet::grouped_causal_conv(
     } else if (cache->conv_state.shape() != state_shape ||
                cache->conv_state.dtype() != qkv.dtype() ||
                cache->conv_state.device() != qkv.device()) return output;
-    auto q_buffer = backend->create_buffer(
-        static_cast<size_t>(token_count * key_width) *
-            SizeOfDType(qkv.dtype()),
-        qkv.buffer()->memory_type());
-    auto k_buffer = backend->create_buffer(
-        static_cast<size_t>(token_count * key_width) *
-            SizeOfDType(qkv.dtype()),
-        qkv.buffer()->memory_type());
-    auto v_buffer = backend->create_buffer(
-        static_cast<size_t>(token_count * value_width) *
-            SizeOfDType(qkv.dtype()),
-        qkv.buffer()->memory_type());
+    const MemoryType memory_type = qkv.buffer()->memory_type();
+    auto& workspaces = grouped_conv_workspaces();
+    auto q_buffer = acquire_deltanet_workspace(
+        backend.get(), static_cast<size_t>(token_count * key_width) *
+                           SizeOfDType(qkv.dtype()), memory_type, &workspaces);
+    auto k_buffer = acquire_deltanet_workspace(
+        backend.get(), static_cast<size_t>(token_count * key_width) *
+                           SizeOfDType(qkv.dtype()), memory_type, &workspaces);
+    auto v_buffer = acquire_deltanet_workspace(
+        backend.get(), static_cast<size_t>(token_count * value_width) *
+                           SizeOfDType(qkv.dtype()), memory_type, &workspaces);
     if (q_buffer == nullptr || k_buffer == nullptr || v_buffer == nullptr ||
         !backend->deltanet_grouped_conv(
             q_buffer.get(), k_buffer.get(), v_buffer.get(),
@@ -387,8 +503,9 @@ Tensor GatedDeltaNet::recurrent(
     } else if (cache->recurrent_state.shape() != state_shape ||
                cache->recurrent_state.dtype() != DType::FP32 ||
                cache->recurrent_state.device() != query.device()) return Tensor();
-    auto output_buffer = backend->create_buffer(
-        value.nbytes(), value.buffer()->memory_type());
+    auto output_buffer = acquire_deltanet_workspace(
+        backend.get(), value.nbytes(), value.buffer()->memory_type(),
+        &recurrent_workspaces());
     if (output_buffer == nullptr || !backend->deltanet_recurrent(
             output_buffer.get(), cache->recurrent_state.buffer().get(),
             query.buffer().get(), key.buffer().get(), value.buffer().get(),

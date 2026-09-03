@@ -202,6 +202,20 @@ Status CpuBackend::copy(Buffer* dst, const Buffer* src, size_t size,
     return Status::OK();
 }
 
+Status CpuBackend::copy_to_offset(Buffer* dst, size_t dst_offset,
+                                  const Buffer* src, size_t src_offset,
+                                  size_t size, Stream* stream) {
+    (void)stream;
+    if (dst == nullptr || src == nullptr || dst_offset + size > dst->size() ||
+        src_offset + size > src->size()) {
+        return Status(StatusCode::InvalidArgument,
+                      "CPU offset copy range is invalid");
+    }
+    std::memcpy(static_cast<uint8_t*>(dst->data()) + dst_offset,
+                static_cast<const uint8_t*>(src->data()) + src_offset, size);
+    return Status::OK();
+}
+
 Status CpuBackend::memset(Buffer* dst, int value, size_t size, Stream* stream) {
     (void)stream;
     std::memset(dst->data(), value, size);

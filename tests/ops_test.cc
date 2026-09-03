@@ -127,5 +127,48 @@ TEST(LinearTest, ForwardAddsBiasAcrossRowsOnCpu) {
     }
 }
 
+TEST(LinearTest, ForwardIntoReusesOutputBufferOnCpu) {
+    InitializeBuiltinBackends();
+    auto backend = BackendRegistry::instance().create_backend(Device::Cpu());
+    ASSERT_NE(backend, nullptr);
+
+    const std::vector<float> input_data = {1, 2, 3, 4, 5, 6};
+    const std::vector<float> weight_data = {
+        1, 0, 0,
+        0, 1, 0,
+        0, 0, 1,
+        1, 1, 1,
+    };
+    auto make_tensor = [&](const Shape& shape,
+                           const std::vector<float>& values) {
+        auto buffer = backend->create_buffer(values.size() * sizeof(float),
+                                             MemoryType::Host);
+        if (buffer == nullptr) return Tensor();
+        std::memcpy(buffer->data(), values.data(), values.size() * sizeof(float));
+        return Tensor(shape, DType::FP32, Device::Cpu(), std::move(buffer));
+    };
+
+    Tensor input = make_tensor(Shape{2, 3}, input_data);
+    Tensor weight = make_tensor(Shape{4, 3}, weight_data);
+    ASSERT_NE(input.buffer(), nullptr);
+    ASSERT_NE(weight.buffer(), nullptr);
+    auto output_buffer = backend->create_buffer(2 * 4 * sizeof(float),
+                                                MemoryType::Host);
+    ASSERT_NE(output_buffer, nullptr);
+    void* expected_address = output_buffer->data();
+
+    Tensor output = ops::Linear::forward_into(input, weight, output_buffer);
+    ASSERT_NE(output.data(), nullptr);
+    EXPECT_EQ(output.data(), expected_address);
+    const float* values = static_cast<const float*>(output.data());
+    const std::vector<float> expected = {
+        1.0f, 2.0f, 3.0f, 6.0f,
+        4.0f, 5.0f, 6.0f, 15.0f,
+    };
+    for (size_t i = 0; i < expected.size(); ++i) {
+        EXPECT_FLOAT_EQ(values[i], expected[i]);
+    }
+}
+
 } // namespace
 } // namespace hybridai

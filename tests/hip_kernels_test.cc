@@ -164,6 +164,37 @@ TEST_F(HipKernelTest, EmbeddingAddAndArgmaxMatchReference) {
     EXPECT_EQ(index[0], 3);
 }
 
+TEST_F(HipKernelTest, BatchedArgmaxRowsMatchesReferenceForFp32AndBf16) {
+    constexpr int64_t rows = 3;
+    constexpr int64_t columns = 7;
+    const std::vector<float> values_fp32 = {
+        1.0f, 9.0f, 3.0f, 9.0f, -1.0f, 2.0f, 0.0f,
+        -4.0f, -3.0f, -2.0f, -1.0f, 0.0f, 1.0f, 8.0f,
+        5.0f, 5.0f, 4.0f, 3.0f, 2.0f, 1.0f, 0.0f,
+    };
+    auto fp32 = upload(values_fp32);
+    auto fp32_output = backend_->create_buffer(rows * sizeof(int64_t),
+                                                MemoryType::Device);
+    ASSERT_NE(fp32_output, nullptr);
+    ASSERT_TRUE(backend_->argmax_rows(
+        fp32_output.get(), fp32.get(), DType::FP32, rows, columns).ok());
+    const auto fp32_actual = download<int64_t>(fp32_output, rows);
+    const std::vector<int64_t> expected = {1, 6, 0};
+    EXPECT_EQ(fp32_actual, expected);
+
+    std::vector<uint16_t> values_bf16(values_fp32.size());
+    for (size_t index = 0; index < values_bf16.size(); ++index)
+        values_bf16[index] = fp32_to_bf16(values_fp32[index]);
+    auto bf16 = upload(values_bf16);
+    auto bf16_output = backend_->create_buffer(rows * sizeof(int64_t),
+                                               MemoryType::Device);
+    ASSERT_NE(bf16_output, nullptr);
+    ASSERT_TRUE(backend_->argmax_rows(
+        bf16_output.get(), bf16.get(), DType::BF16, rows, columns).ok());
+    const auto bf16_actual = download<int64_t>(bf16_output, rows);
+    EXPECT_EQ(bf16_actual, expected);
+}
+
 TEST_F(HipKernelTest, RowBiasAddBroadcastsAcrossRows) {
     const std::vector<float> values = {
         1.0f, 2.0f, 3.0f,

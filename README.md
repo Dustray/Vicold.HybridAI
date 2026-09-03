@@ -307,6 +307,22 @@ activation。它不是 tensor parallel，不使用 RCCL/NCCL collective，也不
 - 当前实现保持连续分区以减少跨卡 activation transfer；尚未实现 tensor parallel、
   RCCL/NCCL 通信、拓扑感知选卡或自动显存感知 placement。
 
+### Qwen 原生 MTP 状态
+
+当前 Qwen3.8 checkpoint 已识别出原生 MTP 元数据，但实际权重索引中没有
+可加载的 `mtp.*` tensor：
+
+- `mtp_num_hidden_layers=1`；
+- `mtp_use_dedicated_embeddings=false`；
+- `model.safetensors.index.json` 中不存在 `mtp.fc.weight`、`mtp.norm.weight`；
+- 也不存在 `mtp.pre_fc_norm_embedding.weight`、`mtp.pre_fc_norm_hidden.weight`；
+- 也不存在 `mtp.layers.0.*` MTP decoder layer 权重。
+
+代码已经完成 MTP 配置解析和按需权重加载接口；当 checkpoint 缺少这些权重时，
+`load_mtp()` 会明确返回模型不完整错误。MTP 多 token 生成循环、cache 提交/回滚
+和 acceptance 统计尚未接入。当前生成仍使用普通单 token greedy decode；需要先
+获得包含完整 `mtp.*` 权重的 checkpoint，才能继续实现和验证 MTP 推理。
+
 在当前 8 × 64 GiB `gfx936` 环境实测加载成功：文本模型权重约
 `50.10 GiB`，首末卡各约 `8.04 GiB`，其余卡各约 `5.67 GiB`。
 该命令可以继续执行 BF16 投影、真实 DeltaNet/reference forward、完整

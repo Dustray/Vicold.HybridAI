@@ -91,5 +91,7 @@ Status deltanet_recurrent_decode128_for_test(
     void* stream_handle);
 Status argmax_last_row(int64_t* dst, const void* src, DType dtype,
                        int64_t rows, int64_t columns, void* stream_handle);
+Status argmax_rows(int64_t* dst, const void* src, DType dtype,
+                   int64_t rows, int64_t columns, void* stream_handle);
 
 } // namespace hybridai::hip_kernels

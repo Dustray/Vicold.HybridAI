@@ -223,6 +223,11 @@ public:
         return Status(StatusCode::NotImplemented,
                       "Backend argmax unavailable");
     }
+    virtual Status argmax_rows(Buffer*, const Buffer*, DType, int64_t,
+                               int64_t, Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend batched argmax unavailable");
+    }
 
     // Kernel registration hook. Backends may pre-register custom kernels (e.g.
     // hand-written tile kernels) into the global KernelRegistry during
@@ -242,6 +247,11 @@ public:
                                 Stream* = nullptr) {
         return Status(StatusCode::NotImplemented,
                       "Backend strided copy unavailable");
+    }
+    virtual Status copy_to_offset(Buffer*, size_t, const Buffer*, size_t,
+                                  size_t, Stream* = nullptr) {
+        return Status(StatusCode::NotImplemented,
+                      "Backend offset copy unavailable");
     }
     virtual Status q_gate_rmsnorm_rope(
         Buffer*, Buffer*, const Buffer*, const Buffer*, DType, int64_t,

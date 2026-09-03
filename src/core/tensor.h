@@ -6,6 +6,7 @@
 #include "core/shape.h"
 
 #include <memory>
+#include <utility>
 #include <vector>
 
 namespace hybridai {
@@ -44,6 +45,15 @@ public:
     const void* data() const { return buffer_ ? buffer_->data() : nullptr; }
 
     std::shared_ptr<Buffer> buffer() const noexcept { return buffer_; }
+
+    void swap(Tensor& other) noexcept {
+        std::swap(shape_, other.shape_);
+        std::swap(dtype_, other.dtype_);
+        std::swap(device_, other.device_);
+        buffer_.swap(other.buffer_);
+        strides_.swap(other.strides_);
+        std::swap(is_contiguous_, other.is_contiguous_);
+    }
 
     // Move tensor to another device (uses backend copy)
     Tensor to(Device target) const;

@@ -1,3 +1,82 @@
+2026-09-03 speculative correctness smoke
+- Build: build-benchmark (HIP, benchmark runner)
+- Model: Qwen3.8-27B BF16 real weights
+- Prompt: "Hello, how are you? And who are you?"
+- max_new_tokens: 8, proposal width: 8
+- Baseline token_ids: [9419,0,353,2688,3604,1575,11,9414]
+- Speculative token_ids: [9419,0,353,2688,3604,1575,11,9414]
+- Result: exact token identity; mismatch path entered target-only fallback
+- Speculative metrics: proposed=7, accepted=2, rejected=5, correction=1,
+  replay_tokens=4, mtp_recovery_tokens=0, fallback_steps=1
+- Note: MTP recovery remains intentionally disabled until positional and
+  recurrent-cache equivalence is formally established.
+
+2026-09-03 long-request fallback validation
+- Request: max_new_tokens=160; the model emitted 40 tokens before EOS.
+- Baseline token_ids and speculative token_ids were exactly identical.
+- Baseline mean elapsed: 3.081753 s; speculative mean elapsed: 2.965155 s.
+- Baseline decode throughput: 13.462346 token/s; speculative:
+  13.490657 token/s. This is not evidence of MTP speedup because the
+  speculative run fell back after its first round.
+- Width=8 metrics: proposed=8, accepted=2, rejected=6, correction=1,
+  replay_tokens=4, fallback_steps=1, fallback_seconds=2.590481,
+  proposal_seconds=0.028785, verification_seconds=0.094614.
+- Interpretation: correctness is validated through the full emitted suffix,
+  but low acceptance makes the current target-only fallback effectively the
+  dominant decode path. Do not optimize benchmark noise before implementing a
+  formally verified multi-round MTP cache recovery/commit path.
+
+2026-09-03 multi-round MTP recovery smoke
+- Build: build-benchmark (HIP, benchmark runner)
+- Model: Qwen3.8-27B BF16 real weights; prompt unchanged; max_new_tokens=40
+- Baseline token_ids and speculative token_ids were exactly identical.
+- Baseline: elapsed=3.371495 s, decode=12.824275 token/s.
+- Speculative width=8: elapsed=1.630598 s, decode=24.535927 token/s.
+- Speculative metrics: rounds=7, proposed=56, accepted=27, rejected=29,
+  correction=6, replay_tokens=31, recovery_tokens=5, fallback_steps=0.
+- Result: first multi-round recovery implementation preserved token identity
+  and restored measurable acceleration. Keep larger prompt/width regression
+  coverage before treating this as final performance.
+
+2026-09-03 speculative width matrix
+- Model: Qwen3.8-27B BF16 real weights; same prompt; max_new_tokens=40.
+- Every completed width (1, 2, 4, 6, 8) produced token_ids exactly identical
+  to its paired baseline run.
+- Width 1: speedup=2.113x, rounds=20, accepted=19, recovery=0.
+- Width 2: speedup=2.034x, rounds=13, accepted=25, recovery=1.
+- Width 4: speedup=1.699x, rounds=10, accepted=24, recovery=5.
+- Width 6: speedup=1.939x, rounds=8, accepted=25, recovery=6.
+- Width 8: speedup=2.066x, rounds=7, accepted=27, recovery=5.
+- Width 16: token_ids identical, speedup=1.448x, rounds=7, proposed=103,
+  accepted=26, acceptance=25.2%, rejected=77, correction=7, replay=40,
+  recovery=6, fallback=0.
+- Full completed matrix: width=1/2/4/6/8/16 all produced token_ids exactly
+  identical to their paired baseline runs. Width=16 initially encountered a
+  transient GPU allocation failure while another long benchmark occupied the
+  device; the isolated rerun completed successfully on a clean GPU.
+- Single-run smoke interpretation: width=1 and width=2 had the highest
+  acceptance rates (95.0% and 96.2%); width=1 measured the best speedup
+  (2.113x), while width=8 remained a strong throughput/round-count tradeoff
+  (2.066x). Do not change the default width based on this matrix alone.
+
+2026-09-03 multi-prompt width=8 regression
+- Model: Qwen3.8-27B BF16 real weights; max_new_tokens=40; greedy; batch=1.
+- Four prompts were tested. All speculative outputs had token_ids exactly
+  identical to their paired baseline outputs, and all completed with
+  mtp_fallback_steps=0.
+- Prompt 1 ("Hello, how are you? And who are you?"): speedup=2.049x,
+  proposed=56, accepted=27, acceptance=48.2%, rounds=7, recovery=5.
+- Prompt 2 (capital of France question): speedup=1.796x, proposed=62,
+  accepted=25, acceptance=40.3%, rounds=8, recovery=6.
+- Prompt 3 (compiler explanation): speedup=1.763x, proposed=66,
+  accepted=24, acceptance=36.4%, rounds=9, recovery=7.
+- Prompt 4 (robot painting story): speedup=1.206x, proposed=90,
+  accepted=14, acceptance=15.6%, rounds=13, recovery=12.
+- Mean across these four single-run samples: speedup=1.703x and acceptance
+  rate=35.1%. This validates correctness and recovery across prompt types,
+  but is not sufficient to establish a universal best width or performance
+  guarantee.
+
 HIP_ALLOC_INITIALIZE=0 HIP_VISIBLE_DEVICES=1 python3 benchmark/python/benchmark_latency.py   --runner build-benchmark/bin/hybridai_benchmark_runner   --model /public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master   --backend hip   --max-new-tokens 160   --warmup 1   --runs 5   --output results/latency.jsonl
 2026.08.31
 HybridAI Latency Benchmark
@@ -48,3 +127,137 @@ HybridAI Latency Benchmark
 | prefill_seconds [ms]     |       5 |   183.998 |   183.717 |   184.267 |   183.916 |   184.234 |   184.250 |   184.263 |
 | decode_seconds [ms]      |       5 |  2876.890 |  2861.923 |  2881.744 |  2880.545 |  2881.439 |  2881.591 |  2881.713 |
 +--------------------------+---------+-----------+-----------+-----------+-----------+-----------+-----------+-----------+
+
+
+
+HIP_ALLOC_INITIALIZE=0 HIP_VISIBLE_DEVICES=5 python3 benchmark/python/benchmark_latency.py   --runner build-benchmark/bin/hybridai_benchmark_runner   --model /public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master   --backend hip   --max-new-tokens 160   --warmup 1   --runs 5   --output results/latency.jsonl --speculative-mtp
+
+2026.09.01  enableMTP（历史记录；当前默认 proposal width=8）：
+MTP proposal
+→ target batch verification
+→ 一旦 mismatch
+→ replay accepted prefix + correction
+→ 丢弃 MTP scratch cache
+→ 剩余 token 全部 target-only decode
+HybridAI Latency Benchmark
+  module: latency
+  mtp_mode: speculative
+  records [count]: 5
+  max_new_tokens [token]: 160
+  +---------------------------------------------+---------+------+-----+-----+-----+-----+-----+-----+
+  | Metric                                      | samples | mean | min | max | p50 | p90 | p95 | p99 |
+  +---------------------------------------------+---------+------+-----+-----+-----+-----+-----+-----+
+  | prompt_tokens [token]                       |       5 |   23 |  23 |  23 |  23 |  23 |  23 |  23 |
+  | generated_tokens [token]                    |       5 |   40 |  40 |  40 |  40 |  40 |  40 |  40 |
+  | e2e_seconds [ms]                            |       5 | 1940.671 | 1932.460 | 1943.286 | 1942.291 | 1943.216 | 1943.251 | 1943.279 |
+  | ttft_seconds [ms]                           |       5 | 184.147 | 183.788 | 184.390 | 184.285 | 184.356 | 184.373 | 184.387 |
+  | decode_seconds [ms]                         |       5 | 1940.258 | 1932.063 | 1942.844 | 1941.895 | 1942.783 | 1942.814 | 1942.838 |
+  | output_tokens_per_second [token/s]          |       5 | 20.61 | 20.58 | 20.70 | 20.59 | 20.66 | 20.68 | 20.69 |
+  | decode_tokens_per_second [token/s]          |       5 | 20.62 | 20.59 | 20.70 | 20.60 | 20.66 | 20.68 | 20.70 |
+  | mtp_proposed_tokens [token]                 |       5 |   40 |  40 |  40 |  40 |  40 |  40 |  40 |
+  | mtp_accepted_tokens [token]                 |       5 |   24 |  24 |  24 |  24 |  24 |  24 |  24 |
+  | mtp_fallback_steps [token]                  |       5 |    5 |   5 |   5 |   5 |   5 |   5 |   5 |
+  | mtp_acceptance_rate                         |       5 |  60% | 60% | 60% | 60% | 60% | 60% | 60% |
+  | speculative_proposal_seconds [ms]           |       5 | 144.033 | 142.818 | 145.537 | 143.791 | 145.018 | 145.277 | 145.485 |
+  | speculative_verification_seconds [ms]       |       5 | 1118.726 | 1115.772 | 1120.128 | 1119.762 | 1120.043 | 1120.086 | 1120.120 |
+  | speculative_replay_seconds [ms]             |       5 | 483.907 | 480.311 | 485.050 | 484.719 | 484.956 | 485.003 | 485.041 |
+  | speculative_fallback_seconds [ms]           |       5 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+  | speculative_mtp_cache_clone_seconds [ms]    |       5 | 1.518 | 1.481 | 1.543 | 1.522 | 1.537 | 1.540 | 1.542 |
+  | speculative_target_cache_clone_seconds [ms] |       5 | 35.022 | 34.549 | 35.407 | 35.067 | 35.303 | 35.355 | 35.397 |
+  | speculative_argmax_seconds [ms]             |       5 | 4.548 | 4.463 | 4.592 | 4.567 | 4.584 | 4.588 | 4.591 |
+  | speculative_rounds [token]                  |       5 |   10 |  10 |  10 |  10 |  10 |  10 |  10 |
+  +---------------------------------------------+---------+------+-----+-----+-----+-----+-----+-----+
+
+2026.09.01  enableMTP 优化2：真正的多轮 speculative recovery：
+为每个 MTP proposal prefix 保存完整的 Attention cache checkpoint；
+mismatch 后恢复到 accepted prefix 对应的 MTP cache；
+使用 target replay 得到的 correction 输入 hidden；
+重新执行一次 correction 的 MTP forward；
+恢复 MTP hidden 和 cache 后继续下一轮 speculative；
+不再在第一次 mismatch 后永久进入 target-only fallback。
+MTP proposal
+→ target batch verification
+→ accepted prefix + correction replay
+→ 恢复 accepted-prefix MTP cache
+→ correction MTP forward
+→ 继续下一轮 speculative
+HybridAI Latency Benchmark
+  module: latency
+  mtp_mode: speculative
+  records [count]: 5
+  max_new_tokens [token]: 160
+  speculative_width: 8
+  +----------------------------------------------+---------+------+-----+-----+-----+-----+-----+-----+
+  | Metric                                       | samples | mean | min | max | p50 | p90 | p95 | p99 |
+  +----------------------------------------------+---------+------+-----+-----+-----+-----+-----+-----+
+  | prompt_tokens [token]                        |       5 |   23 |  23 |  23 |  23 |  23 |  23 |  23 |
+  | generated_tokens [token]                     |       5 |   40 |  40 |  40 |  40 |  40 |  40 |  40 |
+  | e2e_seconds [ms]                             |       5 | 1510.060 | 1504.077 | 1515.783 | 1512.500 | 1514.814 | 1515.298 | 1515.686 |
+  | ttft_seconds [ms]                            |       5 | 184.325 | 184.066 | 184.692 | 184.150 | 184.644 | 184.668 | 184.688 |
+  | decode_seconds [ms]                          |       5 | 1509.923 | 1503.948 | 1515.641 | 1512.365 | 1514.668 | 1515.154 | 1515.544 |
+  | output_tokens_per_second [token/s]           |       5 | 26.49 | 26.39 | 26.59 | 26.45 | 26.59 | 26.59 | 26.59 |
+  | decode_tokens_per_second [token/s]           |       5 | 26.49 | 26.39 | 26.60 | 26.45 | 26.59 | 26.59 | 26.60 |
+  | mtp_proposed_tokens [token]                  |       5 |   56 |  56 |  56 |  56 |  56 |  56 |  56 |
+  | mtp_accepted_tokens [token]                  |       5 |   27 |  27 |  27 |  27 |  27 |  27 |  27 |
+  | mtp_rejected_tokens [token]                  |       5 |   29 |  29 |  29 |  29 |  29 |  29 |  29 |
+  | mtp_correction_tokens [token]                |       5 |    6 |   6 |   6 |   6 |   6 |   6 |   6 |
+  | speculative_replay_tokens [token]            |       5 |   31 |  31 |  31 |  31 |  31 |  31 |  31 |
+  | speculative_mtp_recovery_tokens [token]      |       5 |    5 |   5 |   5 |   5 |   5 |   5 |   5 |
+  | speculative_max_proposal_width [token]       |       5 |    8 |   8 |   8 |   8 |   8 |   8 |   8 |
+  | speculative_mtp_cache_clone_count [token]    |       5 |   70 |  70 |  70 |  70 |  70 |  70 |  70 |
+  | speculative_target_cache_clone_count [token] |       5 |    7 |   7 |   7 |   7 |   7 |   7 |   7 |
+  | mtp_fallback_steps [token]                   |       5 |    0 |   0 |   0 |   0 |   0 |   0 |   0 |
+  | mtp_acceptance_rate                          |       5 |  48% | 48% | 48% | 48% | 48% | 48% | 48% |
+  | speculative_proposal_seconds [ms]            |       5 | 202.804 | 202.130 | 204.055 | 202.624 | 203.574 | 203.814 | 204.007 |
+  | speculative_verification_seconds [ms]        |       5 | 647.999 | 644.976 | 650.847 | 648.639 | 650.427 | 650.637 | 650.805 |
+  | speculative_replay_seconds [ms]              |       5 | 199.578 | 195.124 | 203.167 | 201.638 | 202.649 | 202.908 | 203.115 |
+  | speculative_fallback_seconds [ms]            |       5 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+  | speculative_mtp_cache_clone_seconds [ms]     |       5 | 5.168 | 5.066 | 5.336 | 5.139 | 5.266 | 5.301 | 5.329 |
+  | speculative_target_cache_clone_seconds [ms]  |       5 | 21.863 | 21.617 | 22.059 | 21.935 | 22.034 | 22.046 | 22.056 |
+  | speculative_argmax_seconds [ms]              |       5 | 3.390 | 3.154 | 3.697 | 3.391 | 3.628 | 3.663 | 3.690 |
+  | speculative_rounds [token]                   |       5 |    7 |   7 |   7 |   7 |   7 |   7 |   7 |
+  +----------------------------------------------+---------+------+-----+-----+-----+-----+-----+-----+
+
+
+
+   HIP_ALLOC_INITIALIZE=0 HIP_VISIBLE_DEVICES=7 python3 benchmark/python/benchmark_latency.py   --runner build-benchmark/bin/hybridai_benc
+hmark_runner   --model /public/home/panyq/yiny/modelscope/models/Qwen--Qwen3.8-27B/snapshots/master   --backend hip   --max-new-tokens 160   --warmup 1   --runs 5   --output results/latency.jsonl --s
+peculative-mtp  --speculative-width  1
+
+2026.09.01  enableMTP --speculative-width  1
+HybridAI Latency Benchmark
+  module: latency
+  mtp_mode: speculative
+  records [count]: 5
+  max_new_tokens [token]: 160
+  speculative_width: 1
+  +----------------------------------------------+---------+------+-----+-----+-----+-----+-----+-----+
+  | Metric                                       | samples | mean | min | max | p50 | p90 | p95 | p99 |
+  +----------------------------------------------+---------+------+-----+-----+-----+-----+-----+-----+
+  | prompt_tokens [token]                        |       5 |   23 |  23 |  23 |  23 |  23 |  23 |  23 |
+  | generated_tokens [token]                     |       5 |   40 |  40 |  40 |  40 |  40 |  40 |  40 |
+  | e2e_seconds [ms]                             |       5 | 1469.941 | 1468.131 | 1476.135 | 1468.485 | 1473.149 | 1474.642 | 1475.836 |
+  | ttft_seconds [ms]                            |       5 | 184.235 | 184.183 | 184.325 | 184.235 | 184.293 | 184.309 | 184.322 |
+  | decode_seconds [ms]                          |       5 | 1469.812 | 1468.006 | 1476.000 | 1468.353 | 1473.018 | 1474.509 | 1475.702 |
+  | output_tokens_per_second [token/s]           |       5 | 27.21 | 27.10 | 27.25 | 27.24 | 27.24 | 27.24 | 27.25 |
+  | decode_tokens_per_second [token/s]           |       5 | 27.21 | 27.10 | 27.25 | 27.24 | 27.25 | 27.25 | 27.25 |
+  | mtp_proposed_tokens [token]                  |       5 |   20 |  20 |  20 |  20 |  20 |  20 |  20 |
+  | mtp_accepted_tokens [token]                  |       5 |   19 |  19 |  19 |  19 |  19 |  19 |  19 |
+  | mtp_rejected_tokens [token]                  |       5 |    1 |   1 |   1 |   1 |   1 |   1 |   1 |
+  | mtp_correction_tokens [token]                |       5 |    1 |   1 |   1 |   1 |   1 |   1 |   1 |
+  | speculative_replay_tokens [token]            |       5 |    2 |   2 |   2 |   2 |   2 |   2 |   2 |
+  | speculative_mtp_recovery_tokens [token]      |       5 |    0 |   0 |   0 |   0 |   0 |   0 |   0 |
+  | speculative_max_proposal_width [token]       |       5 |    1 |   1 |   1 |   1 |   1 |   1 |   1 |
+  | speculative_mtp_cache_clone_count [token]    |       5 |   60 |  60 |  60 |  60 |  60 |  60 |  60 |
+  | speculative_target_cache_clone_count [token] |       5 |   20 |  20 |  20 |  20 |  20 |  20 |  20 |
+  | mtp_fallback_steps [token]                   |       5 |    0 |   0 |   0 |   0 |   0 |   0 |   0 |
+  | mtp_acceptance_rate                          |       5 |  95% | 95% | 95% | 95% | 95% | 95% | 95% |
+  | speculative_proposal_seconds [ms]            |       5 | 75.042 | 74.672 | 76.131 | 74.793 | 75.608 | 75.869 | 76.079 |
+  | speculative_verification_seconds [ms]        |       5 | 1172.573 | 1171.166 | 1176.917 | 1171.669 | 1174.862 | 1175.889 | 1176.711 |
+  | speculative_replay_seconds [ms]              |       5 | 32.097 | 31.787 | 32.270 | 32.204 | 32.270 | 32.270 | 32.270 |
+  | speculative_fallback_seconds [ms]            |       5 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 |
+  | speculative_mtp_cache_clone_seconds [ms]     |       5 | 4.148 | 4.072 | 4.381 | 4.096 | 4.275 | 4.328 | 4.370 |
+  | speculative_target_cache_clone_seconds [ms]  |       5 | 53.811 | 53.525 | 54.480 | 53.600 | 54.247 | 54.364 | 54.456 |
+  | speculative_argmax_seconds [ms]              |       5 | 9.080 | 8.990 | 9.338 | 9.028 | 9.216 | 9.277 | 9.325 |
+  | speculative_rounds [token]                   |       5 |   20 |  20 |  20 |  20 |  20 |  20 |  20 |
+  +----------------------------------------------+---------+------+-----+-----+-----+-----+-----+-----+

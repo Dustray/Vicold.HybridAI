@@ -30,6 +30,16 @@ public:
                           const Tensor* bias = nullptr,
                           Stream* stream = nullptr);
 
+    // Compute into a caller-owned output buffer. The buffer must be large
+    // enough for the contiguous output tensor and must belong to the same
+    // device as the input. This is intended for inference workspaces that
+    // reuse temporary projection storage across calls.
+    static Tensor forward_into(const Tensor& input, const Tensor& weight,
+                               const std::shared_ptr<Buffer>& output_buffer,
+                               bool transpose_weight = true,
+                               const Tensor* bias = nullptr,
+                               Stream* stream = nullptr);
+
     // Compute output shape from input and weight shapes.
     static Status compute_output_shape(const Shape& input_shape,
                                        const Shape& weight_shape,

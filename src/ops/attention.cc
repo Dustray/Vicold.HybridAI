@@ -16,6 +16,81 @@
 namespace hybridai {
 namespace ops {
 
+Status AttentionKVCache::truncate(int64_t new_length) noexcept {
+    if (new_length < 0 || capacity < 0 || new_length > capacity) {
+        return Status(StatusCode::InvalidArgument,
+                      "attention cache truncate length is out of range");
+    }
+    if (!initialized()) {
+        return new_length == 0
+            ? Status::OK()
+            : Status(StatusCode::InvalidArgument,
+                     "cannot truncate an uninitialized attention cache");
+    }
+    if (key.shape().ndim() < 1 || value.shape().ndim() < 1 ||
+        key.shape().dim(0) != capacity || value.shape().dim(0) != capacity ||
+        key.device() != value.device() || key.dtype() != value.dtype()) {
+        return Status(StatusCode::InvalidArgument,
+                      "attention cache storage is inconsistent");
+    }
+    length = new_length;
+    return Status::OK();
+}
+
+Status AttentionKVCache::clone(AttentionKVCache* destination) const {
+    if (destination == nullptr) {
+        return Status(StatusCode::InvalidArgument,
+                      "attention cache clone destination is null");
+    }
+    if (!initialized() || key.device() != value.device() ||
+        key.shape() != value.shape() || key.dtype() != value.dtype() ||
+        length < 0 || capacity < 0 || length > capacity) {
+        return Status(StatusCode::InvalidArgument,
+                      "attention cache is invalid or uninitialized");
+    }
+    auto backend = BackendRegistry::instance().get_backend(key.device());
+    if (backend == nullptr) {
+        return Status(StatusCode::InvalidDevice,
+                      "attention cache backend is unavailable");
+    }
+    const bool reusable = destination->initialized() &&
+        destination->key.shape() == key.shape() &&
+        destination->value.shape() == value.shape() &&
+        destination->key.dtype() == key.dtype() &&
+        destination->value.dtype() == value.dtype() &&
+        destination->key.device() == key.device() &&
+        destination->value.device() == value.device() &&
+        destination->key.buffer()->memory_type() == key.buffer()->memory_type() &&
+        destination->value.buffer()->memory_type() == value.buffer()->memory_type() &&
+        destination->key.buffer()->size() >= key.nbytes() &&
+        destination->value.buffer()->size() >= value.nbytes();
+    std::shared_ptr<Buffer> key_buffer = reusable
+        ? destination->key.buffer()
+        : backend->create_buffer(key.nbytes(), key.buffer()->memory_type());
+    std::shared_ptr<Buffer> value_buffer = reusable
+        ? destination->value.buffer()
+        : backend->create_buffer(value.nbytes(), value.buffer()->memory_type());
+    if (key_buffer == nullptr || value_buffer == nullptr) {
+        return Status(StatusCode::OutOfMemory,
+                      "failed to allocate attention cache clone");
+    }
+    Status status = backend->memcpy_d2d(key_buffer.get(), key.buffer().get(),
+                                        key.nbytes());
+    if (!status.ok()) return status;
+    status = backend->memcpy_d2d(value_buffer.get(), value.buffer().get(),
+                                 value.nbytes());
+    if (!status.ok()) return status;
+    status = backend->synchronize();
+    if (!status.ok()) return status;
+    destination->key = Tensor(key.shape(), key.dtype(), key.device(),
+                              std::move(key_buffer));
+    destination->value = Tensor(value.shape(), value.dtype(), value.device(),
+                                std::move(value_buffer));
+    destination->length = length;
+    destination->capacity = capacity;
+    return {};
+}
+
 namespace {
 
 Tensor convert_dtype_host(const Tensor& input, DType output_dtype,

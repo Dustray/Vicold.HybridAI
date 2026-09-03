@@ -115,5 +115,125 @@ TEST_F(AttentionTest, OutputShapeMatchesInput) {
     EXPECT_EQ(output.shape(), input.shape());
 }
 
+TEST(AttentionKVCacheTest, ResetRewindsLengthWithoutReleasingStorage) {
+    InitializeBuiltinBackends();
+    auto backend =
+        BackendRegistry::instance().create_backend(Device::Cpu());
+    ASSERT_NE(backend, nullptr);
+
+    auto key_buffer = backend->create_buffer(8 * sizeof(float),
+                                              MemoryType::Host);
+    auto value_buffer = backend->create_buffer(8 * sizeof(float),
+                                                MemoryType::Host);
+    ASSERT_NE(key_buffer, nullptr);
+    ASSERT_NE(value_buffer, nullptr);
+
+    ops::AttentionKVCache cache;
+    cache.key = Tensor(Shape{4, 1, 2}, DType::FP32, Device::Cpu(),
+                       std::move(key_buffer));
+    cache.value = Tensor(Shape{4, 1, 2}, DType::FP32, Device::Cpu(),
+                          std::move(value_buffer));
+    cache.capacity = 4;
+    cache.length = 3;
+    ASSERT_TRUE(cache.initialized());
+
+    auto* key_storage = cache.key.buffer().get();
+    auto* value_storage = cache.value.buffer().get();
+    cache.reset();
+
+    EXPECT_EQ(cache.length, 0);
+    EXPECT_EQ(cache.capacity, 4);
+    EXPECT_TRUE(cache.initialized());
+    EXPECT_EQ(cache.key.buffer().get(), key_storage);
+    EXPECT_EQ(cache.value.buffer().get(), value_storage);
+}
+
+TEST(AttentionKVCacheTest, TruncateRewindsLogicalPrefixWithoutReleasingStorage) {
+    InitializeBuiltinBackends();
+    auto backend =
+        BackendRegistry::instance().create_backend(Device::Cpu());
+    ASSERT_NE(backend, nullptr);
+
+    auto key_buffer = backend->create_buffer(8 * sizeof(float), MemoryType::Host);
+    auto value_buffer = backend->create_buffer(8 * sizeof(float), MemoryType::Host);
+    ASSERT_NE(key_buffer, nullptr);
+    ASSERT_NE(value_buffer, nullptr);
+
+    ops::AttentionKVCache cache;
+    cache.key = Tensor(Shape{4, 1, 2}, DType::FP32, Device::Cpu(),
+                       std::move(key_buffer));
+    cache.value = Tensor(Shape{4, 1, 2}, DType::FP32, Device::Cpu(),
+                          std::move(value_buffer));
+    cache.capacity = 4;
+    cache.length = 4;
+    auto* key_storage = cache.key.buffer().get();
+    auto* value_storage = cache.value.buffer().get();
+
+    ASSERT_TRUE(cache.truncate(2).ok());
+    EXPECT_EQ(cache.length, 2);
+    EXPECT_EQ(cache.capacity, 4);
+    EXPECT_EQ(cache.key.buffer().get(), key_storage);
+    EXPECT_EQ(cache.value.buffer().get(), value_storage);
+    EXPECT_FALSE(cache.truncate(5).ok());
+    EXPECT_FALSE(cache.truncate(-1).ok());
+}
+
+TEST(AttentionKVCacheTest, TruncateRejectsNonZeroLengthOnUninitializedCache) {
+    ops::AttentionKVCache cache;
+    EXPECT_TRUE(cache.truncate(0).ok());
+    EXPECT_FALSE(cache.truncate(1).ok());
+}
+
+TEST(AttentionKVCacheTest, CloneOwnsIndependentStorage) {
+    InitializeBuiltinBackends();
+    auto backend =
+        BackendRegistry::instance().create_backend(Device::Cpu());
+    ASSERT_NE(backend, nullptr);
+    auto key_buffer = backend->create_buffer(2 * sizeof(float), MemoryType::Host);
+    auto value_buffer = backend->create_buffer(2 * sizeof(float), MemoryType::Host);
+    ASSERT_NE(key_buffer, nullptr);
+    ASSERT_NE(value_buffer, nullptr);
+    const float key_data[] = {1.0f, 2.0f};
+    const float value_data[] = {3.0f, 4.0f};
+    std::memcpy(key_buffer->data(), key_data, sizeof(key_data));
+    std::memcpy(value_buffer->data(), value_data, sizeof(value_data));
+    ops::AttentionKVCache source;
+    source.key = Tensor(Shape{1, 1, 2}, DType::FP32, Device::Cpu(),
+                        std::move(key_buffer));
+    source.value = Tensor(Shape{1, 1, 2}, DType::FP32, Device::Cpu(),
+                          std::move(value_buffer));
+    source.length = 1;
+    source.capacity = 1;
+    ops::AttentionKVCache clone;
+    ASSERT_TRUE(source.clone(&clone).ok());
+    EXPECT_EQ(clone.length, source.length);
+    EXPECT_EQ(clone.capacity, source.capacity);
+    EXPECT_NE(clone.key.buffer().get(), source.key.buffer().get());
+    EXPECT_NE(clone.value.buffer().get(), source.value.buffer().get());
+    EXPECT_EQ(std::memcmp(clone.key.data(), key_data, sizeof(key_data)), 0);
+    EXPECT_EQ(std::memcmp(clone.value.data(), value_data, sizeof(value_data)), 0);
+
+    static_cast<float*>(clone.key.data())[0] = 99.0f;
+    static_cast<float*>(clone.value.data())[0] = 88.0f;
+    EXPECT_FLOAT_EQ(static_cast<const float*>(source.key.data())[0], 1.0f);
+    EXPECT_FLOAT_EQ(static_cast<const float*>(source.value.data())[0], 3.0f);
+}
+
+TEST(AttentionKVCacheTest, SwapCommitsScratchCacheAsAWhole) {
+    ops::AttentionKVCache committed;
+    ops::AttentionKVCache scratch;
+    committed.length = 2;
+    committed.capacity = 8;
+    scratch.length = 5;
+    scratch.capacity = 9;
+
+    committed.swap(&scratch);
+
+    EXPECT_EQ(committed.length, 5);
+    EXPECT_EQ(committed.capacity, 9);
+    EXPECT_EQ(scratch.length, 2);
+    EXPECT_EQ(scratch.capacity, 8);
+}
+
 } // namespace
 } // namespace hybridai

@@ -1240,6 +1240,39 @@ __global__ void argmax_last_row_kernel(int64_t* dst, const T* src,
     if (threadIdx.x == 0) *dst = indices[0];
 }
 
+template <typename T>
+__global__ void argmax_rows_kernel(int64_t* dst, const T* src,
+                                   int64_t rows, int64_t columns) {
+    const int64_t row_index = static_cast<int64_t>(blockIdx.x);
+    if (row_index >= rows) return;
+    const T* row = src + row_index * columns;
+    float best_value = -INFINITY;
+    int64_t best_index = 0;
+    for (int64_t column = threadIdx.x; column < columns;
+         column += blockDim.x) {
+        const float value = load_value(row, column);
+        if (value > best_value) {
+            best_value = value;
+            best_index = column;
+        }
+    }
+
+    __shared__ float values[kBlockSize];
+    __shared__ int64_t indices[kBlockSize];
+    values[threadIdx.x] = best_value;
+    indices[threadIdx.x] = best_index;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride &&
+            values[threadIdx.x + stride] > values[threadIdx.x]) {
+            values[threadIdx.x] = values[threadIdx.x + stride];
+            indices[threadIdx.x] = indices[threadIdx.x + stride];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) dst[row_index] = indices[0];
+}
+
 dim3 grid_for(int64_t count) {
     return dim3(static_cast<unsigned int>((count + kBlockSize - 1) /
                                           kBlockSize));
@@ -1613,6 +1646,15 @@ Status launch_argmax(int64_t* dst, const void* src, int64_t rows,
     hipLaunchKernelGGL(argmax_last_row_kernel<T>, dim3(1), dim3(kBlockSize), 0,
                        stream, dst, static_cast<const T*>(src), rows, columns);
     return hip_status(hipGetLastError(), "launch argmax kernel");
+}
+
+template <typename T>
+Status launch_argmax_rows(int64_t* dst, const void* src, int64_t rows,
+                          int64_t columns, hipStream_t stream) {
+    hipLaunchKernelGGL(argmax_rows_kernel<T>, dim3(static_cast<unsigned int>(rows)),
+                       dim3(kBlockSize), 0, stream, dst,
+                       static_cast<const T*>(src), rows, columns);
+    return hip_status(hipGetLastError(), "launch batched argmax kernel");
 }
 
 } // namespace
@@ -2022,6 +2064,22 @@ Status argmax_last_row(int64_t* dst, const void* src, DType dtype,
                                            as_stream(stream_handle));
     return Status(StatusCode::UnsupportedDType,
                   "Unsupported HIP argmax dtype");
+}
+
+Status argmax_rows(int64_t* dst, const void* src, DType dtype,
+                   int64_t rows, int64_t columns, void* stream_handle) {
+    if (dst == nullptr || src == nullptr || rows <= 0 || columns <= 0) {
+        return Status(StatusCode::InvalidArgument,
+                      "Invalid HIP batched argmax arguments");
+    }
+    if (dtype == DType::FP32)
+        return launch_argmax_rows<float>(dst, src, rows, columns,
+                                         as_stream(stream_handle));
+    if (dtype == DType::BF16)
+        return launch_argmax_rows<hip_bfloat16>(dst, src, rows, columns,
+                                                as_stream(stream_handle));
+    return Status(StatusCode::UnsupportedDType,
+                  "Unsupported HIP batched argmax dtype");
 }
 
 } // namespace hybridai::hip_kernels

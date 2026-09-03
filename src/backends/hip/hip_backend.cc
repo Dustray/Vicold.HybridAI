@@ -397,9 +397,10 @@ std::shared_ptr<memory::MemoryPool> shared_memory_pool(
     // weights bypass the pool so bucket rounding cannot inflate model memory.
     options.max_bucket_size = 8 * 1024 * 1024;
     options.bucket_growth = 1.25;
-    // Retain the transient high-water mark. A fixed cap can keep cold prefill
-    // blocks while repeatedly freeing newly returned hot decode blocks.
-    options.max_pooled_bytes = 0;
+    // Keep a bounded transient cache. An unlimited pool can retain cold
+    // prefill/decode blocks after a benchmark, reducing the headroom needed
+    // to load the 27B model again in the same process/container.
+    options.max_pooled_bytes = 256 * 1024 * 1024;
     auto pool =
         std::make_shared<memory::MemoryPool>(backend, type, options);
     pools.emplace(key, pool);
@@ -631,6 +632,32 @@ Status HipBackend::copy(Buffer* dst, const Buffer* src, size_t size,
     (void)dst;
     (void)src;
     (void)size;
+    (void)stream;
+    return Status(StatusCode::BackendError,
+                  "HIP backend compiled without HIP support");
+#endif
+}
+
+Status HipBackend::copy_to_offset(Buffer* dst, size_t dst_offset,
+                                  const Buffer* src, size_t src_offset,
+                                  size_t size, Stream* stream) {
+#ifdef HYBRIDAI_HAS_HIP
+    if (dst == nullptr || src == nullptr || dst_offset + size > dst->size() ||
+        src_offset + size > src->size()) {
+        return Status(StatusCode::InvalidArgument,
+                      "HIP offset copy range is invalid");
+    }
+    if (hipSetDevice(device_.id()) != hipSuccess) {
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    }
+    auto* s = static_cast<HipStream*>(stream);
+    hipMemcpyKind kind = copy_direction(dst->memory_type(), src->memory_type());
+    return hip_error_to_status(hipMemcpyAsync(
+        static_cast<uint8_t*>(dst->data()) + dst_offset,
+        static_cast<const uint8_t*>(src->data()) + src_offset, size, kind,
+        s ? s->handle() : nullptr));
+#else
+    (void)dst; (void)dst_offset; (void)src; (void)src_offset; (void)size;
     (void)stream;
     return Status(StatusCode::BackendError,
                   "HIP backend compiled without HIP support");
@@ -1454,6 +1481,31 @@ Status HipBackend::argmax_last_row(Buffer* dst, const Buffer* src,
     if (hipSetDevice(device_.id()) != hipSuccess)
         return Status(StatusCode::BackendError, "Failed to select HIP device");
     return hip_kernels::argmax_last_row(
+        static_cast<int64_t*>(dst->data()), src->data(), dtype, rows, columns,
+        native_stream(stream));
+#else
+    (void)dst; (void)src; (void)dtype; (void)rows; (void)columns; (void)stream;
+    return Status(StatusCode::NotImplemented, "HIP kernels are unavailable");
+#endif
+}
+
+Status HipBackend::argmax_rows(Buffer* dst, const Buffer* src, DType dtype,
+                               int64_t rows, int64_t columns, Stream* stream) {
+#if defined(HYBRIDAI_HAS_HIP) && defined(HYBRIDAI_HAS_HIP_KERNELS)
+    if (rows <= 0 || columns <= 0) {
+        return Status(StatusCode::InvalidArgument,
+                      "Invalid HIP batched argmax dimensions");
+    }
+    Status status = validate_kernel_buffer(
+        dst, device_, static_cast<size_t>(rows) * sizeof(int64_t), "dst");
+    if (!status.ok()) return status;
+    status = validate_kernel_buffer(
+        src, device_, static_cast<size_t>(rows * columns) * SizeOfDType(dtype),
+        "src");
+    if (!status.ok()) return status;
+    if (hipSetDevice(device_.id()) != hipSuccess)
+        return Status(StatusCode::BackendError, "Failed to select HIP device");
+    return hip_kernels::argmax_rows(
         static_cast<int64_t*>(dst->data()), src->data(), dtype, rows, columns,
         native_stream(stream));
 #else

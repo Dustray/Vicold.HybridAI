@@ -94,6 +94,30 @@ TEST(BackendBufferTest, CpuCreateBuffer) {
     EXPECT_TRUE(backend->synchronize().ok());
 }
 
+TEST(BackendBufferTest, CpuCopyToOffsetCopiesSelectedRange) {
+    InitializeBuiltinBackends();
+    auto backend = BackendRegistry::instance().create_backend(Device::Cpu());
+    ASSERT_NE(backend, nullptr);
+
+    const std::vector<uint8_t> source = {10, 20, 30, 40, 50, 60};
+    auto source_buffer = backend->create_buffer(source.size(), MemoryType::Host);
+    auto destination_buffer = backend->create_buffer(8, MemoryType::Host);
+    ASSERT_NE(source_buffer, nullptr);
+    ASSERT_NE(destination_buffer, nullptr);
+    ASSERT_TRUE(backend->memcpy_h2d(source_buffer.get(), source.data(),
+                                    source.size()).ok());
+    ASSERT_TRUE(backend->memset(destination_buffer.get(), 0, 8).ok());
+
+    ASSERT_TRUE(backend->copy_to_offset(destination_buffer.get(), 2,
+                                        source_buffer.get(), 1, 3).ok());
+    const auto* actual = static_cast<const uint8_t*>(destination_buffer->data());
+    ASSERT_NE(actual, nullptr);
+    const std::vector<uint8_t> expected = {0, 0, 20, 30, 40, 0, 0, 0};
+    for (size_t index = 0; index < expected.size(); ++index) {
+        EXPECT_EQ(actual[index], expected[index]) << "index=" << index;
+    }
+}
+
 TEST(BackendComputeTest, HipFp32GemmMatchesReference) {
     InitializeBuiltinBackends();
     Device hip_device(0, DeviceType::DiscreteGPU, "hip", false);

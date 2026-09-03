@@ -19,6 +19,24 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--runs", type=int, default=5)
     parser.add_argument("--output", type=Path, default=Path("benchmark.jsonl"))
+    parser.add_argument(
+        "--enable-mtp",
+        action="store_true",
+        help="Enable Qwen native MTP agreement probing in the runner",
+    )
+    parser.add_argument(
+        "--speculative-mtp",
+        action="store_true",
+        help="Enable fixed-width multi-token greedy speculative MTP verification",
+    )
+    parser.add_argument(
+        "--speculative-width",
+        type=int,
+        choices=range(1, 17),
+        metavar="1..16",
+        default=8,
+        help="MTP proposal width (forwarded as HYBRIDAI_SPECULATIVE_WIDTH)",
+    )
 
 
 def parse_records(text: str) -> list[dict]:
@@ -82,7 +100,7 @@ def print_summary_table(title: str, summary: dict) -> None:
             max(
                 (
                     format_statistic(values.get(column), column, name)
-                    for _, values in metric_rows
+                    for name, values in metric_rows
                 ),
                 default="",
             ).__len__(),
@@ -96,40 +114,80 @@ def print_summary_table(title: str, summary: dict) -> None:
         ]
         return "+" + "+".join(fields) + "+"
 
+    def print_table_line(line: str) -> None:
+        print(f"  {line}")
+
     print(f"\n{title}")
     if metadata_rows:
         for name, value in metadata_rows:
             print(f"  {name}: {value}")
-    print(separator_line())
+    print_table_line(separator_line())
     header = [f"{'Metric':<{metric_width}}"] + [
         f"{column:>{column_widths[column]}}" for column in statistic_columns
     ]
-    print("| " + " | ".join(header) + " |")
-    print(separator_line())
+    print_table_line("| " + " | ".join(header) + " |")
+    print_table_line(separator_line())
     for name, values in metric_rows:
         display_name = format_metric_name(name)
         fields = [f"{display_name:<{metric_width}}"] + [
             f"{format_statistic(values.get(column), column, name):>{column_widths[column]}}"
             for column in statistic_columns
         ]
-        print("| " + " | ".join(fields) + " |")
-    print(separator_line())
+        print_table_line("| " + " | ".join(fields) + " |")
+    print_table_line(separator_line())
 
 
-def format_statistic(value: object, column: str, metric_name: str | None = None) -> str:
+def format_statistic(
+    value: float | int | None, column: str, metric_name: str | None = None
+) -> str:
     if value is None:
         return "N/A"
-    if column == "samples" or metric_name in {"prompt_tokens", "generated_tokens"}:
+    if column == "samples" or metric_name in {
+        "prompt_tokens",
+        "generated_tokens",
+        "mtp_proposed_tokens",
+        "mtp_accepted_tokens",
+        "mtp_rejected_tokens",
+        "mtp_correction_tokens",
+        "speculative_replay_tokens",
+        "speculative_mtp_recovery_tokens",
+        "speculative_max_proposal_width",
+        "speculative_mtp_cache_clone_count",
+        "speculative_target_cache_clone_count",
+        "mtp_fallback_steps",
+        "speculative_rounds",
+    }:
         return str(int(value))
+    if metric_name == "mtp_acceptance_rate":
+        return f"{float(value) * 100:.0f}%"
     if metric_name is not None and metric_name.endswith("seconds"):
         return f"{float(value) * 1000:.3f}"
+    if metric_name is not None and metric_name.endswith("tokens_per_second"):
+        return f"{float(value):.2f}"
     return f"{float(value):.6f}"
 
 
 def format_metric_name(name: str, statistic: str | None = None) -> str:
     metric = name if statistic is None else f"{name}.{statistic}"
-    if name in {"prompt_tokens", "generated_tokens", "max_new_tokens"}:
+    if name in {
+        "prompt_tokens",
+        "generated_tokens",
+        "max_new_tokens",
+        "mtp_proposed_tokens",
+        "mtp_accepted_tokens",
+        "mtp_rejected_tokens",
+        "mtp_correction_tokens",
+        "speculative_replay_tokens",
+        "speculative_mtp_recovery_tokens",
+        "speculative_max_proposal_width",
+        "speculative_mtp_cache_clone_count",
+        "speculative_target_cache_clone_count",
+        "mtp_fallback_steps",
+        "speculative_rounds",
+    }:
         unit = "token"
+    elif name == "mtp_acceptance_rate":
+        unit = ""
     elif name.endswith("tokens_per_second"):
         unit = "token/s"
     elif name.endswith("seconds"):

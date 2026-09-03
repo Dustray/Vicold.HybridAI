@@ -129,6 +129,40 @@ Vicold.HybridAI/
 - **Windows HIP/ROCm 构建链路打通**：将 `src/backends/hip/hip_backend.cc` 改为由 MSVC 直接编译（ROCm headers 在该文件上是 host-only），彻底消除了 ROCm Clang 与 MSVC Debug CRT 的 runtime library mismatch（LNK2038）。`hybridai_test.exe` Debug 配置完整链接成功。
 - 自动化测试：普通 CPU/stub 构建的 GTest 全部通过，共 62 项测试；HIP 后端注册/创建/空 kernel 注册测试通过。
 
+### Qwen 原生 MTP 实施计划（2026-09-01）
+
+已验证：
+
+- 当前 Qwen3.8 checkpoint 的 `text_config` 声明 `mtp_num_hidden_layers=1`；
+- SafeTensor 索引实际包含 `mtp.fc.weight`、MTP norms 以及
+  `mtp.layers.0.*`，这些权重位于最后一个 shard；
+- MTP 顶层 projection 为 `[hidden_size, 2 * hidden_size]`，当前模型对应
+  `[5120, 10240]`，dtype 为 BF16；
+- MTP 权重可以通过 `Qwen3WeightLoader::load_mtp()` 按需加载，并参与末卡显存预算；
+- 普通生成路径默认不加载 MTP 权重，保持现有单 token decode 兼容性。
+
+后续按以下顺序实现：
+
+1. 根据对应 Transformers/Qwen 实现确认 MTP 的 hidden/embedding 拼接、位置编码、
+   attention cache 以及 token acceptance 语义；
+2. 将 MTP decoder 前向封装为独立模型适配层，复用现有 RMSNorm、Attention、MLP
+   和 device transfer 原语，不复制主干 forward；
+3. 扩展 `GenerationOptions` 和 `GenerationResult`，增加显式 MTP 开关、实际
+   proposal/acceptance/fallback 统计，默认值必须关闭 MTP；
+4. 实现单序列 greedy MTP 生成闭环，包括候选生成、验证、EOS、最大长度及 cache
+   提交/回滚；
+5. 增加 metadata、权重 shape/dtype、单步对齐、EOS、边界和 MTP-disabled 回归测试；
+6. 增加 benchmark 中的 MTP TPS、接受率和 fallback 指标。首期不实现 batch、采样、
+   独立 draft model、服务化调度或 tensor parallel。
+
+当前已完成的接口防护：`GeneratorOptions::enable_mtp` 默认关闭；显式开启时会按需
+加载并校验 MTP 权重；在 forward 和候选验证尚未实现前，`generate()` 返回明确的
+`NotImplemented`，不会静默退回普通 decode。`GenerationResult` 已预留 proposal、
+accepted、fallback 和 acceptance rate 字段，默认值为零。
+
+当前禁止项：不能仅因配置中存在 `mtp_num_hidden_layers` 就自动启用 MTP；只有
+完整 `mtp.*` 权重和经过参考实现对齐后，才能将 MTP 标记为可用。
+
 进行中：
 
 - typed GEMM 与 HIP BF16 计算路径：扩展 `Backend::gemm()` 的 dtype 合约，并使用 rocBLAS BF16 输入、FP32 accumulation。
@@ -144,6 +178,105 @@ Vicold.HybridAI/
 - 单层 Transformers 数值对齐、性能测试和最终 CLI 端到端推理验收。
 
 ### 最新构建与 GPU 验证结论
+
+### Speculative cache rollback 进展（2026-09-03）
+
+- `AttentionKVCache::truncate()` 已实现并通过专项测试；该操作只回退逻辑
+   KV 长度，保留已有 storage，适用于后续 append 覆盖被丢弃的 suffix。
+- `DeltaNetCache::checkpoint()` 基于完整深拷贝保存 `conv_state`、
+   `recurrent_state` 和 `length`；`restore()` 通过完整 swap 恢复，并拒绝空、
+   未初始化或 shape/device/dtype 不兼容的 checkpoint。
+- generator 的 target verification 已使用 DeltaNet checkpoint 语义；当前
+   mismatch 后仍保持 target-only fallback。只有在 MTP Attention cache 的
+   accepted-prefix/correction 位置历史得到验证后，才恢复 mismatch 后的
+   speculative proposal。
+- mismatch 后恢复 MTP 不能直接提交完整的 proposal scratch：其中包含被拒绝
+   suffix 的 MTP Attention KV。安全路径应先将 proposal scratch 截断到
+   `accepted` 前缀，再使用 correction 前一个 target hidden 执行一次 correction
+   的 MTP forward，最后才提交 MTP cache。该路径还需要验证 MTP cache length 与
+   target position 的对应关系，并进行 token-by-token reference 对齐；在此之前
+   继续使用 target-only fallback。
+
+### Speculative decoding 阶段性结论（2026-09-03）
+
+- 已实现可配置 proposal width（默认 width=8，允许 1--16）的 Qwen 原生 MTP
+   speculative decoding，验证阶段使用独立 target/MTP cache，full acceptance 时
+   交换 scratch cache，mismatch 时 replay accepted prefix 和 target correction。
+- mismatch 后暂时切换 target-only fallback，避免仅修改 DeltaNet `length` 导致
+   recurrent state、causal convolution state 与逻辑位置不一致。当前不恢复 mismatch
+   后的 speculative，不应在没有 checkpoint/truncate 语义证明前放开该限制。
+- GPU 7 长序列单 prompt（160 tokens、5 次）中，speculative E2E 从 `12147.950 ms`
+   降至 `11800.438 ms`，decode TPS 从 `13.269` 升至 `13.559`；acceptance 为
+   `75%`，收益约 `2.86%`。多 prompt（80 tokens、每组 3 次）测试显示 acceptance
+   为 `0%` 时 E2E 下降约 `2.24%` TPS，acceptance 为 `50%` 时 E2E 降低约 `1.72%`，
+   TPS 仅提升约 `0.31%`，说明收益强依赖 prompt 内容。
+- 当前下一步优先级：先实现并测试 Attention 的安全 truncate 和 DeltaNet 的完整
+   state checkpoint/restore，再评估 mismatch 后恢复 speculative；随后用多 prompt、
+   长序列和更多 runs 重新测量。不得用单次短序列结果代表最终性能。
+- 算子优化继续优先关注 DeltaNet `in_proj_qkv` 和 recurrent；projection workspace
+   复用已经通过 GPU 7 correctness 回归，现阶段主要价值是降低 allocator 压力和
+   碎片风险。projection fusion 需先确认权重 layout、dtype、FP8 scales 和峰值显存，
+   并保留未融合 fallback。
+
+### GPU 7 最新 speculative 对照（2026-09-03）
+
+#### fallback 重建验证结论
+
+- 曾尝试在 mismatch 后将 correction token 通过 `correction_embedding +
+   target_hidden` 重新执行 MTP forward，以恢复后续 speculative rounds。
+- 在 `Hello` prompt、40 token smoke 中，该路径得到 proposed `34`、accepted `27`、
+   `fallback=0`、9 个 speculative rounds，且 token IDs 与 baseline 一致。
+- 但在低 acceptance 的第二个 prompt（`Explain why the sky appears blue in one
+   short paragraph.`）上，80 token 测试在第 68 个 token 出现 divergence：baseline
+   token 为 `279`，speculative token 为 `424`。因此该重建方法不能作为通用正确实现。
+- 当前已撤销未经证明的 MTP cache 重建并恢复保守策略：mismatch 后只提交 target
+   replay 的 correction 和 accepted prefix，随后本次请求进入 target-only fallback。
+   这样会牺牲后续 speculative 机会，但优先保证 greedy token-level correctness。
+- 恢复安全策略后重新编译 Debug 与 benchmark runner；`GeneratorMtpTest.*` 的
+   11 个测试全部通过。之前长序列结果中的 `fallback=0` 不能再作为当前实现的
+   正确性结论使用。
+- 后续要真正消除 fallback，必须按模型 reference 的 positional semantics 重建
+   correction 后的 MTP Attention KV 与 DeltaNet state，不能只补一行 MTP forward。
+
+- 已确认 `build-benchmark/bin/hybridai_benchmark_runner` 可正常执行当前 benchmark
+   路径；本轮所有真实模型进程均使用 `HIP_VISIBLE_DEVICES=7`，没有使用用户占用的
+   GPU 4。
+- 使用同一 Qwen3.8-27B、同一 prompt（23 个 prompt token）、`max_new_tokens=80`、
+   预热 1 次、测量 3 次。模型实际因 EOS 生成 40 个 token。
+- target-only baseline：E2E 均值 `3081.753 ms`，decode 均值 `2896.970 ms`，
+   decode TPS `13.4623`。
+- speculative：E2E 均值 `2930.294 ms`，decode 均值 `2930.172 ms`，
+   decode TPS `13.6512`；proposed/accepted/fallback 为 `4/3/1`，acceptance rate
+   为 `75%`，共 1 个 speculative round。
+- speculative E2E 相比 baseline 降低约 `4.91%`，decode TPS 提升约 `1.40%`。
+   但 decode wall time 反而高约 `1.15%`，说明当前统计口径和一次性
+   verification/fallback 分段开销仍需继续拆分，不能仅凭该 3 次样本宣称稳定收益。
+- 两组结果的 `token_ids` 每次均完全一致；原始 JSONL 因 timing 字段不同不能直接
+   使用文件级 `cmp` 判断，但逐条 token 序列比较通过。该结果支持当前 mismatch 后
+   MTP cache 重建路径在此样本上的 token-level correctness。
+- speculative 阶段 timing：proposal 约 `14.227 ms`、verification 约 `111.125 ms`、
+   replay 约 `30.594 ms`、fallback 约 `2512.057 ms`、target cache clone 约
+   `3.267 ms`、batched argmax 约 `76.992 ms`。fallback 仍占主要时间，后续应优先
+   降低 mismatch 后 target-only 区间，或证明并优化安全的 MTP cache reconstruction。
+
+### 后续实施计划（speculative correctness 优先）
+
+1. 增加自动化 JSONL token 对齐脚本/测试，逐 run 比较 baseline 与 speculative，
+    同时检查 EOS、长度和 mismatch 后 correction token；任何不一致都自动阻断性能
+    结论并回退到 target-only fallback。
+2. 扩大 GPU 7 benchmark：至少 3 个 prompt、`max_new_tokens=160`、5 次测量，
+    分别记录 acceptance、rounds、fallback 后剩余 token 数，以及 E2E/TTFT/decode
+    的 P50/P95/P99。避免重复启动多个大模型进程，降低 allocator fragmentation
+    和临时 buffer 峰值导致的 OOM 风险。
+3. 完善 mismatch 后 MTP cache reconstruction 的 reference 对齐：分别验证
+    Attention KV 的 retained length、position offset、accepted prefix 和 correction
+    token；验证 DeltaNet 的 conv/recurrent state 必须与 target replay 完全一致。
+4. 在 correctness 稳定后再做算子优化，优先级为：DeltaNet `in_proj_qkv` 融合评估、
+    recurrent kernel/矩阵计算优化、projection workspace 生命周期复用；每项都保留
+    未融合 fallback，并用逐 token 数值测试和显存峰值测试把关。
+5. 最后再评估 speculative width（当前默认 8，可通过 `--speculative-width 1..16`
+   调整）和调度策略。若 acceptance 低于 break-even，优先动态关闭 speculative，
+   而不是强制执行 proposal/verification。
 
 - **Linux HIP 当前实测**：2026-09-01 在 8 张 `gfx936` 上通过 `demo/build/qwen_infer` 成功加载约 50.10 GiB 的 BF16 文本权重，并完成 64 层混合 Attention/DeltaNet、MLP、final norm、lm_head 和增量 greedy decode。生成 1023 个 decode token 用时 40.4498 s，吞吐 25.2906 token/s。DeltaNet、cached GQA 和 causal GQA 已使用 HIP 优化 kernel；相同模型、prompt 和解码配置下的生成结果已与 vLLM 对齐，下一阶段继续进行算子和端到端性能优化。
 - **Qwen3.5 语义修复**：主 RMSNorm 使用官方的 `(1 + weight)` 参数化；DeltaNet 的 `RMSNormGated` 保持普通乘权重并在归一化后施加 `SiLU(z)`；标准 Attention 使用 q/k per-head norm、half-split RoPE、sigmoid gate，且 q/gate 按 `[head, 2*head_dim]` 交错布局拆分。

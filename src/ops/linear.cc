@@ -86,11 +86,6 @@ Tensor Linear::forward(const Tensor& input, const Tensor& weight,
         return Tensor();
     }
 
-    const int64_t m = input.shape().dim(0);
-    const int64_t k = input.shape().dim(1);
-    const int64_t n = transpose_weight ? weight.shape().dim(0)
-                                         : weight.shape().dim(1);
-
     // Use the kernel registry to allow custom tile kernels to override BLAS.
     // If no kernel is registered, fall back to backend gemm().
     KernelKey key{"linear", input.device().type(), input.dtype()};
@@ -100,25 +95,51 @@ Tensor Linear::forward(const Tensor& input, const Tensor& weight,
         // For now fall through to backend gemm.
     }
 
-    auto backend = BackendRegistry::instance().get_backend(input.device());
-    if (backend == nullptr) {
-        return Tensor();
-    }
-
     Shape output_shape;
     status = compute_output_shape(input.shape(), weight.shape(),
-                                    transpose_weight, &output_shape);
-    if (!status.ok()) {
-        return Tensor();
-    }
+                                  transpose_weight, &output_shape);
+    if (!status.ok()) return Tensor();
 
     const DType output_dtype = input.dtype();
+
+    auto backend = BackendRegistry::instance().get_backend(input.device());
+    if (backend == nullptr) return Tensor();
+
     auto output_buffer = backend->create_buffer(
         output_shape.numel() * SizeOfDType(output_dtype),
         input.buffer()->memory_type());
-    if (output_buffer == nullptr) {
+    if (output_buffer == nullptr) return Tensor();
+
+    return forward_into(input, weight, output_buffer, transpose_weight, bias,
+                        stream);
+}
+
+Tensor Linear::forward_into(const Tensor& input, const Tensor& weight,
+                            const std::shared_ptr<Buffer>& output_buffer,
+                            bool transpose_weight, const Tensor* bias,
+                            Stream* stream) {
+    Status status = validate(input, weight, transpose_weight, bias);
+    if (!status.ok() || output_buffer == nullptr ||
+        output_buffer->device() != input.device()) {
         return Tensor();
     }
+
+    auto backend = BackendRegistry::instance().get_backend(input.device());
+    if (backend == nullptr) return Tensor();
+
+    Shape output_shape;
+    status = compute_output_shape(input.shape(), weight.shape(),
+                                  transpose_weight, &output_shape);
+    if (!status.ok() || output_buffer->size() <
+                             output_shape.numel() * SizeOfDType(input.dtype())) {
+        return Tensor();
+    }
+
+    const int64_t m = input.shape().dim(0);
+    const int64_t k = input.shape().dim(1);
+    const int64_t n = transpose_weight ? weight.shape().dim(0)
+                                       : weight.shape().dim(1);
+    const DType output_dtype = input.dtype();
 
     // GEMM: C = A * B, where A = input [M, K], B = weight^T [K, N]
     //       => C [M, N].
@@ -154,8 +175,7 @@ Tensor Linear::forward(const Tensor& input, const Tensor& weight,
         }
     }
 
-    return Tensor(output_shape, output_dtype, input.device(),
-                  std::move(output_buffer));
+    return Tensor(output_shape, output_dtype, input.device(), output_buffer);
 }
 
 } // namespace ops

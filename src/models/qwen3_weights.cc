@@ -47,6 +47,38 @@ Status Qwen3LayerWeights::validate() const {
                         "Qwen MLP quantized weights are invalid");
 }
 
+Status Qwen3MTPWeights::validate() const {
+    if (fc.buffer() == nullptr || norm.buffer() == nullptr ||
+        pre_fc_norm_embedding.buffer() == nullptr ||
+        pre_fc_norm_hidden.buffer() == nullptr) {
+        return Status(StatusCode::InvalidModel,
+                      "Qwen MTP projection or normalization weights are missing");
+    }
+    if (fc.shape().ndim() != 2 || norm.shape().ndim() != 1 ||
+        pre_fc_norm_embedding.shape().ndim() != 1 ||
+        pre_fc_norm_hidden.shape().ndim() != 1 ||
+        norm.shape() != pre_fc_norm_embedding.shape() ||
+        norm.shape() != pre_fc_norm_hidden.shape() ||
+        fc.shape().dim(1) != norm.shape().dim(0) * 2 ||
+        fc.shape().dim(0) != norm.shape().dim(0)) {
+        return Status(StatusCode::InvalidModel,
+                      "Qwen MTP projection or normalization shapes are invalid");
+    }
+    if (layers.empty()) {
+        return Status(StatusCode::InvalidModel,
+                      "Qwen MTP decoder layers are missing");
+    }
+    for (const auto& layer : layers) {
+        if (layer.q_norm.buffer() == nullptr || layer.k_norm.buffer() == nullptr) {
+            return Status(StatusCode::InvalidModel,
+                          "Qwen MTP attention normalization weights are missing");
+        }
+        Status status = layer.validate();
+        if (!status.ok()) return status;
+    }
+    return Status::OK();
+}
+
 Status Qwen3WeightLoader::open(const std::string& model_path) {
     return open(model_path, Qwen3LoadOptions{});
 }
@@ -276,6 +308,91 @@ Status Qwen3WeightLoader::load_shared(Device device,
     return Status::OK();
 }
 
+Status Qwen3WeightLoader::load_mtp(Device device,
+                                   Qwen3MTPWeights* output) const {
+    if (output == nullptr) {
+        return Status(StatusCode::InvalidArgument, "Output is null");
+    }
+    if (config_.mtp_num_hidden_layers <= 0) {
+        return Status(StatusCode::InvalidModel,
+                      "Checkpoint does not contain Qwen MTP layers");
+    }
+
+    Qwen3MTPWeights result;
+    Status status = load_tensor("mtp.fc.weight", device, &result.fc);
+    if (!status.ok()) return status;
+    status = load_tensor("mtp.norm.weight", device, &result.norm);
+    if (!status.ok()) return status;
+    status = load_tensor("mtp.pre_fc_norm_embedding.weight", device,
+                         &result.pre_fc_norm_embedding);
+    if (!status.ok()) return status;
+    status = load_tensor("mtp.pre_fc_norm_hidden.weight", device,
+                         &result.pre_fc_norm_hidden);
+    if (!status.ok()) return status;
+
+    result.layers.resize(static_cast<size_t>(config_.mtp_num_hidden_layers));
+    for (int32_t index = 0; index < config_.mtp_num_hidden_layers; ++index) {
+        const std::string prefix = "mtp.layers." + std::to_string(index) + ".";
+        Qwen3LayerWeights layer;
+        layer.layer_index = index;
+        layer.is_attention_layer = true;
+        auto load = [&](const std::string& suffix, Tensor* tensor) {
+            return load_tensor(prefix + suffix, device, tensor);
+        };
+        status = load("input_layernorm.weight", &layer.input_layernorm);
+        if (!status.ok()) return status;
+        status = load("post_attention_layernorm.weight",
+                      &layer.post_attention_layernorm);
+        if (!status.ok()) return status;
+        status = load_quantized(prefix + "self_attn.q_proj.weight", device,
+                                &layer.q_proj);
+        if (!status.ok()) return status;
+        status = load_quantized(prefix + "self_attn.k_proj.weight", device,
+                                &layer.k_proj);
+        if (!status.ok()) return status;
+        status = load_quantized(prefix + "self_attn.v_proj.weight", device,
+                                &layer.v_proj);
+        if (!status.ok()) return status;
+        status = load_quantized(prefix + "self_attn.o_proj.weight", device,
+                                &layer.o_proj);
+        if (!status.ok()) return status;
+        status = load("self_attn.q_norm.weight", &layer.q_norm);
+        if (!status.ok()) return status;
+        status = load("self_attn.k_norm.weight", &layer.k_norm);
+        if (!status.ok()) return status;
+        status = load_quantized(prefix + "mlp.gate_proj.weight", device,
+                                &layer.mlp_gate_proj);
+        if (!status.ok()) return status;
+        status = load_quantized(prefix + "mlp.up_proj.weight", device,
+                                &layer.mlp_up_proj);
+        if (!status.ok()) return status;
+        status = load_quantized(prefix + "mlp.down_proj.weight", device,
+                                &layer.mlp_down_proj);
+        if (!status.ok()) return status;
+        status = layer.validate();
+        if (!status.ok()) return status;
+        result.layers[static_cast<size_t>(index)] = std::move(layer);
+    }
+    status = result.validate();
+    if (!status.ok()) return status;
+    *output = std::move(result);
+    return Status::OK();
+}
+
+uint64_t Qwen3WeightLoader::mtp_bytes() const {
+    if (!loader_ || config_.mtp_num_hidden_layers <= 0) return 0;
+    uint64_t bytes = 0;
+    for (const std::string& name : loader_->tensor_names()) {
+        if (name == "mtp.fc.weight" || name == "mtp.norm.weight" ||
+            name == "mtp.pre_fc_norm_embedding.weight" ||
+            name == "mtp.pre_fc_norm_hidden.weight" ||
+            name.compare(0, std::string("mtp.layers.").size(), "mtp.layers.") == 0) {
+            bytes += tensor_bytes(name);
+        }
+    }
+    return bytes;
+}
+
 Status Qwen3WeightLoader::plan_distributed(
     const std::vector<Device>& devices,
     std::vector<Qwen3DevicePartition>* partitions) const {
@@ -317,6 +434,7 @@ Status Qwen3WeightLoader::plan_distributed(
     result.back().weight_bytes +=
         tensor_bytes("model.language_model.norm.weight");
     result.back().weight_bytes += tensor_bytes("lm_head.weight");
+    result.back().weight_bytes += mtp_bytes();
     *partitions = std::move(result);
     return Status::OK();
 }

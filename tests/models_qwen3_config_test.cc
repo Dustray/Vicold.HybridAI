@@ -87,6 +87,37 @@ TEST(Qwen3ConfigTest, LoadsExplicitScheduleBehaviorAndTokenMetadata) {
     std::filesystem::remove(path);
 }
 
+TEST(Qwen3ConfigTest, LoadsMtpConfiguration) {
+    const auto path = std::filesystem::temp_directory_path() /
+                      "hybridai_qwen3_mtp_config_test.json";
+    nlohmann::json config = {
+        {"text_config", {
+            {"mtp_num_hidden_layers", 2},
+            {"mtp_use_dedicated_embeddings", true}
+        }}
+    };
+    std::ofstream(path) << config.dump();
+
+    Qwen3Config parsed;
+    ASSERT_TRUE(parsed.load_json(path.string()).ok());
+    EXPECT_EQ(parsed.mtp_num_hidden_layers, 2);
+    EXPECT_TRUE(parsed.mtp_use_dedicated_embeddings);
+    std::filesystem::remove(path);
+}
+
+TEST(Qwen3ConfigTest, RejectsNegativeMtpLayerCount) {
+    const auto path = std::filesystem::temp_directory_path() /
+                      "hybridai_qwen3_negative_mtp_config_test.json";
+    nlohmann::json config = {
+        {"mtp_num_hidden_layers", -1}
+    };
+    std::ofstream(path) << config.dump();
+
+    Qwen3Config parsed;
+    EXPECT_EQ(parsed.load_json(path.string()).code(), StatusCode::InvalidModel);
+    std::filesystem::remove(path);
+}
+
 TEST(Qwen3ConfigTest, RejectsUnknownOrConflictingLayerSchedule) {
     const auto path = std::filesystem::temp_directory_path() /
                       "hybridai_qwen3_bad_schedule_test.json";

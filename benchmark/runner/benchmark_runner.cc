@@ -31,6 +31,14 @@ void usage(const char* program) {
               << " [warmup_runs] [measure_runs]\n";
 }
 
+bool env_flag_enabled(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr &&
+           (std::string(value) == "1" || std::string(value) == "true" ||
+            std::string(value) == "TRUE" || std::string(value) == "on" ||
+            std::string(value) == "ON");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -42,8 +50,11 @@ int main(int argc, char** argv) {
     hybridai::GeneratorOptions generator_options;
     generator_options.model_dir = argv[1];
     generator_options.backend = argc > 3 ? argv[3] : "hip";
+    generator_options.enable_mtp = env_flag_enabled("HYBRIDAI_ENABLE_MTP");
 
     hybridai::GenerationOptions request;
+    request.enable_speculative_mtp =
+        env_flag_enabled("HYBRIDAI_SPECULATIVE_MTP");
     request.prompt = argc > 2 ? argv[2] : "Hello, how are you? And who are you?";
     try {
         if (argc > 4) request.max_new_tokens = std::stoi(argv[4]);
@@ -115,7 +126,51 @@ int main(int argc, char** argv) {
                   << ",\"decode_tokens_per_second\":"
                   << result.decode_tokens_per_second
                   << ",\"output_tokens_per_second\":" << output_tps
-                  << ",\"decode_step_seconds\":[";
+                  << ",\"mtp_proposed_tokens\":"
+                  << result.mtp_proposed_tokens
+                  << ",\"mtp_accepted_tokens\":"
+                  << result.mtp_accepted_tokens
+                  << ",\"mtp_rejected_tokens\":"
+                  << result.mtp_rejected_tokens
+                  << ",\"mtp_correction_tokens\":"
+                  << result.mtp_correction_tokens
+                  << ",\"speculative_replay_tokens\":"
+                  << result.speculative_replay_tokens
+                  << ",\"speculative_mtp_recovery_tokens\":"
+                  << result.speculative_mtp_recovery_tokens
+                  << ",\"speculative_max_proposal_width\":"
+                  << result.speculative_max_proposal_width
+                  << ",\"speculative_mtp_cache_clone_count\":"
+                  << result.speculative_mtp_cache_clone_count
+                  << ",\"speculative_target_cache_clone_count\":"
+                  << result.speculative_target_cache_clone_count
+                  << ",\"mtp_fallback_steps\":"
+                  << result.mtp_fallback_steps
+                  << ",\"mtp_acceptance_rate\":"
+                  << result.mtp_acceptance_rate
+                  << ",\"speculative_proposal_seconds\":"
+                  << result.speculative_proposal_seconds
+                  << ",\"speculative_verification_seconds\":"
+                  << result.speculative_verification_seconds
+                  << ",\"speculative_replay_seconds\":"
+                  << result.speculative_replay_seconds
+                  << ",\"speculative_fallback_seconds\":"
+                  << result.speculative_fallback_seconds
+                  << ",\"speculative_mtp_cache_clone_seconds\":"
+                  << result.speculative_mtp_cache_clone_seconds
+                  << ",\"speculative_target_cache_clone_seconds\":"
+                  << result.speculative_target_cache_clone_seconds
+                  << ",\"speculative_argmax_seconds\":"
+                  << result.speculative_argmax_seconds
+                  << ",\"speculative_rounds\":"
+                  << result.speculative_rounds
+                  << ",\"token_ids\":[";
+        for (size_t i = 0; i < result.token_ids.size(); ++i) {
+            if (i != 0) std::cout << ',';
+            std::cout << result.token_ids[i];
+        }
+        std::cout
+                  << "],\"decode_step_seconds\":[";
         for (size_t i = 0; i < result.decode_step_seconds.size(); ++i) {
             if (i != 0) std::cout << ',';
             std::cout << result.decode_step_seconds[i];

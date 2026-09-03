@@ -26,6 +26,7 @@ enum class HYBRIDAI_API ApiStatusCode : int32_t {
     FileNotFound = 7,
     InvalidModel = 8,
     BackendError = 9,
+    NotImplemented = 10,
     Unknown = 99,
 };
 
@@ -47,6 +48,7 @@ struct HYBRIDAI_API GeneratorOptions {
     std::string model_dir;
     std::string backend = "cpu";
     int32_t max_devices = 1;
+    bool enable_mtp = false;
 };
 
 struct HYBRIDAI_API GenerationOptions {
@@ -54,6 +56,10 @@ struct HYBRIDAI_API GenerationOptions {
     int32_t max_new_tokens = 128;
     bool use_chat_template = true;
     bool enable_thinking = false;
+    // Enable one-token Qwen MTP speculative verification. This is separate
+    // from GeneratorOptions::enable_mtp so existing agreement-probe callers
+    // keep their behavior until the speculative path is explicitly opted in.
+    bool enable_speculative_mtp = false;
 };
 
 struct HYBRIDAI_API GenerationResult {
@@ -65,6 +71,25 @@ struct HYBRIDAI_API GenerationResult {
     double time_to_first_token_seconds = 0.0;
     double decode_seconds = 0.0;
     double decode_tokens_per_second = 0.0;
+    int64_t mtp_proposed_tokens = 0;
+    int64_t mtp_accepted_tokens = 0;
+    int64_t mtp_fallback_steps = 0;
+    double mtp_acceptance_rate = 0.0;
+    double speculative_proposal_seconds = 0.0;
+    double speculative_verification_seconds = 0.0;
+    double speculative_replay_seconds = 0.0;
+    double speculative_fallback_seconds = 0.0;
+    double speculative_mtp_cache_clone_seconds = 0.0;
+    double speculative_target_cache_clone_seconds = 0.0;
+    double speculative_argmax_seconds = 0.0;
+    int64_t speculative_rounds = 0;
+    int64_t mtp_rejected_tokens = 0;
+    int64_t mtp_correction_tokens = 0;
+    int64_t speculative_replay_tokens = 0;
+    int64_t speculative_mtp_recovery_tokens = 0;
+    int64_t speculative_max_proposal_width = 0;
+    int64_t speculative_mtp_cache_clone_count = 0;
+    int64_t speculative_target_cache_clone_count = 0;
     std::vector<double> decode_step_seconds;
 };
 
